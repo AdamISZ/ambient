@@ -332,9 +332,9 @@ impl WalletNode {
 
     pub async fn print_summary(&self) {
         let wallet = self.wallet.lock().await;
-        info!("💰 Balance: {}", wallet.balance().total());
-        info!("📦 Chain tip: {}", wallet.local_chain().tip().height());
-        info!("🧾 Tx count: {}", wallet.transactions().count());
+        println!("💰 Balance: {}", wallet.balance().total());
+        println!("📦 Chain tip: {}", wallet.local_chain().tip().height());
+        println!("🧾 Tx count: {}", wallet.transactions().count());
     }
 
     pub async fn get_balance(&self) -> Result<String> {
