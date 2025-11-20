@@ -3,23 +3,12 @@ name = "rustsnicker"
 version = "0.1.0"
 edition = "2021"
 
-[patch.crates-io]
-bdk_chain = { path = "./bdk_chain-0.23.2" }
-bdk_wallet = { path = "./bdk_wallet-2.2.0" }
-bdk_bitcoind_rpc = { path = "./bdk_bitcoind_rpc-0.22.0"}
-
 [dependencies]
 bdk_kyoto = { version = "0.13.1" }
+bdk_wallet = { version = "2.2.0", features = ["rusqlite", "keys-bip39"] }
 tokio = { version = "1", features = ["full"], default-features = false }
 tracing = { version = "0.1" }
 tracing-subscriber = { version = "0.3" }
-bdk_wallet = { path = "./bdk_wallet-2.2.0", features = ["rusqlite", "keys-bip39"] }
-bdk_chain = { path = "./bdk_chain-0.23.2"}
-
-bdk_bitcoind_rpc = {path = "./bdk_bitcoind_rpc-0.22.0"}
-bdk-macros = "0.5"
-log = "0.4"
-env_logger = "0.10"
 anyhow = "1.0"
 clap = { version = "4", features = ["derive"] }
 directories = "5"
