@@ -1,6 +1,7 @@
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -12,7 +13,7 @@ use tracing::info;
 
 use bdk_wallet::{
     PersistedWallet,
-    bitcoin::Network,
+    bitcoin::{Network, Address, Amount, FeeRate, Transaction, Txid, psbt::Psbt},
     keys::{
         bip39::{Language, Mnemonic, WordCount},
         DerivableKey, ExtendedKey, GeneratedKey, GeneratableKey,
@@ -20,7 +21,7 @@ use bdk_wallet::{
     rusqlite::Connection,
     template::{Bip86, DescriptorTemplate},
     miniscript::Tap,
-    KeychainKind, Wallet,
+    KeychainKind, Wallet, SignOptions,
 };
 
 use bdk_kyoto::builder::{NodeBuilder, NodeBuilderExt};
@@ -150,57 +151,45 @@ impl WalletNode {
             .into_xprv(network)
             .ok_or_else(|| anyhow!("Unable to derive xprv from mnemonic"))?;
 
-        let (external_desc, _, _) = Bip86(xprv, KeychainKind::External)
-            .build(network)
-            .expect("Failed to build external descriptor");
-        let (internal_desc, _, _) = Bip86(xprv, KeychainKind::Internal)
-            .build(network)
-            .expect("Failed to build internal descriptor");
+        // BIP86 uses m/86'/cointype'/0' as the account path
+        let coin_type = if network == Network::Bitcoin { 0 } else { 1 };
+
+        // Put the full BIP86 derivation path in the descriptor string
+        // The descriptor parser will handle the derivation internally
+        // Using 'h' for hardened derivation in descriptor syntax
+        let external_desc = format!("tr({}/86h/{}h/0h/0/*)", xprv, coin_type);
+        let internal_desc = format!("tr({}/86h/{}h/0h/1/*)", xprv, coin_type);
+
+        info!("🔍 Descriptor has private keys: {}", external_desc.contains("prv"));
 
         let mut conn = Connection::open(db_path)?;
         info!("💾 Wallet database path: {:?}", db_path);
 
-        if let Some(mut existing) = Wallet::load()
-            .descriptor(KeychainKind::External, Some(external_desc.clone()))
-            .descriptor(KeychainKind::Internal, Some(internal_desc.clone()))
-            .extract_keys()
+        // Check if wallet already exists by trying to load it
+        let maybe_wallet = Wallet::load()
             .check_network(network)
-            .load_wallet(&mut conn)?
-        {
-            info!("✅ Loaded existing wallet from disk.");
+            .load_wallet(&mut conn)?;
 
-            // Force derivation of lookahead scripts so they're persisted to database
-            // This ensures build_with_wallet can find them
-            let ext_revealed = existing.derivation_index(KeychainKind::External).unwrap_or(0);
-            let int_revealed = existing.derivation_index(KeychainKind::Internal).unwrap_or(0);
+        let mut wallet = if let Some(loaded) = maybe_wallet {
+            info!("✅ Loaded existing wallet from database");
+            loaded
+        } else {
+            info!("✅ Creating new wallet with descriptors");
+            let mut new_wallet = Wallet::create(external_desc.clone(), internal_desc.clone())
+                .network(network)
+                .lookahead(RECOVERY_LOOKAHEAD)
+                .create_wallet(&mut conn)?;
 
-            for index in 0..(RECOVERY_LOOKAHEAD + ext_revealed) {
-                let _ = existing.peek_address(KeychainKind::External, index);
+            // Force derivation of lookahead scripts for new wallet
+            for index in 0..RECOVERY_LOOKAHEAD {
+                let _ = new_wallet.peek_address(KeychainKind::External, index);
+                let _ = new_wallet.peek_address(KeychainKind::Internal, index);
             }
-            for index in 0..(RECOVERY_LOOKAHEAD + int_revealed) {
-                let _ = existing.peek_address(KeychainKind::Internal, index);
-            }
+            new_wallet.persist(&mut conn)?;
+            info!("🔧 Derived and persisted {} lookahead scripts", RECOVERY_LOOKAHEAD);
 
-            existing.persist(&mut conn)?;
-            info!("🔧 Derived and persisted {} external + {} internal lookahead scripts",
-                  RECOVERY_LOOKAHEAD + ext_revealed, RECOVERY_LOOKAHEAD + int_revealed);
-
-            return Ok((existing, conn));
-        }
-
-        info!("🪄 Creating new wallet DB...");
-        let mut wallet = Wallet::create(external_desc.clone(), internal_desc.clone())
-            .network(network)
-            .lookahead(RECOVERY_LOOKAHEAD)
-            .create_wallet(&mut conn)?;
-
-        // Force derivation of lookahead scripts for new wallet too
-        for index in 0..RECOVERY_LOOKAHEAD {
-            let _ = wallet.peek_address(KeychainKind::External, index);
-            let _ = wallet.peek_address(KeychainKind::Internal, index);
-        }
-        wallet.persist(&mut conn)?;
-        info!("🔧 Derived and persisted {} lookahead scripts for new wallet", RECOVERY_LOOKAHEAD);
+            new_wallet
+        };
 
         Ok((wallet, conn))
     }
@@ -282,6 +271,198 @@ impl WalletNode {
         }
     }
 
+
+    // ============================================================
+    // TRANSACTION BUILDING & SENDING (Modular Architecture)
+    // ============================================================
+
+    /// Build a transaction with specified recipients and fee rate.
+    /// Returns an unsigned PSBT that can be signed, exported, or modified.
+    pub async fn build_transaction(
+        &mut self,
+        recipients: Vec<(Address, Amount)>,
+        fee_rate: FeeRate,
+    ) -> Result<Psbt> {
+        let mut wallet = self.wallet.lock().await;
+
+        info!("🔍 Building transaction with {} recipients", recipients.len());
+        info!("🔍 Wallet balance: {} sats", wallet.balance().total().to_sat());
+
+        let mut tx_builder = wallet.build_tx();
+
+        // Add all recipients
+        for (address, amount) in recipients {
+            info!("🔍 Adding recipient: {} sats", amount.to_sat());
+            tx_builder.add_recipient(address.script_pubkey(), amount);
+        }
+
+        // Set fee rate
+        tx_builder.fee_rate(fee_rate);
+
+        // Build the PSBT
+        info!("🔍 Finishing transaction build...");
+        let mut psbt = tx_builder.finish()?;
+        info!("🔍 PSBT created with {} inputs, {} outputs", psbt.inputs.len(), psbt.outputs.len());
+
+        // Fix missing witness_utxo: BDK only sets it if the full previous transaction
+        // is in the wallet's graph. With Kyoto, we might not have the full tx, but we
+        // do have the TxOut from list_unspent(). Manually populate it here.
+        let utxos: Vec<_> = wallet.list_unspent().collect();
+        for (i, psbt_input) in psbt.inputs.iter_mut().enumerate() {
+            if psbt_input.witness_utxo.is_none() {
+                let outpoint = psbt.unsigned_tx.input[i].previous_output;
+                if let Some(utxo) = utxos.iter().find(|u| u.outpoint == outpoint) {
+                    psbt_input.witness_utxo = Some(utxo.txout.clone());
+                    info!("🔧 Manually set witness_utxo for input {}", i);
+                }
+            }
+        }
+
+        // Debug: check PSBT state after building
+        for (i, input) in psbt.inputs.iter().enumerate() {
+            info!("🔍 Input {} after build - witness_utxo: {}, non_witness_utxo: {}, tap_internal_key: {}, tap_key_origins: {}",
+                  i,
+                  input.witness_utxo.is_some(),
+                  input.non_witness_utxo.is_some(),
+                  input.tap_internal_key.is_some(),
+                  input.tap_key_origins.len());
+        }
+
+        Ok(psbt)
+    }
+
+    /// Sign a PSBT with the wallet's keys.
+    /// Returns true if the PSBT is fully signed after this operation.
+    pub async fn sign_psbt(&mut self, psbt: &mut Psbt) -> Result<bool> {
+        let mut wallet = self.wallet.lock().await;
+
+        info!("🔍 Signing PSBT with {} inputs", psbt.inputs.len());
+
+        // Debug: Get wallet's key fingerprint
+        let descriptor = wallet.public_descriptor(KeychainKind::External);
+        info!("🔍 Wallet descriptor: {}", descriptor);
+
+        // Debug: check PSBT state before signing
+        for (i, input) in psbt.inputs.iter().enumerate() {
+            info!("🔍 Input {} BEFORE sign:", i);
+            info!("    - witness_utxo: {}", input.witness_utxo.is_some());
+            info!("    - non_witness_utxo: {}", input.non_witness_utxo.is_some());
+            info!("    - tap_internal_key: {:?}", input.tap_internal_key);
+            info!("    - tap_merkle_root: {:?}", input.tap_merkle_root);
+            info!("    - tap_key_sig: {:?}", input.tap_key_sig);
+            info!("    - tap_key_origins: {}", input.tap_key_origins.len());
+
+            // Debug: inspect tap_key_origins
+            for (pubkey, (leaf_hashes, (fingerprint, derivation_path))) in &input.tap_key_origins {
+                info!("      - pubkey: {}", pubkey);
+                info!("        fingerprint: {}", fingerprint);
+                info!("        derivation_path: {}", derivation_path);
+                info!("        leaf_hashes: {:?}", leaf_hashes);
+            }
+
+            info!("    - bip32_derivation: {}", input.bip32_derivation.len());
+            info!("    - partial_sigs: {}", input.partial_sigs.len());
+            info!("    - final_witness: {}", input.final_script_witness.is_some());
+        }
+
+        let finalized = wallet.sign(psbt, SignOptions::default())?;
+        info!("🔍 Sign result - finalized: {}", finalized);
+
+        // Debug: check PSBT state after signing
+        for (i, input) in psbt.inputs.iter().enumerate() {
+            info!("🔍 Input {} AFTER sign:", i);
+            info!("    - tap_internal_key: {:?}", input.tap_internal_key);
+            info!("    - tap_key_sig: {:?}", input.tap_key_sig);
+            info!("    - tap_key_origins: {}", input.tap_key_origins.len());
+            info!("    - partial_sigs: {}", input.partial_sigs.len());
+            info!("    - final_witness: {}", input.final_script_witness.is_some());
+            if let Some(ref witness) = input.final_script_witness {
+                info!("    - witness stack size: {}", witness.len());
+            }
+        }
+
+        Ok(finalized)
+    }
+
+    /// Finalize a fully-signed PSBT into a transaction ready for broadcast.
+    /// Returns an error if the PSBT is not fully signed.
+    pub async fn finalize_psbt(&mut self, mut psbt: Psbt) -> Result<Transaction> {
+        // Extract the final transaction (validates PSBT structure and finalization)
+        let tx = psbt.extract_tx()?;
+
+        Ok(tx)
+    }
+
+    /// Broadcast a transaction to the network.
+    /// Note: In bdk_kyoto 0.13.1, we need to implement broadcasting.
+    /// For now, this returns the txid and prints the hex for manual broadcast.
+    pub async fn broadcast_transaction(&mut self, tx: Transaction) -> Result<Txid> {
+        use bdk_wallet::bitcoin::consensus::encode::serialize_hex;
+
+        let txid = tx.compute_txid();
+        let tx_hex = serialize_hex(&tx);
+
+        info!("📡 Transaction ready for broadcast");
+        info!("   Txid: {}", txid);
+        info!("   Hex: {}", tx_hex);
+
+        println!("\n⚠️  Broadcast not yet implemented - use this hex to broadcast manually:");
+        println!("{}", tx_hex);
+        println!();
+
+        Ok(txid)
+    }
+
+    /// Convenience method: Build, sign, finalize, and broadcast a transaction in one step.
+    /// This is the simple "send" interface for basic usage.
+    pub async fn send_to_address(
+        &mut self,
+        address_str: &str,
+        amount_sats: u64,
+        fee_rate_sat_vb: f32,
+    ) -> Result<Txid> {
+        // Parse address
+        let address = Address::from_str(address_str)
+            .map_err(|e| anyhow!("Invalid address: {}", e))?
+            .require_network(self.network)
+            .map_err(|e| anyhow!("Address network mismatch: {}", e))?;
+
+        // Build transaction
+        let recipients = vec![(address, Amount::from_sat(amount_sats))];
+        let fee_rate = FeeRate::from_sat_per_vb_unchecked(fee_rate_sat_vb as u64);
+
+        info!("🔨 Building transaction...");
+        let mut psbt = self.build_transaction(recipients, fee_rate).await?;
+
+        // Sign transaction
+        info!("✍️  Signing transaction...");
+        let finalized = self.sign_psbt(&mut psbt).await?;
+
+        if finalized {
+            info!("✅ PSBT fully signed and finalized");
+        } else {
+            info!("⚠️  PSBT signed but needs finalization");
+        }
+
+        // Finalize transaction (extract_tx will fail if not properly signed)
+        info!("🔐 Finalizing transaction...");
+        let tx = self.finalize_psbt(psbt).await?;
+
+        // Persist wallet state (update used UTXOs, change address, etc.)
+        {
+            let mut conn = self.conn.lock().await;
+            let mut wallet = self.wallet.lock().await;
+            wallet.persist(&mut conn)?;
+        } // Drop locks before broadcast
+
+        // Broadcast transaction
+        info!("📡 Broadcasting transaction...");
+        let txid = self.broadcast_transaction(tx).await?;
+
+        info!("✅ Transaction sent: {}", txid);
+
+        Ok(txid)
+    }
 
     // ============================================================
     // PUBLIC WALLET/STATE HELPERS (used by UI)

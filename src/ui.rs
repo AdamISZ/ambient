@@ -141,7 +141,40 @@ pub async fn repl(network_str: &str, recovery_height: u32) -> Result<()> {
           println!("No wallet loaded.");
       }
   }
-  
+
+  "send" => {
+      if args.len() != 3 {
+          println!("Usage: send <address> <amount_sats> <fee_rate_sat_vb>");
+          println!("Example: send tb1q... 10000 1.5");
+          continue;
+      }
+      if let Some(node) = current.as_mut() {
+          let address = args[0];
+          let amount: u64 = match args[1].parse() {
+              Ok(a) => a,
+              Err(_) => {
+                  println!("Invalid amount");
+                  continue;
+              }
+          };
+          let fee_rate: f32 = match args[2].parse() {
+              Ok(f) => f,
+              Err(_) => {
+                  println!("Invalid fee rate");
+                  continue;
+              }
+          };
+
+          println!("Sending {} sats to {} (fee rate: {} sat/vB)...", amount, address, fee_rate);
+          match node.send_to_address(address, amount, fee_rate).await {
+              Ok(txid) => println!("✅ Transaction broadcast: {}", txid),
+              Err(e) => println!("❌ Error: {}", e),
+          }
+      } else {
+          println!("No wallet loaded.");
+      }
+  }
+
             "quit" | "exit" => {
                 println!("👋 Goodbye.");
                 break;
@@ -158,13 +191,14 @@ pub async fn repl(network_str: &str, recovery_height: u32) -> Result<()> {
 
 fn print_help() {
     println!("Commands:");
-    println!("  generate <name>   - create a new wallet");
-    println!("  load <name>       - load an existing wallet");
-    println!("  balance           - show balance");
-    println!("  address           - get next receive address");
-    println!("  listunspent       - show UTXOs");
-    println!("  summary           - show wallet summary");
-    println!("  sync              - rescan recent blocks for this wallet");
-    println!("  help              - show this help message");
-    println!("  quit              - exit");
+    println!("  generate <name>         - create a new wallet");
+    println!("  load <name>             - load an existing wallet");
+    println!("  balance                 - show balance");
+    println!("  address                 - get next receive address");
+    println!("  listunspent             - show UTXOs");
+    println!("  summary                 - show wallet summary");
+    println!("  send <addr> <amt> <fee> - send transaction (addr, sats, sat/vB)");
+    println!("  sync                    - rescan recent blocks for this wallet");
+    println!("  help                    - show this help message");
+    println!("  quit                    - exit");
 }
