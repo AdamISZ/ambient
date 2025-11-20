@@ -1,0 +1,31 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# Cargo lock file (optional - uncomment if you want to ignore it)
+# Cargo.lock
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local wallet data
+.local/
+
+# Log files
+*.log
+
+# Kyoto light client data
+light_client_data/
+
+# Backup files
+*_bak.rs
+*_bak2.rs
