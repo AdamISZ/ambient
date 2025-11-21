@@ -1,3 +1,4 @@
+mod snicker;
 mod ui;
 mod wallet_node;
 

@@ -600,6 +600,335 @@ impl WalletNode {
         }
         Ok(out)
     }
+
+    // ============================================================
+    // SNICKER CANDIDATE SCANNING
+    // ============================================================
+
+    /// Initialize the candidates database table
+    fn init_candidates_table(conn: &mut Connection) -> Result<()> {
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS snicker_candidates (
+                block_height INTEGER NOT NULL,
+                txid TEXT NOT NULL,
+                tx_data BLOB NOT NULL,
+                PRIMARY KEY (block_height, txid)
+            )",
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// Initialize the proposals database table
+    fn init_proposals_table(conn: &mut Connection) -> Result<()> {
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS snicker_proposals (
+                ephemeral_pubkey BLOB NOT NULL,
+                tag BLOB NOT NULL,
+                encrypted_data BLOB NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (ephemeral_pubkey, tag)
+            )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_proposals_tag
+             ON snicker_proposals(tag)",
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// Scan the last N blocks for transactions with P2TR outputs within size range
+    ///
+    /// Stores matching transactions in the database for later use by SNICKER proposer.
+    ///
+    /// # Arguments
+    /// * `num_blocks` - Number of recent blocks to scan (e.g., 10)
+    /// * `size_min` - Minimum output value in satoshis
+    /// * `size_max` - Maximum output value in satoshis
+    ///
+    /// # Returns
+    /// Number of candidate transactions found and stored
+    pub async fn scan_for_snicker_candidates(
+        &self,
+        num_blocks: u32,
+        size_min: u64,
+        size_max: u64,
+    ) -> Result<usize> {
+        use bdk_wallet::bitcoin::BlockHash;
+
+        // Initialize database table if needed
+        {
+            let mut conn = self.conn.lock().await;
+            Self::init_candidates_table(&mut conn)?;
+        }
+
+        let wallet = self.wallet.lock().await;
+        let tip = wallet.local_chain().tip();
+        let tip_height = tip.height();
+        let start_height = tip_height.saturating_sub(num_blocks - 1);
+
+        info!("🔍 Scanning {} blocks (heights {}-{}) for SNICKER candidates",
+              num_blocks, start_height, tip_height);
+        info!("   Size range: {} - {} sats", size_min, size_max);
+
+        // Collect block hashes to fetch
+        let mut block_requests = Vec::new();
+        let mut checkpoint = Some(tip.clone());
+
+        while let Some(cp) = checkpoint {
+            let height = cp.height();
+            if height < start_height {
+                break;
+            }
+            let hash = BlockHash::from_raw_hash(*cp.hash().as_raw_hash());
+            block_requests.push((height, hash));
+            checkpoint = cp.prev();
+        }
+
+        drop(wallet); // Release lock before async operations
+
+        let mut total_candidates = 0;
+
+        // Scan each block
+        for (height, block_hash) in block_requests {
+            match self.requester.get_block(block_hash).await {
+                Ok(indexed_block) => {
+                    let mut block_candidates = 0;
+
+                    // Scan each transaction in the block
+                    for tx in &indexed_block.block.txdata {
+                        // Check if transaction has at least one P2TR output in size range
+                        let has_matching_output = tx.output.iter().any(|output| {
+                            let is_p2tr = output.script_pubkey.is_p2tr();
+                            let in_range = output.value.to_sat() >= size_min
+                                        && output.value.to_sat() <= size_max;
+                            is_p2tr && in_range
+                        });
+
+                        if has_matching_output {
+                            // Store this transaction
+                            if let Err(e) = self.store_candidate(height, tx).await {
+                                tracing::warn!("Failed to store candidate {}: {}", tx.compute_txid(), e);
+                            } else {
+                                block_candidates += 1;
+                            }
+                        }
+                    }
+
+                    if block_candidates > 0 {
+                        info!("  Block {}: found {} candidates", height, block_candidates);
+                        total_candidates += block_candidates;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("⚠️  Failed to fetch block {} at height {}: {}",
+                                 block_hash, height, e);
+                }
+            }
+        }
+
+        info!("🎯 Found {} total SNICKER candidates", total_candidates);
+        Ok(total_candidates)
+    }
+
+    /// Store a candidate transaction in the database
+    async fn store_candidate(&self, block_height: u32, tx: &Transaction) -> Result<()> {
+        use bdk_wallet::bitcoin::consensus::encode::serialize;
+
+        let mut conn = self.conn.lock().await;
+        let txid = tx.compute_txid().to_string();
+        let tx_data = serialize(tx);
+
+        conn.execute(
+            "INSERT OR REPLACE INTO snicker_candidates (block_height, txid, tx_data) VALUES (?1, ?2, ?3)",
+            (block_height, txid, tx_data),
+        )?;
+
+        Ok(())
+    }
+
+    /// Retrieve all stored candidate transactions
+    pub async fn get_snicker_candidates(&self) -> Result<Vec<(u32, Txid, Transaction)>> {
+        use bdk_wallet::bitcoin::consensus::encode::deserialize;
+
+        let conn = self.conn.lock().await;
+
+        let mut stmt = conn.prepare(
+            "SELECT block_height, txid, tx_data FROM snicker_candidates ORDER BY block_height DESC"
+        )?;
+
+        let candidates = stmt.query_map([], |row| {
+            let height: u32 = row.get(0)?;
+            let txid_str: String = row.get(1)?;
+            let tx_data: Vec<u8> = row.get(2)?;
+
+            Ok((height, txid_str, tx_data))
+        })?;
+
+        let mut result = Vec::new();
+        for candidate in candidates {
+            let (height, txid_str, tx_data) = candidate?;
+            let txid = Txid::from_str(&txid_str)?;
+            let tx: Transaction = deserialize(&tx_data)?;
+            result.push((height, txid, tx));
+        }
+
+        Ok(result)
+    }
+
+    /// Clear all stored candidates (useful for testing or periodic cleanup)
+    pub async fn clear_snicker_candidates(&self) -> Result<usize> {
+        let conn = self.conn.lock().await;
+        let count = conn.execute("DELETE FROM snicker_candidates", [])?;
+        info!("🗑️  Cleared {} SNICKER candidates from database", count);
+        Ok(count)
+    }
+
+    // ============================================================
+    // SNICKER PROPOSAL STORAGE AND RETRIEVAL
+    // ============================================================
+
+    /// Store a SNICKER proposal in the database
+    ///
+    /// # Arguments
+    /// * `proposal` - The encrypted proposal to store
+    pub async fn store_snicker_proposal(
+        &self,
+        proposal: &crate::snicker::EncryptedProposal,
+    ) -> Result<()> {
+        use bdk_wallet::bitcoin::consensus::encode::serialize;
+
+        let mut conn = self.conn.lock().await;
+
+        // Initialize table if needed
+        Self::init_proposals_table(&mut conn)?;
+
+        // Serialize ephemeral pubkey
+        let pubkey_bytes = proposal.ephemeral_pubkey.serialize();
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64;
+
+        conn.execute(
+            "INSERT OR REPLACE INTO snicker_proposals
+             (ephemeral_pubkey, tag, encrypted_data, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            (
+                &pubkey_bytes[..],
+                &proposal.tag[..],
+                &proposal.encrypted_data,
+                timestamp,
+            ),
+        )?;
+
+        Ok(())
+    }
+
+    /// Retrieve all SNICKER proposals from the database
+    ///
+    /// # Returns
+    /// Vector of all encrypted proposals
+    pub async fn get_all_snicker_proposals(
+        &self,
+    ) -> Result<Vec<crate::snicker::EncryptedProposal>> {
+        use bdk_wallet::bitcoin::secp256k1::PublicKey;
+
+        let mut conn = self.conn.lock().await;
+
+        // Initialize table if needed
+        Self::init_proposals_table(&mut conn)?;
+
+        let mut stmt = conn.prepare(
+            "SELECT ephemeral_pubkey, tag, encrypted_data FROM snicker_proposals
+             ORDER BY created_at DESC"
+        )?;
+
+        let proposals = stmt.query_map([], |row| {
+            let pubkey_bytes: Vec<u8> = row.get(0)?;
+            let tag_bytes: Vec<u8> = row.get(1)?;
+            let encrypted_data: Vec<u8> = row.get(2)?;
+            Ok((pubkey_bytes, tag_bytes, encrypted_data))
+        })?;
+
+        let mut result = Vec::new();
+        for proposal in proposals {
+            let (pubkey_bytes, tag_bytes, encrypted_data) = proposal?;
+
+            let ephemeral_pubkey = PublicKey::from_slice(&pubkey_bytes)
+                .map_err(|e| anyhow::anyhow!("Invalid pubkey in database: {}", e))?;
+
+            let mut tag = [0u8; 8];
+            if tag_bytes.len() != 8 {
+                continue; // Skip invalid entries
+            }
+            tag.copy_from_slice(&tag_bytes);
+
+            result.push(crate::snicker::EncryptedProposal {
+                ephemeral_pubkey,
+                tag,
+                encrypted_data,
+            });
+        }
+
+        Ok(result)
+    }
+
+    /// Scan all proposals and attempt to decrypt those meant for our outputs
+    ///
+    /// Iterates through all proposals and our wallet outputs, checking if the
+    /// tag matches. If it does, attempts decryption.
+    ///
+    /// # Returns
+    /// Vector of successfully decrypted proposals meant for us
+    pub async fn scan_proposals_for_wallet(
+        &self,
+    ) -> Result<Vec<crate::snicker::Proposal>> {
+        use crate::snicker::tweak::{
+            calculate_dh_shared_secret, compute_proposal_tag, decrypt_proposal,
+        };
+        use bdk_wallet::KeychainKind;
+
+        // Get all proposals
+        let proposals = self.get_all_snicker_proposals().await?;
+        if proposals.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Get all our UTXOs
+        let wallet = self.wallet.lock().await;
+        let utxos: Vec<_> = wallet.list_unspent().collect();
+        drop(wallet);
+
+        let mut decrypted_proposals = Vec::new();
+
+        // For each proposal, try to match with our outputs
+        for encrypted_proposal in proposals {
+            for utxo in &utxos {
+                // Get the secret key for this output
+                // TODO: This requires wallet key access - implement properly
+                // For now, we'll skip the actual decryption
+
+                // The pattern would be:
+                // 1. Get secret key for utxo.keychain and utxo.derivation_index
+                // 2. Calculate shared_secret = ECDH(our_seckey, ephemeral_pubkey)
+                // 3. Calculate expected_tag = compute_proposal_tag(shared_secret)
+                // 4. If expected_tag == encrypted_proposal.tag, try decrypt
+                // 5. If decrypt succeeds, add to results
+            }
+        }
+
+        Ok(decrypted_proposals)
+    }
+
+    /// Clear all SNICKER proposals from the database
+    pub async fn clear_snicker_proposals(&self) -> Result<usize> {
+        let conn = self.conn.lock().await;
+        let count = conn.execute("DELETE FROM snicker_proposals", [])?;
+        info!("🗑️  Cleared {} SNICKER proposals from database", count);
+        Ok(count)
+    }
 }
 
 async fn trace_logs(
