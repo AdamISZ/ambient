@@ -29,3 +29,24 @@ light_client_data/
 # Backup files
 *_bak.rs
 *_bak2.rs
+
+# CRITICAL: Bitcoin wallet sensitive data
+# SQLite wallet databases
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
+
+# Mnemonic seed phrases
+mnemonic*.txt
+seed*.txt
+*.mnemonic
+
+# Private keys
+*.key
+*.priv
+
+# Test wallet data (if accidentally created in repo)
+ambient_test_*
+ambient_kyoto_*
+/tmp/
