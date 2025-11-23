@@ -36,7 +36,7 @@ pub struct WalletNode {
     pub wallet: Arc<Mutex<PersistedWallet<Connection>>>,
     pub conn: Arc<Mutex<Connection>>,
     pub requester: bdk_kyoto::Requester,
-    update_subscriber: Arc<Mutex<bdk_kyoto::UpdateSubscriber>>,
+    pub(crate) update_subscriber: Arc<Mutex<bdk_kyoto::UpdateSubscriber>>,
     pub network: Network,
     /// Master extended private key (needed for SNICKER DH operations)
     pub(crate) xprv: bdk_wallet::bitcoin::bip32::Xpriv,
@@ -92,7 +92,7 @@ impl WalletNode {
         let (wallet, conn) = Self::load_or_create_wallet(&mnemonic, network, &db_path)?;
 
         let (requester, update_subscriber) =
-            Self::start_node(&wallet, network, recovery_height)?;
+            Self::start_node(&wallet, network, recovery_height, name)?;
 
         // Derive xprv from mnemonic for SNICKER operations
         let xkey: ExtendedKey = mnemonic.into_extended_key()?;
@@ -207,13 +207,45 @@ impl WalletNode {
         wallet: &PersistedWallet<Connection>,
         network: Network,
         from_height: u32,
+        wallet_name: &str,
     ) -> Result<(bdk_kyoto::Requester, bdk_kyoto::UpdateSubscriber)> {
         let scan_type = ScanType::Recovery {
             from_height,
         };
         info!("🔍 Recovery starting height: {}", from_height);
 
-        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(34, 135, 189, 101)), 38333);
+        // Select peer based on network
+        let peer = match network {
+            Network::Regtest => {
+                // Connect to local regtest node
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 18444)
+            }
+            Network::Signet => {
+                // Public signet node
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(34, 135, 189, 101)), 38333)
+            }
+            Network::Bitcoin | Network::Testnet => {
+                // TODO: Add mainnet/testnet peers
+                return Err(anyhow!("Mainnet/Testnet peers not configured yet"));
+            }
+            _ => {
+                return Err(anyhow!("Unsupported network: {:?}", network));
+            }
+        };
+        info!("🔗 Connecting to peer: {}", peer);
+
+        // Create Kyoto peer database directory (unique per wallet to avoid conflicts)
+        let project_dirs = ProjectDirs::from("org", "code", "rustsnicker")
+            .ok_or_else(|| anyhow!("Cannot determine project dir"))?;
+
+        let kyoto_db_path = project_dirs
+            .data_local_dir()
+            .join(format!("{:?}", network).to_lowercase())
+            .join(wallet_name)
+            .join("kyoto_peers");
+
+        std::fs::create_dir_all(&kyoto_db_path)?;
+        info!("📁 Kyoto peer database: {:?}", kyoto_db_path);
 
         let LightClient {
             requester,
@@ -225,6 +257,7 @@ impl WalletNode {
         } = NodeBuilder::new(network)
             .add_peer(peer)
             .required_peers(NUM_CONNECTIONS)
+            .data_dir(kyoto_db_path)
             .build_with_wallet(wallet, scan_type)
             .unwrap();
 
@@ -732,13 +765,55 @@ impl WalletNode {
         let path_str = format!("m/86h/{}h/0h/{}/{}", coin_type, change, derivation_index);
         let derivation_path = DerivationPath::from_str(&path_str)?;
 
-        // Derive the private key
-        let derived = self.xprv.derive_priv(
-            &bdk_wallet::bitcoin::secp256k1::Secp256k1::new(),
-            &derivation_path
-        )?;
+        // Derive the internal private key
+        let secp = bdk_wallet::bitcoin::secp256k1::Secp256k1::new();
+        let derived = self.xprv.derive_priv(&secp, &derivation_path)?;
+        let mut internal_key = derived.private_key;
 
-        Ok(derived.private_key)
+        // For BIP86 Taproot, we need to return the TWEAKED private key
+        // This matches the output key that appears in the P2TR script
+        use bdk_wallet::bitcoin::secp256k1::XOnlyPublicKey;
+        use bdk_wallet::bitcoin::taproot::TapTweakHash;
+        use bdk_wallet::bitcoin::hashes::Hash;
+
+        // CRITICAL: BIP341 requires the internal key to have even parity before computing the tweak
+        // If the internal pubkey has odd parity, negate the internal private key
+        let internal_pubkey_full = internal_key.public_key(&secp);
+        let has_odd_y = internal_pubkey_full.serialize()[0] == 0x03;
+        if has_odd_y {
+            internal_key = internal_key.negate();
+        }
+
+        // Get the even-parity x-only internal public key
+        let internal_pubkey = internal_key.public_key(&secp);
+        let internal_xonly = XOnlyPublicKey::from(internal_pubkey);
+
+        // Calculate BIP341 taproot tweak: t = hash_TapTweak(internal_key || merkle_root)
+        // For BIP86 (no script tree), merkle_root is None
+        let tweak_hash = TapTweakHash::from_key_and_tweak(internal_xonly, None);
+
+        // Convert the tweak hash to a scalar
+        let tweak_scalar = bdk_wallet::bitcoin::secp256k1::Scalar::from_be_bytes(
+            *tweak_hash.as_byte_array()
+        ).map_err(|_| anyhow::anyhow!("Invalid tweak scalar"))?;
+
+        // Apply tweak: tweaked_privkey = internal_privkey + tweak
+        let mut tweaked_seckey = internal_key.add_tweak(&tweak_scalar)?;
+
+        // BIP341: Check if the tweaked public key has odd parity
+        // If so, negate the private key to match the even-parity output key
+        let tweaked_pubkey = tweaked_seckey.public_key(&secp);
+        let tweaked_xonly = XOnlyPublicKey::from(tweaked_pubkey);
+
+        // Get the parity from the full public key
+        let parity = tweaked_pubkey.serialize()[0];
+
+        // If odd parity (0x03), negate the private key
+        if parity == 0x03 {
+            tweaked_seckey = tweaked_seckey.negate();
+        }
+
+        Ok(tweaked_seckey)
     }
 }
 

@@ -37,7 +37,10 @@
 
 pub mod tweak;
 
-use std::sync::Arc;
+#[cfg(test)]
+mod tweak_tests;
+
+use std::sync::{Arc, Mutex};
 use std::str::FromStr;
 
 use anyhow::Result;
@@ -46,7 +49,6 @@ use bdk_wallet::{
     rusqlite::Connection,
 };
 use serde::{Serialize, Deserialize};
-use tokio::sync::Mutex;
 
 // ============================================================
 // SNICKER TRANSACTION FILTERS
@@ -125,7 +127,7 @@ impl Snicker {
         let conn = Arc::new(Mutex::new(conn));
 
         // Initialize database tables
-        let mut conn_guard = conn.blocking_lock();
+        let mut conn_guard = conn.lock().unwrap();
         Self::init_candidates_table(&mut conn_guard)?;
         Self::init_proposals_table(&mut conn_guard)?;
         drop(conn_guard);
@@ -146,8 +148,8 @@ impl Snicker {
     /// along with a specified output from the proposer's wallet.
     ///
     /// Creates an encrypted proposal using an ephemeral key for privacy.
-    /// Returns both the unsigned PSBT (for the proposer to sign) and the encrypted proposal
-    /// (to be shared with the receiver).
+    /// The proposer's input is signed before encryption, so the encrypted proposal
+    /// contains a partially-signed PSBT.
     ///
     /// # Arguments
     /// * `target_tx` - The on-chain transaction containing the output to co-spend
@@ -158,10 +160,11 @@ impl Snicker {
     /// * `proposer_change_output_addr` - Address for proposer's change output
     /// * `delta_sats` - Fee adjustment (positive = receiver pays, 0 = proposer pays all, negative = proposer pays receiver)
     /// * `fee_rate` - Fee rate for the transaction
+    /// * `sign_psbt` - Callback to sign the PSBT (should only sign proposer's input)
     ///
     /// # Returns
-    /// Tuple of (unsigned PSBT, encrypted proposal)
-    pub fn propose(
+    /// Tuple of (partially-signed PSBT, encrypted proposal with signed PSBT)
+    pub fn propose<F>(
         &self,
         target_tx: Transaction,
         output_index: usize,
@@ -171,7 +174,11 @@ impl Snicker {
         proposer_change_output_addr: bdk_wallet::bitcoin::Address,
         delta_sats: i64,
         fee_rate: bdk_wallet::bitcoin::FeeRate,
-    ) -> Result<(Psbt, EncryptedProposal)> {
+        sign_psbt: F,
+    ) -> Result<(Psbt, EncryptedProposal)>
+    where
+        F: FnOnce(&mut Psbt) -> Result<()>,
+    {
         use bdk_wallet::bitcoin::secp256k1::{rand, Secp256k1, SecretKey};
 
         // 1. Create the tweaked output
@@ -179,8 +186,8 @@ impl Snicker {
             .ok_or_else(|| anyhow::anyhow!("Output index out of bounds"))?;
         let (tweaked_output, proposer_pubkey) = self.create_tweaked_output(target_output)?;
 
-        // 2. Build the PSBT (unsigned - caller will sign)
-        let psbt = self.build_psbt(
+        // 2. Build the PSBT (unsigned)
+        let mut psbt = self.build_psbt(
             &target_tx,
             output_index,
             tweaked_output.clone(),
@@ -192,7 +199,10 @@ impl Snicker {
             fee_rate,
         )?;
 
-        // 3. Create the proposal with real keys
+        // 3. Sign the proposer's input (partial signature)
+        sign_psbt(&mut psbt)?;
+
+        // 4. Create the proposal with signed PSBT
         let tweak_info = TweakInfo {
             original_output: (*target_output).clone(),
             tweaked_output,
@@ -203,13 +213,13 @@ impl Snicker {
             tweak_info
         };
 
-        // 4. Generate ephemeral keypair for encryption
+        // 5. Generate ephemeral keypair for encryption
         let secp = Secp256k1::new();
         let mut rng = rand::thread_rng();
         let ephemeral_seckey = SecretKey::new(&mut rng);
         let ephemeral_pubkey = ephemeral_seckey.public_key(&secp);
 
-        // 5. Extract receiver's pubkey from target output
+        // 6. Extract receiver's pubkey from target output
         let receiver_pubkey_xonly = tweak::extract_taproot_pubkey(target_output)?;
         // Convert x-only to full pubkey (assume even parity)
         let mut receiver_pubkey_bytes = [0u8; 33];
@@ -219,16 +229,16 @@ impl Snicker {
             &receiver_pubkey_bytes
         )?;
 
-        // 6. Calculate shared secret using ephemeral key
+        // 7. Calculate shared secret using ephemeral key
         let shared_secret = tweak::calculate_dh_shared_secret(
             &ephemeral_seckey,
             &receiver_pubkey
         );
 
-        // 7. Calculate tag
+        // 8. Calculate tag
         let tag = tweak::compute_proposal_tag(&shared_secret);
 
-        // 8. Serialize and encrypt the proposal
+        // 9. Serialize and encrypt the proposal (contains partially-signed PSBT)
         let proposal_bytes = serde_json::to_vec(&proposal)?;
         let encrypted_data = tweak::encrypt_proposal(&proposal_bytes, &shared_secret)?;
 
@@ -238,7 +248,7 @@ impl Snicker {
             encrypted_data,
         };
 
-        // Return both the unsigned PSBT (for signing) and the encrypted proposal (for sharing)
+        // Return both the partially-signed PSBT and the encrypted proposal (for sharing)
         Ok((psbt, encrypted_proposal))
     }
 
@@ -341,7 +351,10 @@ impl Snicker {
         // Build outputs vector
         let outputs = vec![
             // Equal output 1: to receiver (tweaked)
-            tweaked_output,
+            TxOut {
+                value: equal_output_amount,
+                script_pubkey: tweaked_output.script_pubkey,
+            },
             // Equal output 2: to proposer
             TxOut {
                 value: equal_output_amount,
@@ -677,7 +690,7 @@ impl Snicker {
     pub async fn store_candidate(&self, block_height: u32, tx: &Transaction) -> Result<()> {
         use bdk_wallet::bitcoin::consensus::encode::serialize;
 
-        let conn = self.conn.lock().await;
+        let conn = self.conn.lock().unwrap();
         let txid = tx.compute_txid().to_string();
         let tx_data = serialize(tx);
 
@@ -693,7 +706,7 @@ impl Snicker {
     pub async fn get_snicker_candidates(&self) -> Result<Vec<(u32, Txid, Transaction)>> {
         use bdk_wallet::bitcoin::consensus::encode::deserialize;
 
-        let conn = self.conn.lock().await;
+        let conn = self.conn.lock().unwrap();
 
         let mut stmt = conn.prepare(
             "SELECT block_height, txid, tx_data FROM snicker_candidates ORDER BY block_height DESC"
@@ -720,7 +733,7 @@ impl Snicker {
 
     /// Clear all stored candidates
     pub async fn clear_snicker_candidates(&self) -> Result<usize> {
-        let conn = self.conn.lock().await;
+        let conn = self.conn.lock().unwrap();
         let count = conn.execute("DELETE FROM snicker_candidates", [])?;
         tracing::info!("🗑️  Cleared {} SNICKER candidates from database", count);
         Ok(count)
@@ -728,7 +741,7 @@ impl Snicker {
 
     /// Store a SNICKER proposal in the database
     pub async fn store_snicker_proposal(&self, proposal: &EncryptedProposal) -> Result<()> {
-        let conn = self.conn.lock().await;
+        let conn = self.conn.lock().unwrap();
 
         let pubkey_bytes = proposal.ephemeral_pubkey.serialize();
         let timestamp = std::time::SystemTime::now()
@@ -754,7 +767,7 @@ impl Snicker {
     pub async fn get_all_snicker_proposals(&self) -> Result<Vec<EncryptedProposal>> {
         use bdk_wallet::bitcoin::secp256k1::PublicKey;
 
-        let conn = self.conn.lock().await;
+        let conn = self.conn.lock().unwrap();
 
         let mut stmt = conn.prepare(
             "SELECT ephemeral_pubkey, tag, encrypted_data FROM snicker_proposals
@@ -793,7 +806,7 @@ impl Snicker {
 
     /// Clear all SNICKER proposals from the database
     pub async fn clear_snicker_proposals(&self) -> Result<usize> {
-        let conn = self.conn.lock().await;
+        let conn = self.conn.lock().unwrap();
         let count = conn.execute("DELETE FROM snicker_proposals", [])?;
         tracing::info!("🗑️  Cleared {} SNICKER proposals from database", count);
         Ok(count)

@@ -113,6 +113,66 @@ impl Manager {
         self.wallet_node.print_summary().await
     }
 
+    /// Wait for wallet to sync to at least the specified height
+    ///
+    /// Actively pulls updates from Kyoto and applies them to the wallet until
+    /// it reaches the target height, or times out.
+    ///
+    /// # Arguments
+    /// * `target_height` - Minimum height to wait for
+    /// * `timeout_secs` - Maximum seconds to wait (default 30)
+    pub async fn wait_for_height(&self, target_height: u32, timeout_secs: u64) -> Result<u32> {
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(timeout_secs);
+
+        loop {
+            // Check if we've reached the expected height
+            {
+                let wallet = self.wallet_node.wallet.lock().await;
+                let current_height = wallet.local_chain().tip().height();
+                if current_height >= target_height {
+                    tracing::info!("✅ Synced to height {}", current_height);
+                    return Ok(current_height);
+                }
+            }
+
+            // Try to get next update with timeout
+            let mut sub = self.wallet_node.update_subscriber.lock().await;
+            let update_result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                sub.update()
+            ).await;
+            drop(sub);
+
+            match update_result {
+                Ok(Ok(update)) => {
+                    let mut wallet = self.wallet_node.wallet.lock().await;
+                    let mut conn = self.wallet_node.conn.lock().await;
+
+                    wallet.apply_update(update)?;
+                    wallet.persist(&mut conn)?;
+
+                    let height = wallet.local_chain().tip().height();
+                    tracing::info!("Sync update: height {} / {}", height, target_height);
+                }
+                Ok(Err(e)) => return Err(anyhow::anyhow!("Sync error: {}", e)),
+                Err(_) => {
+                    // Timeout on this update - check if we've exceeded total timeout
+                    if start.elapsed() > timeout {
+                        let wallet = self.wallet_node.wallet.lock().await;
+                        let current_height = wallet.local_chain().tip().height();
+                        return Err(anyhow::anyhow!(
+                            "Sync timeout: only reached height {} (expected >= {})",
+                            current_height, target_height
+                        ));
+                    }
+                    // Otherwise continue waiting
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
+        }
+    }
+
     // ============================================================
     // SNICKER OPERATIONS (coordinate between WalletNode and Snicker)
     // ============================================================
@@ -175,9 +235,9 @@ impl Manager {
     /// * `delta_sats` - Fee adjustment (positive = receiver pays more, negative = proposer incentivizes)
     ///
     /// # Returns
-    /// Tuple of (unsigned PSBT for proposer to sign, encrypted proposal to publish)
+    /// Tuple of (partially-signed PSBT, encrypted proposal with signed PSBT to publish)
     pub async fn create_snicker_proposal(
-        &self,
+        &mut self,
         opportunity: &ProposalOpportunity,
         delta_sats: i64,
     ) -> Result<(Psbt, EncryptedProposal)> {
@@ -202,7 +262,26 @@ impl Manager {
         // Get fee rate from wallet
         let fee_rate = self.wallet_node.get_fee_rate();
 
-        // Create proposal using Snicker
+        // Create signing callback that signs the proposer's input
+        // Use block_in_place to allow blocking operations in async context
+        let wallet_clone = self.wallet_node.wallet.clone();
+        let sign_callback = move |psbt: &mut Psbt| -> Result<()> {
+            let mut wallet = tokio::task::block_in_place(|| {
+                wallet_clone.blocking_lock()
+            });
+
+            // Sign with trust_witness_utxo enabled
+            // This allows signing without non_witness_utxo when witness_utxo is present
+            let sign_options = bdk_wallet::SignOptions {
+                trust_witness_utxo: true,
+                ..Default::default()
+            };
+
+            wallet.sign(psbt, sign_options)?;
+            Ok(())
+        };
+
+        // Create proposal using Snicker (will sign via callback)
         let (psbt, encrypted_proposal) = self.snicker.propose(
             opportunity.target_tx.clone(),
             opportunity.target_output_index,
@@ -212,30 +291,21 @@ impl Manager {
             change_output_addr,
             delta_sats,
             fee_rate,
+            sign_callback,
         )?;
 
         Ok((psbt, encrypted_proposal))
     }
 
-    /// Sign a SNICKER proposal PSBT and finalize it
+    /// Finalize a fully-signed PSBT into a transaction
     ///
     /// # Arguments
-    /// * `psbt` - The unsigned PSBT from create_snicker_proposal
+    /// * `psbt` - A fully-signed PSBT (both proposer and receiver have signed)
     ///
     /// # Returns
     /// The finalized transaction ready for broadcast
-    pub async fn sign_and_finalize_proposal(&mut self, mut psbt: Psbt) -> Result<Transaction> {
-        // Sign with wallet
-        let finalized = self.wallet_node.sign_psbt(&mut psbt).await?;
-
-        if !finalized {
-            return Err(anyhow::anyhow!("PSBT not fully signed"));
-        }
-
-        // Finalize
-        let tx = self.wallet_node.finalize_psbt(psbt).await?;
-
-        Ok(tx)
+    pub async fn finalize_psbt(&mut self, psbt: Psbt) -> Result<Transaction> {
+        self.wallet_node.finalize_psbt(psbt).await
     }
 
     /// Store an encrypted SNICKER proposal (for publishing/sharing)
@@ -292,22 +362,22 @@ impl Manager {
     /// Accept and sign a SNICKER proposal as receiver
     ///
     /// # Arguments
-    /// * `proposal` - The proposal to accept
+    /// * `proposal` - The proposal to accept (contains proposer's signature)
     /// * `acceptable_delta_range` - Min and max delta we'll accept
     ///
     /// # Returns
-    /// Signed transaction ready for broadcast
+    /// Fully-signed PSBT (both parties signed) ready for finalization
     pub async fn accept_snicker_proposal(
         &mut self,
         proposal: Proposal,
         acceptable_delta_range: (i64, i64),
-    ) -> Result<Transaction> {
+    ) -> Result<Psbt> {
         // Get our UTXOs from wallet
         let wallet = self.wallet_node.wallet.lock().await;
         let our_utxos: Vec<_> = wallet.list_unspent().collect();
         drop(wallet);
 
-        // Validate and get unsigned PSBT from Snicker
+        // Validate and get PSBT from Snicker (already has proposer's signature)
         let mut psbt = self.snicker.receive(
             proposal,
             &our_utxos,
@@ -315,17 +385,11 @@ impl Manager {
             |keychain, index| self.wallet_node.derive_utxo_privkey(keychain, index),
         )?;
 
-        // Sign with wallet
-        let finalized = self.wallet_node.sign_psbt(&mut psbt).await?;
+        // Sign with wallet (adds receiver's signature)
+        self.wallet_node.sign_psbt(&mut psbt).await?;
 
-        if !finalized {
-            return Err(anyhow::anyhow!("PSBT not fully signed after receiver signature"));
-        }
-
-        // Finalize
-        let tx = self.wallet_node.finalize_psbt(psbt).await?;
-
-        Ok(tx)
+        // Return fully-signed PSBT (caller can finalize and broadcast)
+        Ok(psbt)
     }
 
     /// Broadcast a transaction to the network
