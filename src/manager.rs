@@ -65,7 +65,7 @@ impl Manager {
     ) -> Result<Snicker> {
         use directories::ProjectDirs;
 
-        let project_dirs = ProjectDirs::from("org", "code", "rustsnicker")
+        let project_dirs = ProjectDirs::from("org", "code", "ambient")
             .ok_or_else(|| anyhow::anyhow!("Cannot determine project dir"))?;
 
         let snicker_db_path = project_dirs

@@ -177,6 +177,41 @@ pub fn verify_tweaked_output(
     Ok(shared_secret)
 }
 
+/// Apply a tweak to a secret key with proper parity handling for x-only keys
+///
+/// When tweaking a secret key, the resulting public key may have odd parity.
+/// Since x-only keys in BIP340/Taproot always have even parity, we must negate
+/// the secret key if the resulting public key has odd parity.
+///
+/// This ensures: XOnlyPublicKey::from(tweaked_seckey) == expected_xonly_pubkey
+///
+/// # Arguments
+/// * `seckey` - The secret key to tweak
+/// * `tweak` - The tweak as a scalar
+///
+/// # Returns
+/// The tweaked secret key with even-parity public key
+pub fn apply_tweak_to_seckey_with_parity(
+    seckey: &SecretKey,
+    tweak: &Scalar,
+) -> Result<SecretKey> {
+    let secp = Secp256k1::new();
+
+    // Apply tweak: tweaked_seckey = seckey + tweak
+    let mut tweaked = seckey.add_tweak(tweak)?;
+
+    // Check parity of resulting public key
+    let pubkey = PublicKey::from_secret_key(&secp, &tweaked);
+    let has_odd_y = pubkey.serialize()[0] == 0x03;
+
+    // If odd parity, negate to match x-only (even parity) convention
+    if has_odd_y {
+        tweaked = tweaked.negate();
+    }
+
+    Ok(tweaked)
+}
+
 /// Calculate the tweaked secret key (for receiver to sign)
 ///
 /// The receiver needs to derive their tweaked private key to sign
@@ -449,15 +484,21 @@ mod tests {
         // Step 2: Calculate taproot tweak
         let taproot_tweak_scalar = calculate_taproot_tweak_scalar(&internal_pubkey_xonly).unwrap();
 
-        // Apply taproot tweak to secret key: q_tap = p + t_tap
-        let taproot_tweaked_seckey = internal_seckey.add_tweak(&taproot_tweak_scalar).unwrap();
+        // Apply taproot tweak to secret key with parity handling
+        let taproot_tweaked_seckey = apply_tweak_to_seckey_with_parity(
+            &internal_seckey,
+            &taproot_tweak_scalar
+        ).unwrap();
 
         // Step 3: Apply SNICKER tweak
         let snicker_tweak = [0xBB; 32];
         let snicker_tweak_scalar = Scalar::from_be_bytes(snicker_tweak).unwrap();
 
-        // Final secret key: q_final = q_tap + t_snicker = p + t_tap + t_snicker
-        let final_seckey = taproot_tweaked_seckey.add_tweak(&snicker_tweak_scalar).unwrap();
+        // Apply SNICKER tweak to get final secret key with parity handling
+        let final_seckey = apply_tweak_to_seckey_with_parity(
+            &taproot_tweaked_seckey,
+            &snicker_tweak_scalar
+        ).unwrap();
 
         // Derive public key from final secret key
         let final_pubkey_from_seckey = PublicKey::from_secret_key(&secp, &final_seckey);

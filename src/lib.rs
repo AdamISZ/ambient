@@ -1,4 +1,4 @@
-// Library interface for rustsnicker
+// Library interface for ambient wallet
 // Exposes public modules for testing
 
 pub mod manager;

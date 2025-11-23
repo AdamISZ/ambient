@@ -140,7 +140,7 @@ impl WalletNode {
     }
 
     fn wallet_paths(name: &str, network_str: &str) -> Result<(PathBuf, PathBuf, PathBuf)> {
-        let project_dirs = ProjectDirs::from("org", "code", "rustsnicker")
+        let project_dirs = ProjectDirs::from("org", "code", "ambient")
             .ok_or_else(|| anyhow!("Cannot determine project dir"))?;
 
         let wallet_dir = project_dirs.data_local_dir().join(network_str).join(name);
@@ -235,7 +235,7 @@ impl WalletNode {
         info!("🔗 Connecting to peer: {}", peer);
 
         // Create Kyoto peer database directory (unique per wallet to avoid conflicts)
-        let project_dirs = ProjectDirs::from("org", "code", "rustsnicker")
+        let project_dirs = ProjectDirs::from("org", "code", "ambient")
             .ok_or_else(|| anyhow!("Cannot determine project dir"))?;
 
         let kyoto_db_path = project_dirs

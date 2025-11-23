@@ -417,7 +417,7 @@ impl TestWallet {
         let internal_desc = format!("tr({}/86h/{}h/0h/1/*)", xprv, coin_type);
 
         // Create temporary database for this test
-        let db_path = std::env::temp_dir().join(format!("rustsnicker_test_{}_{}.sqlite",
+        let db_path = std::env::temp_dir().join(format!("ambient_test_{}_{}.sqlite",
             test_name,
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -444,7 +444,7 @@ impl TestWallet {
         let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), BITCOIND.p2p_port);
 
         // Create temporary directory for Kyoto's peer database
-        let kyoto_db_path = std::env::temp_dir().join(format!("rustsnicker_kyoto_{}_{}",
+        let kyoto_db_path = std::env::temp_dir().join(format!("ambient_kyoto_{}_{}",
             test_name,
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

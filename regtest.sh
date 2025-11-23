@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Regtest bitcoind management script for rustsnicker testing
+# Regtest bitcoind management script for ambient wallet testing
 
 set -e
 
-DATADIR="/tmp/rustsnicker-regtest"
+DATADIR="/tmp/ambient-regtest"
 
 # Check if second argument is a directory path (bitcoin bin directory)
 if [ -n "$2" ] && [ -d "$2" ]; then

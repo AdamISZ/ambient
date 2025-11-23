@@ -8,7 +8,7 @@ mod common;
 use common::{BITCOIND, TestBitcoind};
 
 // Import Manager from main crate
-use rustsnicker::manager::Manager;
+use ambient::manager::Manager;
 
 // ============================================================
 // SNICKER END-TO-END TEST

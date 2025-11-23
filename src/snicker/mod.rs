@@ -6,7 +6,7 @@
 //! # Example Usage
 //!
 //! ```no_run
-//! use rustsnicker::snicker::Snicker;
+//! use ambient::snicker::Snicker;
 //! use bdk_wallet::bitcoin::Transaction;
 //!
 //! # async fn example(wallet_node: &WalletNode) -> anyhow::Result<()> {

@@ -43,10 +43,10 @@ impl Net {
 async fn main() -> Result<()> {
     let args = Args::parse();
     let project_dirs = directories::ProjectDirs
-    ::from("org", "code", "rustsnicker").unwrap();
+    ::from("org", "code", "ambient").unwrap();
     let log_path = project_dirs.data_local_dir()
     .join(args.network.as_str()).join( "logs")
-    .join("rustsnicker.log");
+    .join("ambient.log");
     std::fs::create_dir_all(log_path.parent().unwrap())?;
     let log_file = OpenOptions::new()
         .create(true)

@@ -93,7 +93,7 @@ The test infrastructure automatically kills stale processes, but if you see this
 lsof -ti :18443 | xargs kill -9
 
 # Clean up temp directories
-rm -rf /tmp/.tmp* /tmp/rustsnicker_*
+rm -rf /tmp/.tmp* /tmp/ambient_*
 ```
 
 ### Tests timing out
@@ -106,7 +106,7 @@ If `wait_for_sync()` times out:
 Each test creates a unique database file. If you see conflicts:
 ```bash
 # Clean up old test databases
-rm -rf /tmp/rustsnicker_*
+rm -rf /tmp/ambient_*
 ```
 
 ## Manual Testing with regtest.sh
