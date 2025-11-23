@@ -276,9 +276,17 @@ async fn test_snicker_end_to_end() -> Result<()> {
     assert!(equal_output_exists, "Should have two equal-sized outputs for privacy");
 
     println!("\n📡 Broadcasting transaction...");
-    let txid = alice_mgr.broadcast_transaction(coinjoin_tx).await?;
+    let txid = coinjoin_tx.compute_txid();
+
+    // Broadcast via bitcoind RPC (for regtest testing)
+    use bdk_wallet::bitcoin::consensus::encode::serialize_hex;
+    let tx_hex = serialize_hex(&coinjoin_tx);
+    let broadcast_result = BITCOIND.rpc_call("sendrawtransaction", &[
+        serde_json::json!(tx_hex),
+    ], None)?;
     println!("   ✅ Transaction broadcast!");
     println!("   Txid: {}", txid);
+    println!("   Broadcast result: {}", broadcast_result);
 
     // Mine a block to confirm
     println!("\n⛏️  Mining 1 block to confirm transaction...");
@@ -287,8 +295,11 @@ async fn test_snicker_end_to_end() -> Result<()> {
     println!("   ✅ Block mined, height: {}", final_height);
 
     // Wait for sync
-    println!("\n⏳ Waiting for wallets to see confirmed transaction...");
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    println!("\n⏳ Waiting for wallets to sync to height {}...", final_height);
+    alice_mgr.wait_for_height(final_height, 30).await?;
+    println!("   ✅ Alice synced");
+    bob_mgr.wait_for_height(final_height, 30).await?;
+    println!("   ✅ Bob synced");
 
     let alice_final_balance = alice_mgr.get_balance().await?;
     let bob_final_balance = bob_mgr.get_balance().await?;

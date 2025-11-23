@@ -249,6 +249,10 @@ impl Manager {
             .find(|utxo| utxo.outpoint == opportunity.our_outpoint)
             .ok_or_else(|| anyhow::anyhow!("UTXO not found in wallet"))?;
 
+        // Derive the proposer's input private key (for SNICKER tweak)
+        let our_keychain = our_utxo.keychain;
+        let our_derivation_index = our_utxo.derivation_index;
+
         // Get addresses for outputs
         let equal_output_addr = wallet.reveal_next_address(bdk_wallet::KeychainKind::External).address;
         let change_output_addr = wallet.reveal_next_address(bdk_wallet::KeychainKind::Internal).address;
@@ -258,6 +262,9 @@ impl Manager {
 
         drop(wallet);
         drop(conn);
+
+        // Derive our input private key (the proposer's input key used for SNICKER tweak)
+        let our_input_privkey = self.wallet_node.derive_utxo_privkey(our_keychain, our_derivation_index)?;
 
         // Get fee rate from wallet
         let fee_rate = self.wallet_node.get_fee_rate();
@@ -287,6 +294,7 @@ impl Manager {
             opportunity.target_output_index,
             our_utxo.outpoint,
             our_utxo.txout.clone(),
+            our_input_privkey,  // Proposer's input key for SNICKER tweak (enables recovery)
             equal_output_addr,
             change_output_addr,
             delta_sats,

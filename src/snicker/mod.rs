@@ -130,6 +130,7 @@ impl Snicker {
         let mut conn_guard = conn.lock().unwrap();
         Self::init_candidates_table(&mut conn_guard)?;
         Self::init_proposals_table(&mut conn_guard)?;
+        Self::init_snicker_utxos_table(&mut conn_guard)?;
         drop(conn_guard);
 
         Ok(Self {
@@ -170,6 +171,7 @@ impl Snicker {
         output_index: usize,
         proposer_outpoint: OutPoint,
         proposer_utxo_txout: TxOut,
+        proposer_input_seckey: bdk_wallet::bitcoin::secp256k1::SecretKey,
         proposer_equal_output_addr: bdk_wallet::bitcoin::Address,
         proposer_change_output_addr: bdk_wallet::bitcoin::Address,
         delta_sats: i64,
@@ -181,10 +183,17 @@ impl Snicker {
     {
         use bdk_wallet::bitcoin::secp256k1::{rand, Secp256k1, SecretKey};
 
-        // 1. Create the tweaked output
+        // 1. Extract proposer's input public key from the UTXO being spent
+        let secp = Secp256k1::new();
+        let proposer_input_pubkey = proposer_input_seckey.public_key(&secp);
+
+        // 2. Create the tweaked output using proposer's input key
         let target_output = &target_tx.output.get(output_index)
             .ok_or_else(|| anyhow::anyhow!("Output index out of bounds"))?;
-        let (tweaked_output, proposer_pubkey) = self.create_tweaked_output(target_output)?;
+        let (tweaked_output, snicker_shared_secret) = self.create_tweaked_output(
+            target_output,
+            &proposer_input_seckey,
+        )?;
 
         // 2. Build the PSBT (unsigned)
         let mut psbt = self.build_psbt(
@@ -206,15 +215,14 @@ impl Snicker {
         let tweak_info = TweakInfo {
             original_output: (*target_output).clone(),
             tweaked_output,
-            proposer_pubkey,
+            proposer_pubkey: proposer_input_pubkey,
         };
         let proposal = Proposal {
             psbt: psbt.clone(),
             tweak_info
         };
 
-        // 5. Generate ephemeral keypair for encryption
-        let secp = Secp256k1::new();
+        // 5. Generate ephemeral keypair for encryption (separate from SNICKER tweak)
         let mut rng = rand::thread_rng();
         let ephemeral_seckey = SecretKey::new(&mut rng);
         let ephemeral_pubkey = ephemeral_seckey.public_key(&secp);
@@ -229,18 +237,20 @@ impl Snicker {
             &receiver_pubkey_bytes
         )?;
 
-        // 7. Calculate shared secret using ephemeral key
-        let shared_secret = tweak::calculate_dh_shared_secret(
+        // 7. Calculate encryption shared secret using ephemeral key (for privacy)
+        let encryption_shared_secret = tweak::calculate_dh_shared_secret(
             &ephemeral_seckey,
             &receiver_pubkey
         );
 
-        // 8. Calculate tag
-        let tag = tweak::compute_proposal_tag(&shared_secret);
+        // 8. Calculate tag from encryption shared secret (for efficient proposal matching)
+        // Receiver tries each UTXO with ephemeral key to check tag before decrypting
+        let tag = tweak::compute_proposal_tag(&encryption_shared_secret);
 
         // 9. Serialize and encrypt the proposal (contains partially-signed PSBT)
+        // After decryption, receiver will extract proposer's input key from PSBT witness
         let proposal_bytes = serde_json::to_vec(&proposal)?;
-        let encrypted_data = tweak::encrypt_proposal(&proposal_bytes, &shared_secret)?;
+        let encrypted_data = tweak::encrypt_proposal(&proposal_bytes, &encryption_shared_secret)?;
 
         let encrypted_proposal = EncryptedProposal {
             ephemeral_pubkey,
@@ -454,17 +464,16 @@ impl Snicker {
         Ok(psbt)
     }
 
-    /// Create a tweaked output from an original output
-    fn create_tweaked_output(&self, original: &TxOut) -> Result<(TxOut, PublicKey)> {
-        use bdk_wallet::bitcoin::secp256k1::{rand, Secp256k1, SecretKey};
-
-        // 1. Generate a fresh proposer secret key for this proposal
-        let secp = Secp256k1::new();
-        let mut rng = rand::thread_rng();
-        let proposer_seckey = SecretKey::new(&mut rng);
-        let proposer_pubkey = PublicKey::from_secret_key(&secp, &proposer_seckey);
-
-        // 2. Extract receiver's public key from the original output
+    /// Create a tweaked output from an original output using the proposer's input key
+    ///
+    /// This uses the proposer's INPUT private key (not ephemeral) for the SNICKER tweak,
+    /// enabling wallet recovery from seed alone by scanning spent UTXOs.
+    fn create_tweaked_output(
+        &self,
+        original: &TxOut,
+        proposer_input_seckey: &bdk_wallet::bitcoin::secp256k1::SecretKey,
+    ) -> Result<(TxOut, [u8; 32])> {
+        // 1. Extract receiver's public key from the original output
         let receiver_pubkey_xonly = tweak::extract_taproot_pubkey(original)?;
 
         // Convert x-only to full pubkey (assume even parity)
@@ -473,15 +482,15 @@ impl Snicker {
         receiver_pubkey_bytes[1..].copy_from_slice(&receiver_pubkey_xonly);
         let receiver_pubkey = PublicKey::from_slice(&receiver_pubkey_bytes)?;
 
-        // 3. Create the tweaked output
-        let (tweaked_output, _tweak_value) = tweak::create_tweaked_output(
+        // 2. Create the tweaked output using proposer's INPUT key (for recoverability)
+        let (tweaked_output, snicker_shared_secret) = tweak::create_tweaked_output(
             original,
-            &proposer_seckey,
+            proposer_input_seckey,
             &receiver_pubkey
         )?;
 
-        // 4. Return tweaked output and proposer's pubkey
-        Ok((tweaked_output, proposer_pubkey))
+        // 3. Return tweaked output and the SNICKER shared secret
+        Ok((tweaked_output, snicker_shared_secret))
     }
 
 
@@ -602,11 +611,73 @@ impl Snicker {
     where
         F: Fn(bdk_wallet::KeychainKind, u32) -> Result<bdk_wallet::bitcoin::secp256k1::SecretKey>,
     {
+        // Validate inputs: all must be taproot, and verify proposer's input key
+        self.validate_inputs(&proposal.psbt, &proposal.tweak_info, our_utxos)?;
+
         // Validate amounts (including finding our input/output correctly)
         self.validate_amounts(&proposal.psbt, &proposal.tweak_info, our_utxos, acceptable_delta_range)?;
 
         // Verify the tweak is correct
         self.validate_tweak(&proposal.tweak_info, our_utxos, derive_privkey)?;
+
+        Ok(())
+    }
+
+    /// Validate that all inputs are taproot and verify proposer's input key
+    fn validate_inputs(
+        &self,
+        psbt: &Psbt,
+        tweak_info: &TweakInfo,
+        our_utxos: &[bdk_wallet::LocalOutput],
+    ) -> Result<()> {
+        // Find our input to identify which input is the proposer's
+        let our_input_idx = psbt.unsigned_tx.input.iter().position(|input| {
+            our_utxos.iter().any(|utxo| utxo.outpoint == input.previous_output)
+        }).ok_or_else(|| anyhow::anyhow!("Could not find our input in PSBT"))?;
+
+        // Find the proposer's input (first input that's not ours)
+        let proposer_input_idx = if our_input_idx == 0 { 1 } else { 0 };
+
+        // Get the proposer's input
+        let proposer_psbt_input = psbt.inputs.get(proposer_input_idx)
+            .ok_or_else(|| anyhow::anyhow!("Proposer input not found in PSBT"))?;
+
+        // Get the witness_utxo (previous output being spent)
+        let proposer_prevout = proposer_psbt_input.witness_utxo.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Proposer input missing witness_utxo"))?;
+
+        // Verify it's P2TR
+        if !proposer_prevout.script_pubkey.is_p2tr() {
+            return Err(anyhow::anyhow!("Proposer input is not P2TR"));
+        }
+
+        // Extract the proposer's input public key from the script
+        let proposer_input_pubkey_xonly = tweak::extract_taproot_pubkey(proposer_prevout)?;
+
+        // Convert to full pubkey (assume even parity)
+        let mut proposer_input_pubkey_bytes = [0u8; 33];
+        proposer_input_pubkey_bytes[0] = 0x02;
+        proposer_input_pubkey_bytes[1..].copy_from_slice(&proposer_input_pubkey_xonly);
+        let proposer_input_pubkey = PublicKey::from_slice(&proposer_input_pubkey_bytes)?;
+
+        // Verify it matches the proposer_pubkey in TweakInfo
+        if proposer_input_pubkey != tweak_info.proposer_pubkey {
+            return Err(anyhow::anyhow!(
+                "Proposer input pubkey mismatch: PSBT has {}, TweakInfo claims {}",
+                proposer_input_pubkey,
+                tweak_info.proposer_pubkey
+            ));
+        }
+
+        // Verify ALL inputs are P2TR (taproot only)
+        for (idx, input) in psbt.inputs.iter().enumerate() {
+            let prevout = input.witness_utxo.as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Input {} missing witness_utxo", idx))?;
+
+            if !prevout.script_pubkey.is_p2tr() {
+                return Err(anyhow::anyhow!("Input {} is not P2TR (taproot required)", idx));
+            }
+        }
 
         Ok(())
     }
@@ -637,7 +708,8 @@ impl Snicker {
         // Derive our secret key for this UTXO
         let receiver_seckey = derive_privkey(our_utxo.keychain, our_utxo.derivation_index)?;
 
-        // Verify the tweaked output was created correctly
+        // IMPORTANT: Verify the tweaked output was created using the proposer_pubkey from TweakInfo
+        // This ensures the SNICKER tweak uses the proposer's input key (for wallet recovery)
         tweak::verify_tweaked_output(
             &tweak_info.original_output,
             &tweak_info.tweaked_output,

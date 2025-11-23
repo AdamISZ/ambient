@@ -25,7 +25,7 @@ use bdk_wallet::{
 };
 
 use bdk_kyoto::builder::{NodeBuilder, NodeBuilderExt};
-use bdk_kyoto::{Info, LightClient, Receiver, ScanType, UnboundedReceiver, Warning};
+use bdk_kyoto::{Info, LightClient, Receiver, ScanType, UnboundedReceiver, Warning, TxBroadcast, TxBroadcastPolicy};
 
 const RECOVERY_LOOKAHEAD: u32 = 50;
 const NUM_CONNECTIONS: u8 = 1;
@@ -444,13 +444,16 @@ impl WalletNode {
         let txid = tx.compute_txid();
         let tx_hex = serialize_hex(&tx);
 
-        info!("📡 Transaction ready for broadcast");
+        info!("📡 Broadcasting transaction");
         info!("   Txid: {}", txid);
         info!("   Hex: {}", tx_hex);
 
-        println!("\n⚠️  Broadcast not yet implemented - use this hex to broadcast manually:");
-        println!("{}", tx_hex);
-        println!();
+        // Broadcast via Kyoto requester to all connected peers
+        let tx_broadcast = TxBroadcast::new(tx, TxBroadcastPolicy::AllPeers);
+        self.requester.broadcast_tx(tx_broadcast)
+            .map_err(|e| anyhow!("Broadcast failed: {}", e))?;
+
+        info!("✅ Transaction broadcast successful");
 
         Ok(txid)
     }
