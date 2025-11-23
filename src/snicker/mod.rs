@@ -106,6 +106,22 @@ pub struct EncryptedProposal {
     pub encrypted_data: Vec<u8>,
 }
 
+/// A SNICKER UTXO stored in the database
+#[derive(Debug, Clone)]
+pub struct SnickerUtxo {
+    /// The outpoint (txid:vout)
+    pub outpoint: bdk_wallet::bitcoin::OutPoint,
+    /// Amount in satoshis
+    pub amount: u64,
+    /// The tweaked script pubkey
+    pub script_pubkey: bdk_wallet::bitcoin::ScriptBuf,
+    /// The tweaked private key (for spending)
+    pub tweaked_privkey: bdk_wallet::bitcoin::secp256k1::SecretKey,
+    /// The SNICKER shared secret (for recovery verification)
+    pub snicker_shared_secret: [u8; 32],
+    /// Block height when confirmed (if known)
+    pub block_height: Option<u32>,
+}
 
 /// SNICKER functionality
 ///
@@ -758,6 +774,31 @@ impl Snicker {
         Ok(())
     }
 
+    /// Initialize the SNICKER UTXOs database table
+    fn init_snicker_utxos_table(conn: &mut Connection) -> Result<()> {
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS snicker_utxos (
+                txid TEXT NOT NULL,
+                vout INTEGER NOT NULL,
+                amount INTEGER NOT NULL,
+                script_pubkey BLOB NOT NULL,
+                tweaked_privkey BLOB NOT NULL,
+                snicker_shared_secret BLOB NOT NULL,
+                block_height INTEGER,
+                spent BOOLEAN DEFAULT 0,
+                spent_in_txid TEXT,
+                PRIMARY KEY (txid, vout)
+            )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_snicker_utxos_spent
+             ON snicker_utxos(spent)",
+            [],
+        )?;
+        Ok(())
+    }
+
     /// Store a candidate transaction in the database
     pub async fn store_candidate(&self, block_height: u32, tx: &Transaction) -> Result<()> {
         use bdk_wallet::bitcoin::consensus::encode::serialize;
@@ -882,6 +923,121 @@ impl Snicker {
         let count = conn.execute("DELETE FROM snicker_proposals", [])?;
         tracing::info!("🗑️  Cleared {} SNICKER proposals from database", count);
         Ok(count)
+    }
+
+    /// Store a SNICKER UTXO after accepting a proposal
+    pub async fn store_snicker_utxo(
+        &self,
+        txid: bdk_wallet::bitcoin::Txid,
+        vout: u32,
+        amount: u64,
+        script_pubkey: &bdk_wallet::bitcoin::ScriptBuf,
+        tweaked_privkey: &bdk_wallet::bitcoin::secp256k1::SecretKey,
+        snicker_shared_secret: &[u8; 32],
+        block_height: Option<u32>,
+    ) -> Result<()> {
+        use bdk_wallet::bitcoin::consensus::encode::serialize;
+
+        let conn = self.conn.lock().unwrap();
+
+        let script_pubkey_bytes = serialize(script_pubkey);
+        let tweaked_privkey_bytes = tweaked_privkey.secret_bytes();
+
+        conn.execute(
+            "INSERT OR REPLACE INTO snicker_utxos
+             (txid, vout, amount, script_pubkey, tweaked_privkey, snicker_shared_secret, block_height, spent)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)",
+            (
+                txid.to_string(),
+                vout,
+                amount as i64,
+                script_pubkey_bytes,
+                &tweaked_privkey_bytes[..],
+                &snicker_shared_secret[..],
+                block_height,
+            ),
+        )?;
+
+        tracing::info!("💾 Stored SNICKER UTXO: {}:{} ({} sats)", txid, vout, amount);
+        Ok(())
+    }
+
+    /// Get the total balance of unspent SNICKER UTXOs
+    pub async fn get_snicker_balance(&self) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+
+        let balance: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(amount), 0) FROM snicker_utxos WHERE spent = 0",
+            [],
+            |row| row.get(0),
+        )?;
+
+        Ok(balance as u64)
+    }
+
+    /// List all unspent SNICKER UTXOs
+    pub async fn list_snicker_utxos(&self) -> Result<Vec<SnickerUtxo>> {
+        let conn = self.conn.lock().unwrap();
+
+        let mut stmt = conn.prepare(
+            "SELECT txid, vout, amount, script_pubkey, tweaked_privkey, snicker_shared_secret, block_height
+             FROM snicker_utxos
+             WHERE spent = 0
+             ORDER BY block_height DESC, amount DESC"
+        )?;
+
+        let utxos = stmt.query_map([], |row| {
+            let txid_str: String = row.get(0)?;
+            let vout: u32 = row.get(1)?;
+            let amount: i64 = row.get(2)?;
+            let script_pubkey_bytes: Vec<u8> = row.get(3)?;
+            let tweaked_privkey_bytes: Vec<u8> = row.get(4)?;
+            let snicker_shared_secret_bytes: Vec<u8> = row.get(5)?;
+            let block_height: Option<u32> = row.get(6)?;
+
+            Ok((txid_str, vout, amount, script_pubkey_bytes, tweaked_privkey_bytes, snicker_shared_secret_bytes, block_height))
+        })?.collect::<std::result::Result<Vec<_>, _>>()?;
+
+        let mut result = Vec::new();
+        for (txid_str, vout, amount, script_bytes, privkey_bytes, secret_bytes, block_height) in utxos {
+            use bdk_wallet::bitcoin::consensus::encode::deserialize;
+
+            let txid = bdk_wallet::bitcoin::Txid::from_str(&txid_str)?;
+            let script_pubkey: bdk_wallet::bitcoin::ScriptBuf = deserialize(&script_bytes)?;
+            let tweaked_privkey = bdk_wallet::bitcoin::secp256k1::SecretKey::from_slice(&privkey_bytes)?;
+
+            let mut snicker_shared_secret = [0u8; 32];
+            snicker_shared_secret.copy_from_slice(&secret_bytes);
+
+            result.push(SnickerUtxo {
+                outpoint: bdk_wallet::bitcoin::OutPoint { txid, vout },
+                amount: amount as u64,
+                script_pubkey,
+                tweaked_privkey,
+                snicker_shared_secret,
+                block_height,
+            });
+        }
+
+        Ok(result)
+    }
+
+    /// Mark a SNICKER UTXO as spent
+    pub async fn mark_snicker_utxo_spent(
+        &self,
+        txid: bdk_wallet::bitcoin::Txid,
+        vout: u32,
+        spent_in_txid: bdk_wallet::bitcoin::Txid,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+
+        conn.execute(
+            "UPDATE snicker_utxos SET spent = 1, spent_in_txid = ?1 WHERE txid = ?2 AND vout = ?3",
+            (spent_in_txid.to_string(), txid.to_string(), vout),
+        )?;
+
+        tracing::info!("✅ Marked SNICKER UTXO {}:{} as spent in {}", txid, vout, spent_in_txid);
+        Ok(())
     }
 
     // ============================================================

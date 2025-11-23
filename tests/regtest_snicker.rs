@@ -288,6 +288,15 @@ async fn test_snicker_end_to_end() -> Result<()> {
     println!("   Txid: {}", txid);
     println!("   Broadcast result: {}", broadcast_result);
 
+    // Store Alice's SNICKER UTXO
+    println!("\n💾 Storing Alice's SNICKER UTXO...");
+    let alice_utxos: Vec<_> = {
+        let wallet = alice_mgr.wallet_node.wallet.lock().await;
+        wallet.list_unspent().collect()
+    };
+    alice_mgr.store_accepted_snicker_utxo(&proposal, &coinjoin_tx, &alice_utxos).await?;
+    println!("   ✅ SNICKER UTXO stored");
+
     // Mine a block to confirm
     println!("\n⛏️  Mining 1 block to confirm transaction...");
     BITCOIND.mine_blocks(1)?;
@@ -301,11 +310,23 @@ async fn test_snicker_end_to_end() -> Result<()> {
     bob_mgr.wait_for_height(final_height, 30).await?;
     println!("   ✅ Bob synced");
 
-    let alice_final_balance = alice_mgr.get_balance().await?;
+    let alice_wallet_balance = alice_mgr.get_balance().await?;
+    let alice_snicker_balance = alice_mgr.get_snicker_balance().await?;
     let bob_final_balance = bob_mgr.get_balance().await?;
 
-    println!("   Alice final balance: {}", alice_final_balance);
+    println!("   Alice wallet balance: {}", alice_wallet_balance);
+    println!("   Alice SNICKER balance: {} sats", alice_snicker_balance);
+    println!("   Alice total balance: {} sats",
+             alice_wallet_balance.parse::<String>().unwrap().split_whitespace().next().unwrap().parse::<u64>().unwrap()
+             + alice_snicker_balance);
     println!("   Bob final balance: {}", bob_final_balance);
+
+    // List Alice's SNICKER UTXOs
+    let alice_snicker_utxos = alice_mgr.list_snicker_utxos().await?;
+    println!("\n📋 Alice's SNICKER UTXOs: {}", alice_snicker_utxos.len());
+    for utxo in &alice_snicker_utxos {
+        println!("   {}:{} - {} sats", utxo.outpoint.txid, utxo.outpoint.vout, utxo.amount);
+    }
 
     // ============================================================
     // VERIFICATION

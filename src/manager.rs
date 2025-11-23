@@ -419,4 +419,66 @@ impl Manager {
     pub async fn clear_snicker_proposals(&self) -> Result<usize> {
         self.snicker.clear_snicker_proposals().await
     }
+
+    /// Get SNICKER balance (sum of unspent SNICKER UTXOs)
+    pub async fn get_snicker_balance(&self) -> Result<u64> {
+        self.snicker.get_snicker_balance().await
+    }
+
+    /// List all unspent SNICKER UTXOs
+    pub async fn list_snicker_utxos(&self) -> Result<Vec<crate::snicker::SnickerUtxo>> {
+        self.snicker.list_snicker_utxos().await
+    }
+
+    /// Store a SNICKER UTXO after accepting a proposal and broadcasting
+    ///
+    /// This should be called after broadcasting a SNICKER coinjoin transaction.
+    /// The receiver's tweaked output is always at index 0.
+    pub async fn store_accepted_snicker_utxo(
+        &self,
+        proposal: &crate::snicker::Proposal,
+        tx: &Transaction,
+        our_utxos: &[bdk_wallet::LocalOutput],
+    ) -> Result<()> {
+        // Find our UTXO to get keychain and derivation index
+        let our_utxo = our_utxos.iter()
+            .find(|utxo| utxo.txout.script_pubkey == proposal.tweak_info.original_output.script_pubkey)
+            .ok_or_else(|| anyhow::anyhow!("Original output not found in our wallet"))?;
+
+        // Derive our private key
+        let receiver_seckey = self.wallet_node.derive_utxo_privkey(
+            our_utxo.keychain,
+            our_utxo.derivation_index
+        )?;
+
+        // Calculate the SNICKER shared secret
+        let snicker_shared_secret = crate::snicker::tweak::calculate_dh_shared_secret(
+            &receiver_seckey,
+            &proposal.tweak_info.proposer_pubkey
+        );
+
+        // Calculate the tweaked private key (for spending the SNICKER output)
+        let tweaked_privkey = crate::snicker::tweak::derive_tweaked_seckey(
+            &receiver_seckey,
+            &snicker_shared_secret
+        )?;
+
+        // The receiver's tweaked output is always at index 0
+        let output_index = 0;
+        let tweaked_output = &tx.output[output_index];
+        let txid = tx.compute_txid();
+
+        // Store in database
+        self.snicker.store_snicker_utxo(
+            txid,
+            output_index as u32,
+            tweaked_output.value.to_sat(),
+            &tweaked_output.script_pubkey,
+            &tweaked_privkey,
+            &snicker_shared_secret,
+            None, // block_height unknown at broadcast time
+        ).await?;
+
+        Ok(())
+    }
 }
