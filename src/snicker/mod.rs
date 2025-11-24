@@ -1594,4 +1594,133 @@ mod tests {
         let balance = snicker.get_snicker_balance().await.unwrap();
         assert_eq!(balance, 0);
     }
+
+    // ============================================================
+    // TRANSACTION FILTERING TESTS
+    // ============================================================
+
+    #[test]
+    fn test_is_snicker_candidate_with_valid_p2tr() {
+        let secp = Secp256k1::new();
+        let internal_key = bdk_wallet::bitcoin::secp256k1::XOnlyPublicKey::from_slice(&[2u8; 32])
+            .unwrap();
+
+        // Create transaction with P2TR output in valid range
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![],
+            output: vec![
+                TxOut {
+                    value: Amount::from_sat(50000), // 50k sats - in range
+                    script_pubkey: ScriptBuf::new_p2tr(&secp, internal_key, None),
+                }
+            ],
+        };
+
+        assert!(is_snicker_candidate(&tx, 10_000, 100_000),
+                "Transaction with 50k sat P2TR output should be a candidate");
+    }
+
+    #[test]
+    fn test_is_snicker_candidate_rejects_too_small() {
+        let secp = Secp256k1::new();
+        let internal_key = bdk_wallet::bitcoin::secp256k1::XOnlyPublicKey::from_slice(&[2u8; 32])
+            .unwrap();
+
+        // Create transaction with P2TR output below min
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![],
+            output: vec![
+                TxOut {
+                    value: Amount::from_sat(5000), // 5k sats - too small
+                    script_pubkey: ScriptBuf::new_p2tr(&secp, internal_key, None),
+                }
+            ],
+        };
+
+        assert!(!is_snicker_candidate(&tx, 10_000, 100_000),
+                "Transaction with 5k sat output (below 10k min) should not be a candidate");
+    }
+
+    #[test]
+    fn test_is_snicker_candidate_rejects_too_large() {
+        let secp = Secp256k1::new();
+        let internal_key = bdk_wallet::bitcoin::secp256k1::XOnlyPublicKey::from_slice(&[2u8; 32])
+            .unwrap();
+
+        // Create transaction with P2TR output above max
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![],
+            output: vec![
+                TxOut {
+                    value: Amount::from_sat(150_000), // 150k sats - too large
+                    script_pubkey: ScriptBuf::new_p2tr(&secp, internal_key, None),
+                }
+            ],
+        };
+
+        assert!(!is_snicker_candidate(&tx, 10_000, 100_000),
+                "Transaction with 150k sat output (above 100k max) should not be a candidate");
+    }
+
+    #[test]
+    fn test_is_snicker_candidate_rejects_non_p2tr() {
+        use bdk_wallet::bitcoin::hashes::Hash;
+
+        // Create transaction with P2WPKH output (not P2TR)
+        let wpkh = bdk_wallet::bitcoin::WPubkeyHash::from_slice(&[0u8; 20]).unwrap();
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![],
+            output: vec![
+                TxOut {
+                    value: Amount::from_sat(50000), // 50k sats - in range
+                    script_pubkey: ScriptBuf::new_p2wpkh(&wpkh),
+                }
+            ],
+        };
+
+        assert!(!is_snicker_candidate(&tx, 10_000, 100_000),
+                "Transaction with non-P2TR output should not be a candidate");
+    }
+
+    #[test]
+    fn test_is_snicker_candidate_mixed_outputs() {
+        use bdk_wallet::bitcoin::hashes::Hash;
+
+        let secp = Secp256k1::new();
+        let internal_key = bdk_wallet::bitcoin::secp256k1::XOnlyPublicKey::from_slice(&[2u8; 32])
+            .unwrap();
+        let wpkh = bdk_wallet::bitcoin::WPubkeyHash::from_slice(&[0u8; 20]).unwrap();
+
+        // Create transaction with mixed outputs: 1 valid P2TR, 1 invalid P2WPKH, 1 out-of-range P2TR
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![],
+            output: vec![
+                TxOut {
+                    value: Amount::from_sat(5000), // Too small
+                    script_pubkey: ScriptBuf::new_p2tr(&secp, internal_key, None),
+                },
+                TxOut {
+                    value: Amount::from_sat(50000), // Valid!
+                    script_pubkey: ScriptBuf::new_p2tr(&secp, internal_key, None),
+                },
+                TxOut {
+                    value: Amount::from_sat(50000), // Right size but wrong type
+                    script_pubkey: ScriptBuf::new_p2wpkh(&wpkh),
+                },
+            ],
+        };
+
+        assert!(is_snicker_candidate(&tx, 10_000, 100_000),
+                "Transaction with at least one valid P2TR output in range should be a candidate");
+    }
 }
