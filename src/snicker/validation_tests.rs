@@ -1508,3 +1508,715 @@ fn test_validate_tweak_non_p2tr_output() {
     assert!(result.is_err(), "Non-P2TR original output should be rejected");
     assert!(result.unwrap_err().to_string().contains("not P2TR"));
 }
+
+// ============================================================
+// PSBT CONSTRUCTION TESTS
+// ============================================================
+
+#[test]
+fn test_build_psbt_correct_structure() {
+    let snicker = create_test_snicker();
+    let secp = Secp256k1::new();
+
+    // Create a target transaction with receiver's output
+    let receiver_seckey = SecretKey::from_slice(&[0x01; 32]).unwrap();
+    let receiver_key = XOnlyPublicKey::from_keypair(
+        &Keypair::from_secret_key(&secp, &receiver_seckey)
+    ).0;
+    let receiver_script = ScriptBuf::new_p2tr(&secp, receiver_key, None);
+
+    let target_tx = Transaction {
+        version: bdk_wallet::bitcoin::transaction::Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![],
+        output: vec![
+            TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: receiver_script.clone(),
+            },
+        ],
+    };
+
+    // Create proposer's UTXO
+    let proposer_seckey = SecretKey::from_slice(&[0x02; 32]).unwrap();
+    let proposer_key = XOnlyPublicKey::from_keypair(
+        &Keypair::from_secret_key(&secp, &proposer_seckey)
+    ).0;
+    let proposer_script = ScriptBuf::new_p2tr(&secp, proposer_key, None);
+
+    let proposer_outpoint = OutPoint {
+        txid: "0000000000000000000000000000000000000000000000000000000000000001"
+            .parse().unwrap(),
+        vout: 0,
+    };
+
+    let proposer_txout = TxOut {
+        value: Amount::from_sat(200_000),
+        script_pubkey: proposer_script.clone(),
+    };
+
+    // Create tweaked output
+    let tweaked_seckey = SecretKey::from_slice(&[0x03; 32]).unwrap();
+    let tweaked_key = XOnlyPublicKey::from_keypair(
+        &Keypair::from_secret_key(&secp, &tweaked_seckey)
+    ).0;
+    let tweaked_script = ScriptBuf::new_p2tr(&secp, tweaked_key, None);
+    let tweaked_output = TxOut {
+        value: Amount::from_sat(99_000), // After 1000 sat delta
+        script_pubkey: tweaked_script,
+    };
+
+    // Create addresses for proposer
+    let proposer_equal_addr = bdk_wallet::bitcoin::Address::p2tr(
+        &secp,
+        proposer_key,
+        None,
+        bdk_wallet::bitcoin::Network::Regtest,
+    );
+    let proposer_change_addr = bdk_wallet::bitcoin::Address::p2tr(
+        &secp,
+        proposer_key,
+        None,
+        bdk_wallet::bitcoin::Network::Regtest,
+    );
+
+    let psbt = snicker.build_psbt(
+        &target_tx,
+        0,
+        tweaked_output,
+        proposer_outpoint,
+        proposer_txout,
+        proposer_equal_addr,
+        proposer_change_addr,
+        1_000, // delta
+        bdk_wallet::bitcoin::FeeRate::from_sat_per_vb(2).unwrap(),
+    ).unwrap();
+
+    // Verify structure
+    assert_eq!(psbt.unsigned_tx.input.len(), 2, "PSBT should have 2 inputs");
+    assert_eq!(psbt.unsigned_tx.output.len(), 3, "PSBT should have 3 outputs");
+}
+
+#[test]
+fn test_build_psbt_correct_order() {
+    let snicker = create_test_snicker();
+    let secp = Secp256k1::new();
+
+    // Create a target transaction with receiver's output
+    let receiver_seckey = SecretKey::from_slice(&[0x01; 32]).unwrap();
+    let receiver_key = XOnlyPublicKey::from_keypair(
+        &Keypair::from_secret_key(&secp, &receiver_seckey)
+    ).0;
+    let receiver_script = ScriptBuf::new_p2tr(&secp, receiver_key, None);
+
+    let target_tx = Transaction {
+        version: bdk_wallet::bitcoin::transaction::Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![],
+        output: vec![
+            TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: receiver_script.clone(),
+            },
+        ],
+    };
+
+    let proposer_seckey = SecretKey::from_slice(&[0x02; 32]).unwrap();
+    let proposer_key = XOnlyPublicKey::from_keypair(
+        &Keypair::from_secret_key(&secp, &proposer_seckey)
+    ).0;
+
+    let proposer_outpoint = OutPoint {
+        txid: "0000000000000000000000000000000000000000000000000000000000000001"
+            .parse().unwrap(),
+        vout: 0,
+    };
+
+    let proposer_txout = TxOut {
+        value: Amount::from_sat(200_000),
+        script_pubkey: ScriptBuf::new_p2tr(&secp, proposer_key, None),
+    };
+
+    let tweaked_seckey = SecretKey::from_slice(&[0x03; 32]).unwrap();
+    let tweaked_key = XOnlyPublicKey::from_keypair(
+        &Keypair::from_secret_key(&secp, &tweaked_seckey)
+    ).0;
+    let tweaked_output = TxOut {
+        value: Amount::from_sat(99_000),
+        script_pubkey: ScriptBuf::new_p2tr(&secp, tweaked_key, None),
+    };
+
+    let proposer_equal_addr = bdk_wallet::bitcoin::Address::p2tr(
+        &secp,
+        proposer_key,
+        None,
+        bdk_wallet::bitcoin::Network::Regtest,
+    );
+    let proposer_change_addr = bdk_wallet::bitcoin::Address::p2tr(
+        &secp,
+        proposer_key,
+        None,
+        bdk_wallet::bitcoin::Network::Regtest,
+    );
+
+    let psbt = snicker.build_psbt(
+        &target_tx,
+        0,
+        tweaked_output,
+        proposer_outpoint,
+        proposer_txout.clone(),
+        proposer_equal_addr,
+        proposer_change_addr,
+        1_000,
+        bdk_wallet::bitcoin::FeeRate::from_sat_per_vb(2).unwrap(),
+    ).unwrap();
+
+    // Verify input order: receiver first, proposer second
+    let receiver_outpoint = OutPoint {
+        txid: target_tx.compute_txid(),
+        vout: 0,
+    };
+    assert_eq!(
+        psbt.unsigned_tx.input[0].previous_output,
+        receiver_outpoint,
+        "First input should be receiver's"
+    );
+    assert_eq!(
+        psbt.unsigned_tx.input[1].previous_output,
+        proposer_outpoint,
+        "Second input should be proposer's"
+    );
+}
+
+#[test]
+fn test_build_psbt_includes_witness_utxos() {
+    let snicker = create_test_snicker();
+    let secp = Secp256k1::new();
+
+    let receiver_seckey = SecretKey::from_slice(&[0x01; 32]).unwrap();
+    let receiver_key = XOnlyPublicKey::from_keypair(
+        &Keypair::from_secret_key(&secp, &receiver_seckey)
+    ).0;
+    let receiver_script = ScriptBuf::new_p2tr(&secp, receiver_key, None);
+
+    let target_tx = Transaction {
+        version: bdk_wallet::bitcoin::transaction::Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![],
+        output: vec![
+            TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: receiver_script.clone(),
+            },
+        ],
+    };
+
+    let proposer_seckey = SecretKey::from_slice(&[0x02; 32]).unwrap();
+    let proposer_key = XOnlyPublicKey::from_keypair(
+        &Keypair::from_secret_key(&secp, &proposer_seckey)
+    ).0;
+
+    let proposer_outpoint = OutPoint {
+        txid: "0000000000000000000000000000000000000000000000000000000000000001"
+            .parse().unwrap(),
+        vout: 0,
+    };
+
+    let proposer_txout = TxOut {
+        value: Amount::from_sat(200_000),
+        script_pubkey: ScriptBuf::new_p2tr(&secp, proposer_key, None),
+    };
+
+    let tweaked_seckey = SecretKey::from_slice(&[0x03; 32]).unwrap();
+    let tweaked_key = XOnlyPublicKey::from_keypair(
+        &Keypair::from_secret_key(&secp, &tweaked_seckey)
+    ).0;
+    let tweaked_output = TxOut {
+        value: Amount::from_sat(99_000),
+        script_pubkey: ScriptBuf::new_p2tr(&secp, tweaked_key, None),
+    };
+
+    let proposer_equal_addr = bdk_wallet::bitcoin::Address::p2tr(
+        &secp,
+        proposer_key,
+        None,
+        bdk_wallet::bitcoin::Network::Regtest,
+    );
+    let proposer_change_addr = bdk_wallet::bitcoin::Address::p2tr(
+        &secp,
+        proposer_key,
+        None,
+        bdk_wallet::bitcoin::Network::Regtest,
+    );
+
+    let psbt = snicker.build_psbt(
+        &target_tx,
+        0,
+        tweaked_output,
+        proposer_outpoint,
+        proposer_txout.clone(),
+        proposer_equal_addr,
+        proposer_change_addr,
+        1_000,
+        bdk_wallet::bitcoin::FeeRate::from_sat_per_vb(2).unwrap(),
+    ).unwrap();
+
+    // Verify both inputs have witness_utxo set
+    assert!(
+        psbt.inputs[0].witness_utxo.is_some(),
+        "Receiver input should have witness_utxo"
+    );
+    assert!(
+        psbt.inputs[1].witness_utxo.is_some(),
+        "Proposer input should have witness_utxo"
+    );
+
+    // Verify the witness_utxo values match what we expect
+    assert_eq!(
+        psbt.inputs[0].witness_utxo.as_ref().unwrap().value,
+        Amount::from_sat(100_000),
+        "Receiver witness_utxo value should match"
+    );
+    assert_eq!(
+        psbt.inputs[1].witness_utxo.as_ref().unwrap().value,
+        Amount::from_sat(200_000),
+        "Proposer witness_utxo value should match"
+    );
+}
+
+#[test]
+fn test_build_equal_outputs_dust_prevention() {
+    let snicker = create_test_snicker();
+    let secp = Secp256k1::new();
+
+    let receiver_seckey = SecretKey::from_slice(&[0x01; 32]).unwrap();
+    let receiver_key = XOnlyPublicKey::from_keypair(
+        &Keypair::from_secret_key(&secp, &receiver_seckey)
+    ).0;
+    let receiver_script = ScriptBuf::new_p2tr(&secp, receiver_key, None);
+
+    // Receiver has only 1000 sats (very small UTXO)
+    let target_tx = Transaction {
+        version: bdk_wallet::bitcoin::transaction::Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![],
+        output: vec![
+            TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: receiver_script.clone(),
+            },
+        ],
+    };
+
+    let proposer_seckey = SecretKey::from_slice(&[0x02; 32]).unwrap();
+    let proposer_key = XOnlyPublicKey::from_keypair(
+        &Keypair::from_secret_key(&secp, &proposer_seckey)
+    ).0;
+
+    let proposer_outpoint = OutPoint {
+        txid: "0000000000000000000000000000000000000000000000000000000000000001"
+            .parse().unwrap(),
+        vout: 0,
+    };
+
+    let proposer_txout = TxOut {
+        value: Amount::from_sat(200_000),
+        script_pubkey: ScriptBuf::new_p2tr(&secp, proposer_key, None),
+    };
+
+    let tweaked_seckey = SecretKey::from_slice(&[0x03; 32]).unwrap();
+    let tweaked_key = XOnlyPublicKey::from_keypair(
+        &Keypair::from_secret_key(&secp, &tweaked_seckey)
+    ).0;
+    // After 500 sat delta, equal output would be 500 sats (below 546 dust limit!)
+    let tweaked_output = TxOut {
+        value: Amount::from_sat(500),
+        script_pubkey: ScriptBuf::new_p2tr(&secp, tweaked_key, None),
+    };
+
+    let proposer_equal_addr = bdk_wallet::bitcoin::Address::p2tr(
+        &secp,
+        proposer_key,
+        None,
+        bdk_wallet::bitcoin::Network::Regtest,
+    );
+    let proposer_change_addr = bdk_wallet::bitcoin::Address::p2tr(
+        &secp,
+        proposer_key,
+        None,
+        bdk_wallet::bitcoin::Network::Regtest,
+    );
+
+    let result = snicker.build_psbt(
+        &target_tx,
+        0,
+        tweaked_output,
+        proposer_outpoint,
+        proposer_txout,
+        proposer_equal_addr,
+        proposer_change_addr,
+        500, // delta that would create dust
+        bdk_wallet::bitcoin::FeeRate::from_sat_per_vb(2).unwrap(),
+    );
+
+    assert!(result.is_err(), "Should reject when equal output would be dust");
+    assert!(result.unwrap_err().to_string().contains("dust"));
+}
+
+#[test]
+fn test_build_equal_outputs_insufficient_funds() {
+    let snicker = create_test_snicker();
+    let secp = Secp256k1::new();
+
+    let receiver_seckey = SecretKey::from_slice(&[0x01; 32]).unwrap();
+    let receiver_key = XOnlyPublicKey::from_keypair(
+        &Keypair::from_secret_key(&secp, &receiver_seckey)
+    ).0;
+    let receiver_script = ScriptBuf::new_p2tr(&secp, receiver_key, None);
+
+    let target_tx = Transaction {
+        version: bdk_wallet::bitcoin::transaction::Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![],
+        output: vec![
+            TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: receiver_script.clone(),
+            },
+        ],
+    };
+
+    let proposer_seckey = SecretKey::from_slice(&[0x02; 32]).unwrap();
+    let proposer_key = XOnlyPublicKey::from_keypair(
+        &Keypair::from_secret_key(&secp, &proposer_seckey)
+    ).0;
+
+    let proposer_outpoint = OutPoint {
+        txid: "0000000000000000000000000000000000000000000000000000000000000001"
+            .parse().unwrap(),
+        vout: 0,
+    };
+
+    // Proposer has barely enough to cover one equal output (insufficient!)
+    // Total in: 100,000 + 98,500 = 198,500
+    // Total out: 99,000 + 99,000 = 198,000
+    // Fee: ~410 sats
+    // Change: 198,500 - 198,000 - 410 = 90 sats (below 546 dust limit!)
+    let proposer_txout = TxOut {
+        value: Amount::from_sat(98_900), // Change: 198,900-198,000-410 = 490 sats (below 546)
+        script_pubkey: ScriptBuf::new_p2tr(&secp, proposer_key, None),
+    };
+
+    let tweaked_seckey = SecretKey::from_slice(&[0x03; 32]).unwrap();
+    let tweaked_key = XOnlyPublicKey::from_keypair(
+        &Keypair::from_secret_key(&secp, &tweaked_seckey)
+    ).0;
+    let tweaked_output = TxOut {
+        value: Amount::from_sat(99_000),
+        script_pubkey: ScriptBuf::new_p2tr(&secp, tweaked_key, None),
+    };
+
+    let proposer_equal_addr = bdk_wallet::bitcoin::Address::p2tr(
+        &secp,
+        proposer_key,
+        None,
+        bdk_wallet::bitcoin::Network::Regtest,
+    );
+    let proposer_change_addr = bdk_wallet::bitcoin::Address::p2tr(
+        &secp,
+        proposer_key,
+        None,
+        bdk_wallet::bitcoin::Network::Regtest,
+    );
+
+    let result = snicker.build_psbt(
+        &target_tx,
+        0,
+        tweaked_output,
+        proposer_outpoint,
+        proposer_txout,
+        proposer_equal_addr,
+        proposer_change_addr,
+        1_000,
+        bdk_wallet::bitcoin::FeeRate::from_sat_per_vb(2).unwrap(),
+    );
+
+    assert!(result.is_err(), "Should reject when proposer has insufficient funds");
+    assert!(result.unwrap_err().to_string().contains("Insufficient"));
+}
+
+// ============================================================
+// ERROR HANDLING AND EDGE CASES TESTS
+// ============================================================
+
+#[test]
+fn test_propose_invalid_output_index() {
+    let snicker = create_test_snicker();
+    let secp = Secp256k1::new();
+
+    // Create a target transaction with only 1 output
+    let receiver_seckey = SecretKey::from_slice(&[0x01; 32]).unwrap();
+    let receiver_key = XOnlyPublicKey::from_keypair(
+        &Keypair::from_secret_key(&secp, &receiver_seckey)
+    ).0;
+    let receiver_script = ScriptBuf::new_p2tr(&secp, receiver_key, None);
+
+    let target_tx = Transaction {
+        version: bdk_wallet::bitcoin::transaction::Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![],
+        output: vec![
+            TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: receiver_script.clone(),
+            },
+        ],
+    };
+
+    let proposer_seckey = SecretKey::from_slice(&[0x02; 32]).unwrap();
+    let proposer_key = XOnlyPublicKey::from_keypair(
+        &Keypair::from_secret_key(&secp, &proposer_seckey)
+    ).0;
+
+    let proposer_outpoint = OutPoint {
+        txid: "0000000000000000000000000000000000000000000000000000000000000001"
+            .parse().unwrap(),
+        vout: 0,
+    };
+
+    let proposer_txout = TxOut {
+        value: Amount::from_sat(200_000),
+        script_pubkey: ScriptBuf::new_p2tr(&secp, proposer_key, None),
+    };
+
+    let tweaked_seckey = SecretKey::from_slice(&[0x03; 32]).unwrap();
+    let tweaked_key = XOnlyPublicKey::from_keypair(
+        &Keypair::from_secret_key(&secp, &tweaked_seckey)
+    ).0;
+    let tweaked_output = TxOut {
+        value: Amount::from_sat(99_000),
+        script_pubkey: ScriptBuf::new_p2tr(&secp, tweaked_key, None),
+    };
+
+    let proposer_equal_addr = bdk_wallet::bitcoin::Address::p2tr(
+        &secp,
+        proposer_key,
+        None,
+        bdk_wallet::bitcoin::Network::Regtest,
+    );
+    let proposer_change_addr = bdk_wallet::bitcoin::Address::p2tr(
+        &secp,
+        proposer_key,
+        None,
+        bdk_wallet::bitcoin::Network::Regtest,
+    );
+
+    // Try to access output index 5, but transaction only has 1 output (index 0)
+    let result = snicker.build_psbt(
+        &target_tx,
+        5, // OUT OF BOUNDS!
+        tweaked_output,
+        proposer_outpoint,
+        proposer_txout,
+        proposer_equal_addr,
+        proposer_change_addr,
+        1_000,
+        bdk_wallet::bitcoin::FeeRate::from_sat_per_vb(2).unwrap(),
+    );
+
+    assert!(result.is_err(), "Should reject invalid output index");
+    assert!(result.unwrap_err().to_string().contains("out of bounds"));
+}
+
+#[test]
+fn test_receive_missing_witness_utxo() {
+    let snicker = create_test_snicker();
+
+    let receiver_outpoint = OutPoint {
+        txid: "0000000000000000000000000000000000000000000000000000000000000001"
+            .parse().unwrap(),
+        vout: 0,
+    };
+
+    let proposer_outpoint = OutPoint {
+        txid: "0000000000000000000000000000000000000000000000000000000000000002"
+            .parse().unwrap(),
+        vout: 0,
+    };
+
+    // Create PSBT but WITHOUT setting witness_utxo for the receiver input
+    let secp = Secp256k1::new();
+    let receiver_seckey = SecretKey::from_slice(&[0x01; 32])
+        .unwrap();
+    let receiver_key = XOnlyPublicKey::from_keypair(
+        &Keypair::from_secret_key(&secp, &receiver_seckey)
+    ).0;
+
+    let proposer_seckey = SecretKey::from_slice(&[0x02; 32])
+        .unwrap();
+    let proposer_key = XOnlyPublicKey::from_keypair(
+        &Keypair::from_secret_key(&secp, &proposer_seckey)
+    ).0;
+
+    let tweaked_seckey = SecretKey::from_slice(&[0x03; 32])
+        .unwrap();
+    let tweaked_key = XOnlyPublicKey::from_keypair(
+        &Keypair::from_secret_key(&secp, &tweaked_seckey)
+    ).0;
+
+    let receiver_txout = TxOut {
+        value: Amount::from_sat(50_000),
+        script_pubkey: ScriptBuf::new_p2tr(&secp, receiver_key, None),
+    };
+
+    let proposer_txout = TxOut {
+        value: Amount::from_sat(100_000),
+        script_pubkey: ScriptBuf::new_p2tr(&secp, proposer_key, None),
+    };
+
+    let tweaked_script = ScriptBuf::new_p2tr(&secp, tweaked_key, None);
+
+    let tx = Transaction {
+        version: bdk_wallet::bitcoin::transaction::Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![
+            bdk_wallet::bitcoin::TxIn {
+                previous_output: receiver_outpoint,
+                script_sig: ScriptBuf::new(),
+                sequence: bdk_wallet::bitcoin::Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: bdk_wallet::bitcoin::Witness::new(),
+            },
+            bdk_wallet::bitcoin::TxIn {
+                previous_output: proposer_outpoint,
+                script_sig: ScriptBuf::new(),
+                sequence: bdk_wallet::bitcoin::Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: bdk_wallet::bitcoin::Witness::new(),
+            },
+        ],
+        output: vec![
+            TxOut {
+                value: Amount::from_sat(49_000),
+                script_pubkey: tweaked_script.clone(),
+            },
+            TxOut {
+                value: Amount::from_sat(49_000),
+                script_pubkey: ScriptBuf::new_p2tr(&secp, proposer_key, None),
+            },
+            TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: ScriptBuf::new_p2tr(&secp, proposer_key, None),
+            },
+        ],
+    };
+
+    let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+    // INTENTIONALLY NOT setting witness_utxo for receiver input!
+    // psbt.inputs[0].witness_utxo = Some(receiver_txout.clone());
+    psbt.inputs[1].witness_utxo = Some(proposer_txout.clone());
+
+    // Extract proposer pubkey
+    let proposer_xonly = tweak::extract_taproot_pubkey(&proposer_txout).unwrap();
+    let mut proposer_pubkey_bytes = [0u8; 33];
+    proposer_pubkey_bytes[0] = 0x02;
+    proposer_pubkey_bytes[1..].copy_from_slice(&proposer_xonly);
+    let proposer_pubkey = PublicKey::from_slice(&proposer_pubkey_bytes)
+        .unwrap();
+
+    let tweak_info = TweakInfo {
+        original_output: receiver_txout.clone(),
+        tweaked_output: TxOut {
+            value: Amount::from_sat(49_000),
+            script_pubkey: tweaked_script.clone(),
+        },
+        proposer_pubkey,
+    };
+
+    let our_utxos = vec![create_mock_local_output(
+        receiver_outpoint,
+        50_000,
+        bdk_wallet::KeychainKind::External,
+        0,
+    )];
+
+    let result = snicker.validate_inputs(&psbt, &tweak_info, &our_utxos);
+    assert!(result.is_err(), "Should reject PSBT with missing witness_utxo");
+    assert!(result.unwrap_err().to_string().contains("missing witness_utxo"));
+}
+
+#[tokio::test]
+async fn test_db_concurrent_access() {
+    use std::sync::Arc;
+    use tokio::task::JoinSet;
+
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("concurrent_test.db");
+    let snicker = Arc::new(
+        Snicker::new(&db_path, bdk_wallet::bitcoin::Network::Regtest).unwrap()
+    );
+
+    // Spawn multiple tasks that access the database concurrently
+    let mut tasks = JoinSet::new();
+
+    for i in 0..10u32 {
+        let snicker_clone = Arc::clone(&snicker);
+        tasks.spawn(async move {
+            let secp = Secp256k1::new();
+            let seckey = SecretKey::from_slice(&[i as u8 + 1; 32])
+                .unwrap();
+            let key = XOnlyPublicKey::from_keypair(
+                &Keypair::from_secret_key(&secp, &seckey)
+            ).0;
+
+            // Create a unique transaction for this task
+            let tx = Transaction {
+                version: bdk_wallet::bitcoin::transaction::Version::TWO,
+                lock_time: LockTime::ZERO,
+                input: vec![],
+                output: vec![
+                    TxOut {
+                        value: Amount::from_sat(100_000 + (i as u64) * 1000),
+                        script_pubkey: ScriptBuf::new_p2tr(&secp, key, None),
+                    },
+                ],
+            };
+
+            // Store candidate
+            snicker_clone.store_candidate(i, &tx).await.unwrap();
+        });
+    }
+
+    // Wait for all tasks to complete
+    while let Some(result) = tasks.join_next().await {
+        result.unwrap();
+    }
+
+    // Verify all candidates were stored
+    let candidates = snicker.get_snicker_candidates().await.unwrap();
+    assert_eq!(candidates.len(), 10, "All concurrent writes should succeed");
+}
+
+#[tokio::test]
+async fn test_db_corrupt_candidate() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("corrupt_test.db");
+    let snicker = Snicker::new(&db_path, bdk_wallet::bitcoin::Network::Regtest).unwrap();
+
+    // Manually insert corrupted data directly into the database
+    {
+        let conn = snicker.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO snicker_candidates (block_height, txid, tx_data) VALUES (?1, ?2, ?3)",
+            (
+                12345u32,
+                "0000000000000000000000000000000000000000000000000000000000000001",
+                vec![0xFF, 0xFF, 0xFF], // CORRUPTED DATA!
+            ),
+        ).unwrap();
+    }
+
+    // Try to retrieve candidates - should error on deserialization
+    let result = snicker.get_snicker_candidates().await;
+
+    assert!(result.is_err(), "Should error when deserializing corrupted data");
+    // The error should be from bitcoin deserialization
+}

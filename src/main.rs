@@ -1,6 +1,6 @@
 mod manager;
 mod snicker;
-mod ui;
+mod cli;
 mod wallet_node;
 
 use anyhow::Result;
@@ -62,10 +62,9 @@ async fn main() -> Result<()> {
     //.with_writer(std::io::stderr).finish();
     tracing::subscriber::set_global_default(subscriber)?;
 
-    
-    // delegate all user interactions to the UI layer
-    ui::repl(args.network.as_str(), args.recovery_height).await?;
-    //ui::run_cli(&mut wallet_node).await?;
+
+    // delegate all user interactions to the CLI layer
+    cli::repl(args.network.as_str(), args.recovery_height).await?;
 
     Ok(())
 }
