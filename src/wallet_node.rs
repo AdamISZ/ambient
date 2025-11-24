@@ -221,8 +221,9 @@ impl WalletNode {
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 18444)
             }
             Network::Signet => {
-                // Public signet node
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(34, 135, 189, 101)), 38333)
+                // Public signet node (hardcoded fallback from Bitcoin Core)
+                // Source: https://github.com/bitcoin/bitcoin/blob/master/src/kernel/chainparams.cpp
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(178, 128, 221, 177)), 38333)
             }
             Network::Bitcoin | Network::Testnet => {
                 // TODO: Add mainnet/testnet peers
