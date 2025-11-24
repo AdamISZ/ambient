@@ -745,9 +745,8 @@ impl Snicker {
         conn.execute(
             "CREATE TABLE IF NOT EXISTS snicker_candidates (
                 block_height INTEGER NOT NULL,
-                txid TEXT NOT NULL,
-                tx_data BLOB NOT NULL,
-                PRIMARY KEY (block_height, txid)
+                txid TEXT NOT NULL PRIMARY KEY,
+                tx_data BLOB NOT NULL
             )",
             [],
         )?;
@@ -1244,10 +1243,355 @@ pub struct ProposalOpportunity {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bdk_wallet::bitcoin::{
+        Transaction, TxOut, Amount, ScriptBuf, OutPoint,
+        transaction::Version, locktime::absolute::LockTime,
+    };
+    use bdk_wallet::bitcoin::secp256k1::{Secp256k1, SecretKey, PublicKey};
+
+    fn create_test_snicker() -> Snicker {
+        let db_path = std::env::temp_dir().join(format!(
+            "test_snicker_{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        Snicker::new(&db_path, Network::Regtest).unwrap()
+    }
+
+    fn create_test_transaction() -> Transaction {
+        create_test_transaction_with_seed(2)
+    }
+
+    fn create_test_transaction_with_seed(seed: u64) -> Transaction {
+        use bdk_wallet::bitcoin::secp256k1::rand::SeedableRng;
+
+        let secp = Secp256k1::new();
+
+        // Create a seeded RNG to generate valid keys deterministically
+        let mut rng = bdk_wallet::bitcoin::secp256k1::rand::rngs::StdRng::seed_from_u64(seed);
+        let secret_key = SecretKey::new(&mut rng);
+        let public_key = secret_key.public_key(&secp);
+        let internal_key = public_key.x_only_public_key().0;
+
+        Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![],
+            output: vec![
+                TxOut {
+                    value: Amount::from_sat(50000),
+                    script_pubkey: ScriptBuf::new_p2tr(&secp, internal_key, None),
+                }
+            ],
+        }
+    }
 
     #[test]
     fn test_snicker_struct_creation() {
-        // Basic compile test - actual functionality tests will come later
-        assert!(true);
+        let snicker = create_test_snicker();
+        assert_eq!(snicker.network, Network::Regtest);
+    }
+
+    // ============================================================
+    // CANDIDATE STORAGE TESTS
+    // ============================================================
+
+    #[tokio::test]
+    async fn test_store_and_retrieve_candidate() {
+        let snicker = create_test_snicker();
+        let tx = create_test_transaction();
+        let block_height = 100;
+
+        // Store candidate
+        snicker.store_candidate(block_height, &tx).await.unwrap();
+
+        // Retrieve candidates
+        let candidates = snicker.get_snicker_candidates().await.unwrap();
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].0, block_height);
+        assert_eq!(candidates[0].1, tx.compute_txid());
+        assert_eq!(candidates[0].2.compute_txid(), tx.compute_txid());
+    }
+
+    #[tokio::test]
+    async fn test_store_multiple_candidates() {
+        let snicker = create_test_snicker();
+
+        // Store 3 candidates at different heights with unique transactions
+        for i in 0..3 {
+            let tx = create_test_transaction_with_seed(i as u64);
+            snicker.store_candidate(100 + i, &tx).await.unwrap();
+        }
+
+        let candidates = snicker.get_snicker_candidates().await.unwrap();
+        assert_eq!(candidates.len(), 3);
+
+        // Should be ordered by height DESC
+        assert!(candidates[0].0 >= candidates[1].0);
+        assert!(candidates[1].0 >= candidates[2].0);
+    }
+
+    #[tokio::test]
+    async fn test_replace_duplicate_candidate() {
+        let snicker = create_test_snicker();
+
+        // Create ONE transaction and store it twice with different heights
+        let tx = create_test_transaction();
+        let txid = tx.compute_txid();
+
+        // Store same transaction twice at different heights
+        snicker.store_candidate(100, &tx).await.unwrap();
+        snicker.store_candidate(101, &tx).await.unwrap(); // Different height, same tx
+
+        let candidates = snicker.get_snicker_candidates().await.unwrap();
+
+        // Should only have one entry (INSERT OR REPLACE based on txid)
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].1, txid);
+        assert_eq!(candidates[0].0, 101); // Should have updated height
+    }
+
+    #[tokio::test]
+    async fn test_clear_candidates() {
+        let snicker = create_test_snicker();
+
+        // Store some candidates with unique transactions
+        for i in 0..5 {
+            let tx = create_test_transaction_with_seed(i as u64);
+            snicker.store_candidate(100 + i, &tx).await.unwrap();
+        }
+
+        // Clear them
+        let count = snicker.clear_snicker_candidates().await.unwrap();
+        assert_eq!(count, 5);
+
+        // Verify empty
+        let candidates = snicker.get_snicker_candidates().await.unwrap();
+        assert_eq!(candidates.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_get_candidates_empty_database() {
+        let snicker = create_test_snicker();
+        let candidates = snicker.get_snicker_candidates().await.unwrap();
+        assert_eq!(candidates.len(), 0);
+    }
+
+    // ============================================================
+    // PROPOSAL STORAGE TESTS
+    // ============================================================
+
+    #[tokio::test]
+    async fn test_store_and_retrieve_proposal() {
+        let snicker = create_test_snicker();
+        let secp = Secp256k1::new();
+        let mut rng = bdk_wallet::bitcoin::secp256k1::rand::thread_rng();
+
+        let ephemeral_key = SecretKey::new(&mut rng);
+        let ephemeral_pubkey = ephemeral_key.public_key(&secp);
+
+        let proposal = EncryptedProposal {
+            ephemeral_pubkey,
+            tag: [0xAA; 8],
+            encrypted_data: vec![1, 2, 3, 4, 5],
+        };
+
+        // Store proposal
+        snicker.store_snicker_proposal(&proposal).await.unwrap();
+
+        // Retrieve proposals
+        let proposals = snicker.get_all_snicker_proposals().await.unwrap();
+
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0].ephemeral_pubkey, ephemeral_pubkey);
+        assert_eq!(proposals[0].tag, [0xAA; 8]);
+        assert_eq!(proposals[0].encrypted_data, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[tokio::test]
+    async fn test_store_multiple_proposals() {
+        let snicker = create_test_snicker();
+        let secp = Secp256k1::new();
+        let mut rng = bdk_wallet::bitcoin::secp256k1::rand::thread_rng();
+
+        // Store 3 different proposals
+        for i in 0..3 {
+            let ephemeral_key = SecretKey::new(&mut rng);
+            let ephemeral_pubkey = ephemeral_key.public_key(&secp);
+
+            let proposal = EncryptedProposal {
+                ephemeral_pubkey,
+                tag: [i as u8; 8],
+                encrypted_data: vec![i as u8; 10],
+            };
+
+            snicker.store_snicker_proposal(&proposal).await.unwrap();
+        }
+
+        let proposals = snicker.get_all_snicker_proposals().await.unwrap();
+        assert_eq!(proposals.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_clear_proposals() {
+        let snicker = create_test_snicker();
+        let secp = Secp256k1::new();
+        let mut rng = bdk_wallet::bitcoin::secp256k1::rand::thread_rng();
+
+        // Store some proposals
+        for _ in 0..3 {
+            let ephemeral_key = SecretKey::new(&mut rng);
+            let proposal = EncryptedProposal {
+                ephemeral_pubkey: ephemeral_key.public_key(&secp),
+                tag: [0xFF; 8],
+                encrypted_data: vec![1, 2, 3],
+            };
+            snicker.store_snicker_proposal(&proposal).await.unwrap();
+        }
+
+        // Clear them
+        let count = snicker.clear_snicker_proposals().await.unwrap();
+        assert_eq!(count, 3);
+
+        // Verify empty
+        let proposals = snicker.get_all_snicker_proposals().await.unwrap();
+        assert_eq!(proposals.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_get_proposals_empty_database() {
+        let snicker = create_test_snicker();
+        let proposals = snicker.get_all_snicker_proposals().await.unwrap();
+        assert_eq!(proposals.len(), 0);
+    }
+
+    // ============================================================
+    // SNICKER UTXO STORAGE TESTS
+    // ============================================================
+
+    #[tokio::test]
+    async fn test_store_and_retrieve_snicker_utxo() {
+        let snicker = create_test_snicker();
+        let secp = Secp256k1::new();
+        let mut rng = bdk_wallet::bitcoin::secp256k1::rand::thread_rng();
+
+        let txid = "0000000000000000000000000000000000000000000000000000000000000000"
+            .parse().unwrap();
+        let vout = 0;
+        let amount = 50000;
+        let internal_key = bdk_wallet::bitcoin::secp256k1::XOnlyPublicKey::from_slice(&[2u8; 32])
+            .unwrap();
+        let script_pubkey = ScriptBuf::new_p2tr(&secp, internal_key, None);
+        let tweaked_privkey = SecretKey::new(&mut rng);
+        let snicker_shared_secret = [0xBB; 32];
+
+        // Store UTXO
+        snicker.store_snicker_utxo(
+            txid,
+            vout,
+            amount,
+            &script_pubkey,
+            &tweaked_privkey,
+            &snicker_shared_secret,
+            Some(100),
+        ).await.unwrap();
+
+        // Retrieve UTXOs
+        let utxos = snicker.list_snicker_utxos().await.unwrap();
+
+        assert_eq!(utxos.len(), 1);
+        assert_eq!(utxos[0].outpoint.txid, txid);
+        assert_eq!(utxos[0].outpoint.vout, vout);
+        assert_eq!(utxos[0].amount, amount);
+        assert_eq!(utxos[0].script_pubkey, script_pubkey);
+        assert_eq!(utxos[0].tweaked_privkey.secret_bytes(), tweaked_privkey.secret_bytes());
+        assert_eq!(utxos[0].snicker_shared_secret, snicker_shared_secret);
+        assert_eq!(utxos[0].block_height, Some(100));
+    }
+
+    #[tokio::test]
+    async fn test_snicker_balance_calculation() {
+        let snicker = create_test_snicker();
+        let secp = Secp256k1::new();
+        let mut rng = bdk_wallet::bitcoin::secp256k1::rand::thread_rng();
+
+        let internal_key = bdk_wallet::bitcoin::secp256k1::XOnlyPublicKey::from_slice(&[2u8; 32])
+            .unwrap();
+        let script_pubkey = ScriptBuf::new_p2tr(&secp, internal_key, None);
+        let tweaked_privkey = SecretKey::new(&mut rng);
+        let snicker_shared_secret = [0xCC; 32];
+
+        // Store 3 UTXOs with different amounts
+        let amounts = [10000, 20000, 30000];
+        for (i, &amount) in amounts.iter().enumerate() {
+            snicker.store_snicker_utxo(
+                format!("{:064x}", i).parse().unwrap(),
+                i as u32,
+                amount,
+                &script_pubkey,
+                &tweaked_privkey,
+                &snicker_shared_secret,
+                None,
+            ).await.unwrap();
+        }
+
+        // Check balance
+        let balance = snicker.get_snicker_balance().await.unwrap();
+        assert_eq!(balance, 60000); // Sum of all amounts
+    }
+
+    #[tokio::test]
+    async fn test_snicker_balance_empty() {
+        let snicker = create_test_snicker();
+        let balance = snicker.get_snicker_balance().await.unwrap();
+        assert_eq!(balance, 0);
+    }
+
+    #[tokio::test]
+    async fn test_list_snicker_utxos_empty() {
+        let snicker = create_test_snicker();
+        let utxos = snicker.list_snicker_utxos().await.unwrap();
+        assert_eq!(utxos.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_mark_snicker_utxo_spent() {
+        let snicker = create_test_snicker();
+        let secp = Secp256k1::new();
+        let mut rng = bdk_wallet::bitcoin::secp256k1::rand::thread_rng();
+
+        let txid = "0000000000000000000000000000000000000000000000000000000000000000"
+            .parse().unwrap();
+        let vout = 0;
+        let internal_key = bdk_wallet::bitcoin::secp256k1::XOnlyPublicKey::from_slice(&[2u8; 32])
+            .unwrap();
+        let script_pubkey = ScriptBuf::new_p2tr(&secp, internal_key, None);
+
+        // Store UTXO
+        snicker.store_snicker_utxo(
+            txid,
+            vout,
+            50000,
+            &script_pubkey,
+            &SecretKey::new(&mut rng),
+            &[0xDD; 32],
+            Some(100),
+        ).await.unwrap();
+
+        // Mark as spent (need to provide the spending txid)
+        let spending_txid = "0000000000000000000000000000000000000000000000000000000000000001"
+            .parse().unwrap();
+        snicker.mark_snicker_utxo_spent(txid, vout, spending_txid).await.unwrap();
+
+        // list_snicker_utxos filters out spent UTXOs (WHERE spent = 0)
+        let utxos = snicker.list_snicker_utxos().await.unwrap();
+        assert_eq!(utxos.len(), 0, "Spent UTXOs should be filtered out");
+
+        // Balance should now be 0 (spent UTXOs excluded)
+        let balance = snicker.get_snicker_balance().await.unwrap();
+        assert_eq!(balance, 0);
     }
 }
