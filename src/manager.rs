@@ -179,6 +179,9 @@ impl Manager {
 
     /// Scan recent blocks for SNICKER candidate transactions
     ///
+    /// Uses Bitcoin Core RPC to scan for taproot UTXOs matching size criteria.
+    /// Requires RPC client to be configured via set_rpc_client().
+    ///
     /// # Arguments
     /// * `num_blocks` - Number of recent blocks to scan
     /// * `size_min` - Minimum output size in satoshis
@@ -192,16 +195,15 @@ impl Manager {
         size_min: u64,
         size_max: u64,
     ) -> Result<usize> {
-        // Create filter function using SNICKER's logic
-        let filter = |tx: &Transaction| {
-            crate::snicker::is_snicker_candidate(tx, size_min, size_max)
-        };
-
-        // Scan blockchain using WalletNode's generic scanner
-        let candidates = self.wallet_node.scan_for_transactions(num_blocks, filter).await?;
+        // Scan blockchain using RPC to find taproot UTXOs in the size range
+        let candidates = self.wallet_node.scan_blocks_for_taproot_utxos(
+            num_blocks,
+            size_min,
+            size_max
+        ).await?;
 
         // Store candidates in SNICKER database
-        for (block_height, tx) in &candidates {
+        for (block_height, _txid, tx) in &candidates {
             self.snicker.store_candidate(*block_height, tx).await?;
         }
 
@@ -240,7 +242,7 @@ impl Manager {
         &mut self,
         opportunity: &ProposalOpportunity,
         delta_sats: i64,
-    ) -> Result<(Psbt, EncryptedProposal)> {
+    ) -> Result<(Proposal, EncryptedProposal)> {
         // Get our UTXO details and addresses from wallet
         let mut wallet = self.wallet_node.wallet.lock().await;
         let mut conn = self.wallet_node.conn.lock().await;
@@ -273,23 +275,146 @@ impl Manager {
         // Use block_in_place to allow blocking operations in async context
         let wallet_clone = self.wallet_node.wallet.clone();
         let sign_callback = move |psbt: &mut Psbt| -> Result<()> {
-            let mut wallet = tokio::task::block_in_place(|| {
+            use bdk_wallet::KeychainKind;
+
+            let wallet = tokio::task::block_in_place(|| {
                 wallet_clone.blocking_lock()
             });
 
-            // Sign with trust_witness_utxo enabled
-            // This allows signing without non_witness_utxo when witness_utxo is present
+            tracing::info!("🔨 Proposer signing PSBT with {} inputs", psbt.inputs.len());
+
+            // Get wallet descriptor for comparison
+            let ext_descriptor = wallet.public_descriptor(KeychainKind::External);
+            let int_descriptor = wallet.public_descriptor(KeychainKind::Internal);
+            tracing::info!("🔨 Wallet External descriptor: {}", ext_descriptor);
+            tracing::info!("🔨 Wallet Internal descriptor: {}", int_descriptor);
+
+            // Log PSBT state before signing
+            for (i, input) in psbt.inputs.iter().enumerate() {
+                tracing::info!("🔨 Input {} BEFORE proposer sign:", i);
+                tracing::info!("    - witness_utxo: {}", input.witness_utxo.is_some());
+                tracing::info!("    - tap_internal_key: {:?}", input.tap_internal_key);
+                tracing::info!("    - tap_key_sig: {:?}", input.tap_key_sig);
+                tracing::info!("    - tap_key_origins: {}", input.tap_key_origins.len());
+
+                if let Some(ref witness_utxo) = input.witness_utxo {
+                    tracing::info!("    - script_pubkey: {}", witness_utxo.script_pubkey);
+                    let is_mine = wallet.is_mine(witness_utxo.script_pubkey.clone());
+                    tracing::info!("    - Wallet recognizes as mine: {}", is_mine);
+
+                    // Check if wallet has a UTXO with matching script_pubkey
+                    let matching_utxo = wallet.list_unspent()
+                        .find(|u| u.txout.script_pubkey == witness_utxo.script_pubkey);
+                    tracing::info!("    - Wallet has UTXO with matching script: {}", matching_utxo.is_some());
+                    if let Some(utxo) = matching_utxo {
+                        tracing::info!("      UTXO: {:?}, keychain: {:?}, index: {}",
+                            utxo.outpoint, utxo.keychain, utxo.derivation_index);
+                    }
+                }
+            }
+
+            // CRITICAL: Check if wallet can derive the exact address for our UTXO
+            tracing::info!("🔑 Checking if wallet can derive UTXO addresses...");
+
+            // For each PSBT input, check if wallet can derive its address
+            for (i, input) in psbt.inputs.iter().enumerate() {
+                if let Some(ref witness_utxo) = input.witness_utxo {
+                    let script = &witness_utxo.script_pubkey;
+                    tracing::info!("🔑 Input {} script: {}", i, script);
+
+                    // Check if wallet has a matching UTXO and get its derivation info
+                    if let Some(utxo) = wallet.list_unspent()
+                        .find(|u| &u.txout.script_pubkey == script)
+                    {
+                        tracing::info!("🔑 Input {} is in wallet: {:?}/{}", i, utxo.keychain, utxo.derivation_index);
+
+                        // Manually derive the address at this index
+                        let derived_addr = wallet.peek_address(utxo.keychain, utxo.derivation_index);
+                        tracing::info!("🔑 Wallet derives at {:?}/{}: {}",
+                            utxo.keychain, utxo.derivation_index, derived_addr.address);
+                        tracing::info!("🔑 Derived script: {}", derived_addr.address.script_pubkey());
+                        tracing::info!("🔑 Scripts match: {}", derived_addr.address.script_pubkey() == *script);
+                    }
+                }
+            }
+
+            // CRITICAL: Manually update PSBT with descriptor since automatic update isn't working
+            use bdk_wallet::miniscript::psbt::PsbtInputExt;
+
+            for input_idx in 0..psbt.inputs.len() {
+                if let Some(ref witness_utxo) = psbt.inputs[input_idx].witness_utxo {
+                    // Find matching UTXO in wallet
+                    if let Some(utxo) = wallet.list_unspent()
+                        .find(|u| u.txout.script_pubkey == witness_utxo.script_pubkey)
+                    {
+                        tracing::info!("🔧 Manually updating PSBT input {} with descriptor at {:?}/{}",
+                            input_idx, utxo.keychain, utxo.derivation_index);
+
+                        // Get descriptor and derive to the specific index
+                        let descriptor = wallet.public_descriptor(utxo.keychain);
+                        let derived_desc = descriptor.at_derivation_index(utxo.derivation_index)
+                            .expect("valid derivation index");
+
+                        // Use miniscript's PsbtInputExt trait to update the input
+                        let input = &mut psbt.inputs[input_idx];
+                        if let Err(e) = input.update_with_descriptor_unchecked(&derived_desc) {
+                            tracing::error!("❌ Failed to update input {}: {:?}", input_idx, e);
+                        } else {
+                            tracing::info!("✅ Updated input {} - tap_internal_key: {:?}, tap_key_origins: {}",
+                                input_idx, input.tap_internal_key, input.tap_key_origins.len());
+                        }
+                    }
+                }
+            }
+
+            // Check PSBT state RIGHT BEFORE calling wallet.sign()
+            tracing::info!("🔨 PSBT state BEFORE wallet.sign():");
+            for (i, input) in psbt.inputs.iter().enumerate() {
+                tracing::info!("  Input {}: tap_internal_key={:?}, tap_key_origins={}",
+                    i, input.tap_internal_key.is_some(), input.tap_key_origins.len());
+            }
+
             let sign_options = bdk_wallet::SignOptions {
                 trust_witness_utxo: true,
+                try_finalize: false,  // Don't finalize - SNICKER requires partial signing!
                 ..Default::default()
             };
 
-            wallet.sign(psbt, sign_options)?;
+            let finalized = wallet.sign(psbt, sign_options)?;
+
+            // Check PSBT state RIGHT AFTER calling wallet.sign()
+            tracing::info!("🔨 PSBT state AFTER wallet.sign():");
+            for (i, input) in psbt.inputs.iter().enumerate() {
+                tracing::info!("  Input {}: tap_internal_key={:?}, tap_key_origins={}",
+                    i, input.tap_internal_key.is_some(), input.tap_key_origins.len());
+            }
+            tracing::info!("🔨 Proposer sign result - finalized: {}", finalized);
+
+            // Log PSBT state after signing
+            for (i, input) in psbt.inputs.iter().enumerate() {
+                tracing::info!("🔨 Input {} AFTER proposer sign:", i);
+                tracing::info!("    - tap_internal_key: {:?}", input.tap_internal_key);
+                tracing::info!("    - tap_key_sig: {:?}", input.tap_key_sig);
+                tracing::info!("    - tap_key_origins: {}", input.tap_key_origins.len());
+
+                // Log detailed tap_key_origins data to understand why signing fails
+                for (pubkey, (leaf_hashes, (fingerprint, derivation_path))) in &input.tap_key_origins {
+                    tracing::info!("      * pubkey: {}", pubkey);
+                    tracing::info!("        fingerprint: {}", fingerprint);
+                    tracing::info!("        derivation_path: {}", derivation_path);
+                    tracing::info!("        leaf_hashes: {} entries", leaf_hashes.len());
+                }
+
+                if input.tap_key_sig.is_none() {
+                    tracing::warn!("    ⚠️  No signature added!");
+                }
+            }
+
             Ok(())
         };
 
         // Create proposal using Snicker (will sign via callback)
-        let (psbt, encrypted_proposal) = self.snicker.propose(
+        let (proposal, encrypted_proposal) = self.snicker.propose(
             opportunity.target_tx.clone(),
             opportunity.target_output_index,
             our_utxo.outpoint,
@@ -302,7 +427,26 @@ impl Manager {
             sign_callback,
         )?;
 
-        Ok((psbt, encrypted_proposal))
+        // Store encrypted proposal for sharing
+        self.snicker.store_snicker_proposal(&encrypted_proposal).await?;
+
+        // Store decrypted proposal in our database (proposer side)
+        let our_utxo_str = format!("{}:{}", opportunity.our_outpoint.txid, opportunity.our_outpoint.vout);
+        let target_utxo_str = self.snicker.extract_receiver_utxo(
+            &proposal,
+            &opportunity.target_tx,
+            opportunity.target_output_index
+        )?;
+
+        self.snicker.store_decrypted_proposal(
+            &proposal,
+            "proposer",
+            &our_utxo_str,
+            &target_utxo_str,
+            delta_sats,
+        ).await?;
+
+        Ok((proposal, encrypted_proposal))
     }
 
     /// Finalize a fully-signed PSBT into a transaction
@@ -324,6 +468,7 @@ impl Manager {
     /// Scan for SNICKER proposals meant for our wallet
     ///
     /// Checks all stored proposals and attempts to decrypt those meant for our UTXOs.
+    /// Caches successfully decrypted proposals in the database for later acceptance.
     ///
     /// # Arguments
     /// * `acceptable_delta_range` - Min and max delta we'll accept (e.g., (-1000, 5000))
@@ -344,42 +489,105 @@ impl Manager {
             self.wallet_node.derive_utxo_privkey(keychain, index)
         };
 
-        // Scan proposals using Snicker
+        // Scan proposals using Snicker (decrypts all proposals meant for our UTXOs)
         let all_proposals = self.snicker.scan_proposals(&our_utxos, derive_privkey).await?;
 
-        // Filter to only proposals within acceptable delta range
-        let mut valid_proposals = Vec::new();
-        for proposal in all_proposals {
-            // Validate the proposal (this checks delta among other things)
-            match self.snicker.receive(
-                proposal.clone(),
-                &our_utxos,
-                acceptable_delta_range,
-                |keychain, index| self.wallet_node.derive_utxo_privkey(keychain, index),
-            ) {
-                Ok(_) => valid_proposals.push(proposal),
+        tracing::info!("💾 Storing {} decrypted proposals in cache...", all_proposals.len());
+
+        // Store each successfully decrypted proposal in the database
+        for proposal in &all_proposals {
+            tracing::info!("Processing proposal with tag {}", hex::encode(&proposal.tag));
+
+            // Calculate delta using a wide range to get the actual value
+            match self.snicker.calculate_delta_from_proposal(proposal) {
+                Ok(delta) => {
+                    tracing::info!("  Calculated delta: {} sats", delta);
+
+                    // Identify which input is ours by checking against our UTXOs
+                    let mut our_utxo_str = None;
+                    let mut proposer_utxo_str = None;
+
+                    for (idx, input) in proposal.psbt.unsigned_tx.input.iter().enumerate() {
+                        let outpoint_str = format!("{}:{}", input.previous_output.txid, input.previous_output.vout);
+
+                        // Check if this input matches any of our UTXOs
+                        let is_ours = our_utxos.iter().any(|utxo| {
+                            utxo.outpoint.txid == input.previous_output.txid
+                                && utxo.outpoint.vout == input.previous_output.vout
+                        });
+
+                        if is_ours {
+                            our_utxo_str = Some(outpoint_str);
+                            tracing::info!("  Our UTXO (input {}): {}", idx, our_utxo_str.as_ref().unwrap());
+                        } else {
+                            proposer_utxo_str = Some(outpoint_str);
+                            tracing::info!("  Proposer UTXO (input {}): {}", idx, proposer_utxo_str.as_ref().unwrap());
+                        }
+                    }
+
+                    let our_utxo = match our_utxo_str {
+                        Some(u) => u,
+                        None => {
+                            tracing::warn!("Could not identify our UTXO in proposal inputs");
+                            continue;
+                        }
+                    };
+
+                    let proposer_utxo = match proposer_utxo_str {
+                        Some(u) => u,
+                        None => {
+                            tracing::warn!("Could not identify proposer UTXO in proposal inputs");
+                            continue;
+                        }
+                    };
+
+                    // Store in database with role="receiver" and status="pending"
+                    match self.snicker.store_decrypted_proposal(
+                        proposal,
+                        "receiver",
+                        &our_utxo,
+                        &proposer_utxo,
+                        delta,
+                    ).await {
+                        Ok(_) => tracing::info!("  ✅ Stored in decrypted_proposals table"),
+                        Err(e) => tracing::warn!("  ❌ Failed to cache proposal {}: {}", hex::encode(&proposal.tag), e),
+                    }
+                }
                 Err(e) => {
-                    tracing::info!("Rejected proposal: {}", e);
+                    tracing::warn!("Could not calculate delta for proposal: {}", e);
                 }
             }
         }
 
-        Ok(valid_proposals)
+        // Now query from database with delta filter
+        tracing::info!("🔍 Querying decrypted_proposals table with delta range {} to {} and status='pending'",
+                      acceptable_delta_range.0, acceptable_delta_range.1);
+        let results = self.snicker.get_decrypted_proposals_by_delta_range(
+            acceptable_delta_range.0,
+            acceptable_delta_range.1,
+            "pending"
+        ).await?;
+        tracing::info!("📊 Query returned {} proposals", results.len());
+        Ok(results)
     }
 
     /// Accept and sign a SNICKER proposal as receiver
     ///
     /// # Arguments
-    /// * `proposal` - The proposal to accept (contains proposer's signature)
+    /// * `tag` - Unique identifier of the proposal to accept
     /// * `acceptable_delta_range` - Min and max delta we'll accept
     ///
     /// # Returns
     /// Fully-signed PSBT (both parties signed) ready for finalization
     pub async fn accept_snicker_proposal(
         &mut self,
-        proposal: Proposal,
+        tag: &[u8; 8],
         acceptable_delta_range: (i64, i64),
     ) -> Result<Psbt> {
+        // Get proposal from database
+        let proposal = self.snicker.get_decrypted_proposal_by_tag(tag).await?
+            .ok_or_else(|| anyhow::anyhow!("Proposal not found with tag: {}", hex::encode(tag)))?;
+
         // Get our UTXOs from wallet
         let wallet = self.wallet_node.wallet.lock().await;
         let our_utxos: Vec<_> = wallet.list_unspent().collect();
@@ -395,6 +603,9 @@ impl Manager {
 
         // Sign with wallet (adds receiver's signature)
         self.wallet_node.sign_psbt(&mut psbt).await?;
+
+        // Update status in database
+        self.snicker.update_proposal_status(tag, "accepted").await?;
 
         // Return fully-signed PSBT (caller can finalize and broadcast)
         Ok(psbt)

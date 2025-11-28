@@ -1,6 +1,8 @@
 // Library interface for ambient wallet
 // Exposes public modules for testing
 
+extern crate hex;
+
 pub mod manager;
 pub mod snicker;
 pub mod wallet_node;

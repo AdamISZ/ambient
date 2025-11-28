@@ -8,18 +8,16 @@ use anyhow::{anyhow, Result};
 use directories::ProjectDirs;
 use tokio::select;
 use tokio::sync::Mutex;
-use tokio::time::{timeout, Duration};
 use tracing::info;
 
 use bdk_wallet::{
     PersistedWallet,
-    bitcoin::{Network, Address, Amount, FeeRate, Transaction, Txid, psbt::Psbt, OutPoint},
+    bitcoin::{Network, Address, Amount, FeeRate, Transaction, Txid, psbt::Psbt},
     keys::{
         bip39::{Language, Mnemonic, WordCount},
         DerivableKey, ExtendedKey, GeneratedKey, GeneratableKey,
     },
     rusqlite::Connection,
-    template::{Bip86, DescriptorTemplate},
     miniscript::Tap,
     KeychainKind, Wallet, SignOptions,
 };
@@ -40,6 +38,10 @@ pub struct WalletNode {
     pub network: Network,
     /// Master extended private key (needed for SNICKER DH operations)
     pub(crate) xprv: bdk_wallet::bitcoin::bip32::Xpriv,
+    /// Optional Bitcoin Core RPC client (required for proposer mode scanning)
+    pub(crate) rpc_client: Option<Arc<bdk_bitcoind_rpc::bitcoincore_rpc::Client>>,
+    /// Wallet name (for locating correct headers.db)
+    wallet_name: String,
 }
 
 impl WalletNode {
@@ -122,6 +124,8 @@ impl WalletNode {
             update_subscriber,
             network,
             xprv,
+            rpc_client: None,
+            wallet_name: name.to_string(),
         })
     }
 
@@ -160,27 +164,68 @@ impl WalletNode {
             .into_xprv(network)
             .ok_or_else(|| anyhow!("Unable to derive xprv from mnemonic"))?;
 
+        // Create BIP86 descriptors manually
         // BIP86 uses m/86'/cointype'/0' as the account path
         let coin_type = if network == Network::Bitcoin { 0 } else { 1 };
 
-        // Put the full BIP86 derivation path in the descriptor string
-        // The descriptor parser will handle the derivation internally
-        // Using 'h' for hardened derivation in descriptor syntax
+        // Format: tr(xprv/86h/{cointype}h/0h/{change}/*)
         let external_desc = format!("tr({}/86h/{}h/0h/0/*)", xprv, coin_type);
         let internal_desc = format!("tr({}/86h/{}h/0h/1/*)", xprv, coin_type);
 
-        info!("🔍 Descriptor has private keys: {}", external_desc.contains("prv"));
+        info!("🔍 Descriptor contains private key: {}", external_desc.contains("prv"));
 
         let mut conn = Connection::open(db_path)?;
         info!("💾 Wallet database path: {:?}", db_path);
 
         // Check if wallet already exists by trying to load it
+        // CRITICAL: When loading from DB, we must call .descriptor().extract_keys() to restore signers
+        // Use Box::leak to convert String to &'static str (acceptable for descriptor strings)
+        let external_desc_static: &'static str = Box::leak(external_desc.clone().into_boxed_str());
+        let internal_desc_static: &'static str = Box::leak(internal_desc.clone().into_boxed_str());
+
+        info!("🔍 Loading wallet with descriptors and extract_keys():");
+        info!("   External: {} chars", external_desc_static.len());
+        info!("   Internal: {} chars", internal_desc_static.len());
+
         let maybe_wallet = Wallet::load()
+            .descriptor(KeychainKind::External, Some(external_desc_static))
+            .descriptor(KeychainKind::Internal, Some(internal_desc_static))
+            .extract_keys()  // Re-extract private keys from descriptors to create signers!
             .check_network(network)
             .load_wallet(&mut conn)?;
 
-        let mut wallet = if let Some(loaded) = maybe_wallet {
+        info!("🔍 Wallet load completed");
+
+        let wallet = if let Some(mut loaded) = maybe_wallet {
             info!("✅ Loaded existing wallet from database");
+
+            // CRITICAL FIX: After loading, we must ensure the SPK index is populated!
+            // When a wallet is loaded from DB, the index might not include all UTXOs
+            // that were added in previous sessions. We need to reveal addresses up to
+            // the highest index we've used to repopulate the SPK index.
+
+            // Find the highest derivation index used in each keychain
+            let mut max_external = 0u32;
+            let mut max_internal = 0u32;
+            for utxo in loaded.list_unspent() {
+                match utxo.keychain {
+                    KeychainKind::External => max_external = max_external.max(utxo.derivation_index),
+                    KeychainKind::Internal => max_internal = max_internal.max(utxo.derivation_index),
+                }
+            }
+
+            info!("🔧 Repopulating SPK index: External up to {}, Internal up to {}",
+                max_external, max_internal);
+
+            // Use reveal_addresses_to() which actually updates the SPK index
+            // (peek_address() only reads, doesn't update!)
+            let _ = loaded.reveal_addresses_to(KeychainKind::External, max_external + RECOVERY_LOOKAHEAD).collect::<Vec<_>>();
+            let _ = loaded.reveal_addresses_to(KeychainKind::Internal, max_internal + RECOVERY_LOOKAHEAD).collect::<Vec<_>>();
+
+            // Persist the index changes to database
+            loaded.persist(&mut conn)?;
+
+            info!("✅ SPK index repopulated and persisted");
             loaded
         } else {
             info!("✅ Creating new wallet with descriptors");
@@ -199,6 +244,16 @@ impl WalletNode {
 
             new_wallet
         };
+
+        // NOTE: Wallet::create() with xprv-containing descriptors should automatically
+        // extract and add signers for both External and Internal keychains.
+        // However, Wallet::load() does NOT restore signers (private keys aren't in DB).
+        //
+        // For now, we'll trust that Wallet::create() sets up signers correctly.
+        // If signing issues persist after wallet reload, we'll need to re-add signers
+        // by re-parsing the descriptor strings (which requires storing them encrypted).
+
+        info!("🔑 Wallet created/loaded - signers should be present for both keychains");
 
         Ok((wallet, conn))
     }
@@ -299,6 +354,24 @@ impl WalletNode {
                         tracing::error!("Failed to apply update: {e}");
                         continue;
                     }
+
+                    // CRITICAL: After applying blockchain updates, repopulate SPK index
+                    // This ensures newly discovered UTXOs can be signed
+                    let mut max_external = 0u32;
+                    let mut max_internal = 0u32;
+                    for utxo in wallet.list_unspent() {
+                        match utxo.keychain {
+                            KeychainKind::External => max_external = max_external.max(utxo.derivation_index),
+                            KeychainKind::Internal => max_internal = max_internal.max(utxo.derivation_index),
+                        }
+                    }
+                    if max_external > 0 || max_internal > 0 {
+                        tracing::debug!("🔧 Repopulating SPK index after scan: External up to {}, Internal up to {}",
+                            max_external, max_internal);
+                        let _ = wallet.reveal_addresses_to(KeychainKind::External, max_external + RECOVERY_LOOKAHEAD).collect::<Vec<_>>();
+                        let _ = wallet.reveal_addresses_to(KeychainKind::Internal, max_internal + RECOVERY_LOOKAHEAD).collect::<Vec<_>>();
+                    }
+
                     if let Err(e) = wallet.persist(&mut conn) {
                         tracing::error!("Failed to persist wallet: {e}");
                     }
@@ -316,6 +389,49 @@ impl WalletNode {
 
 
     // ============================================================
+    // PSBT DEBUGGING
+    // ============================================================
+
+    /// Dump complete PSBT state for debugging
+    fn dump_psbt_state(psbt: &Psbt, label: &str) {
+        info!("========== PSBT STATE: {} ==========", label);
+        info!("Transaction inputs: {}", psbt.unsigned_tx.input.len());
+        info!("Transaction outputs: {}", psbt.unsigned_tx.output.len());
+
+        for (i, input) in psbt.inputs.iter().enumerate() {
+            info!("--- Input {} ---", i);
+            info!("  witness_utxo: {}", input.witness_utxo.is_some());
+            if let Some(ref utxo) = input.witness_utxo {
+                info!("    value: {} sats", utxo.value.to_sat());
+                info!("    script: {}", utxo.script_pubkey);
+            }
+            info!("  non_witness_utxo: {}", input.non_witness_utxo.is_some());
+            info!("  sighash_type: {:?}", input.sighash_type);
+            info!("  tap_internal_key: {:?}", input.tap_internal_key);
+            info!("  tap_merkle_root: {:?}", input.tap_merkle_root);
+            info!("  tap_key_sig: {:?}", input.tap_key_sig);
+            info!("  tap_script_sigs: {}", input.tap_script_sigs.len());
+            info!("  tap_key_origins: {}", input.tap_key_origins.len());
+            for (xonly, (leaf_hashes, (fingerprint, path))) in &input.tap_key_origins {
+                info!("    xonly: {}", xonly);
+                info!("    fingerprint: {}", fingerprint);
+                info!("    path: {}", path);
+                info!("    leaf_hashes: {} entries", leaf_hashes.len());
+            }
+            info!("  bip32_derivation: {}", input.bip32_derivation.len());
+            info!("  partial_sigs: {}", input.partial_sigs.len());
+            info!("  final_script_witness: {}", input.final_script_witness.is_some());
+        }
+
+        for (i, output) in psbt.outputs.iter().enumerate() {
+            info!("--- Output {} ---", i);
+            info!("  tap_internal_key: {:?}", output.tap_internal_key);
+            info!("  tap_key_origins: {}", output.tap_key_origins.len());
+        }
+        info!("========================================");
+    }
+
+    // ============================================================
     // TRANSACTION BUILDING & SENDING (Modular Architecture)
     // ============================================================
 
@@ -328,14 +444,12 @@ impl WalletNode {
     ) -> Result<Psbt> {
         let mut wallet = self.wallet.lock().await;
 
-        info!("🔍 Building transaction with {} recipients", recipients.len());
-        info!("🔍 Wallet balance: {} sats", wallet.balance().total().to_sat());
+        info!("🔨 Building transaction with {} recipients", recipients.len());
 
         let mut tx_builder = wallet.build_tx();
 
         // Add all recipients
         for (address, amount) in recipients {
-            info!("🔍 Adding recipient: {} sats", amount.to_sat());
             tx_builder.add_recipient(address.script_pubkey(), amount);
         }
 
@@ -343,9 +457,7 @@ impl WalletNode {
         tx_builder.fee_rate(fee_rate);
 
         // Build the PSBT
-        info!("🔍 Finishing transaction build...");
         let mut psbt = tx_builder.finish()?;
-        info!("🔍 PSBT created with {} inputs, {} outputs", psbt.inputs.len(), psbt.outputs.len());
 
         // Fix missing witness_utxo: BDK only sets it if the full previous transaction
         // is in the wallet's graph. With Kyoto, we might not have the full tx, but we
@@ -356,20 +468,11 @@ impl WalletNode {
                 let outpoint = psbt.unsigned_tx.input[i].previous_output;
                 if let Some(utxo) = utxos.iter().find(|u| u.outpoint == outpoint) {
                     psbt_input.witness_utxo = Some(utxo.txout.clone());
-                    info!("🔧 Manually set witness_utxo for input {}", i);
                 }
             }
         }
 
-        // Debug: check PSBT state after building
-        for (i, input) in psbt.inputs.iter().enumerate() {
-            info!("🔍 Input {} after build - witness_utxo: {}, non_witness_utxo: {}, tap_internal_key: {}, tap_key_origins: {}",
-                  i,
-                  input.witness_utxo.is_some(),
-                  input.non_witness_utxo.is_some(),
-                  input.tap_internal_key.is_some(),
-                  input.tap_key_origins.len());
-        }
+        info!("✅ PSBT created: {} inputs, {} outputs", psbt.inputs.len(), psbt.outputs.len());
 
         Ok(psbt)
     }
@@ -377,52 +480,14 @@ impl WalletNode {
     /// Sign a PSBT with the wallet's keys.
     /// Returns true if the PSBT is fully signed after this operation.
     pub async fn sign_psbt(&mut self, psbt: &mut Psbt) -> Result<bool> {
-        let mut wallet = self.wallet.lock().await;
+        let wallet = self.wallet.lock().await;
 
-        info!("🔍 Signing PSBT with {} inputs", psbt.inputs.len());
-
-        // Debug: Get wallet's key fingerprint
-        let descriptor = wallet.public_descriptor(KeychainKind::External);
-        info!("🔍 Wallet descriptor: {}", descriptor);
-
-        // Debug: check PSBT state before signing
-        for (i, input) in psbt.inputs.iter().enumerate() {
-            info!("🔍 Input {} BEFORE sign:", i);
-            info!("    - witness_utxo: {}", input.witness_utxo.is_some());
-            info!("    - non_witness_utxo: {}", input.non_witness_utxo.is_some());
-            info!("    - tap_internal_key: {:?}", input.tap_internal_key);
-            info!("    - tap_merkle_root: {:?}", input.tap_merkle_root);
-            info!("    - tap_key_sig: {:?}", input.tap_key_sig);
-            info!("    - tap_key_origins: {}", input.tap_key_origins.len());
-
-            // Debug: inspect tap_key_origins
-            for (pubkey, (leaf_hashes, (fingerprint, derivation_path))) in &input.tap_key_origins {
-                info!("      - pubkey: {}", pubkey);
-                info!("        fingerprint: {}", fingerprint);
-                info!("        derivation_path: {}", derivation_path);
-                info!("        leaf_hashes: {:?}", leaf_hashes);
-            }
-
-            info!("    - bip32_derivation: {}", input.bip32_derivation.len());
-            info!("    - partial_sigs: {}", input.partial_sigs.len());
-            info!("    - final_witness: {}", input.final_script_witness.is_some());
-        }
+        info!("✍️  Signing PSBT with {} inputs", psbt.inputs.len());
 
         let finalized = wallet.sign(psbt, SignOptions::default())?;
-        info!("🔍 Sign result - finalized: {}", finalized);
 
-        // Debug: check PSBT state after signing
-        for (i, input) in psbt.inputs.iter().enumerate() {
-            info!("🔍 Input {} AFTER sign:", i);
-            info!("    - tap_internal_key: {:?}", input.tap_internal_key);
-            info!("    - tap_key_sig: {:?}", input.tap_key_sig);
-            info!("    - tap_key_origins: {}", input.tap_key_origins.len());
-            info!("    - partial_sigs: {}", input.partial_sigs.len());
-            info!("    - final_witness: {}", input.final_script_witness.is_some());
-            if let Some(ref witness) = input.final_script_witness {
-                info!("    - witness stack size: {}", witness.len());
-            }
-        }
+        let signed_count = psbt.inputs.iter().filter(|i| i.tap_key_sig.is_some()).count();
+        info!("✅ Signed {} inputs (finalized: {})", signed_count, finalized);
 
         Ok(finalized)
     }
@@ -430,7 +495,44 @@ impl WalletNode {
     /// Finalize a fully-signed PSBT into a transaction ready for broadcast.
     /// Returns an error if the PSBT is not fully signed.
     pub async fn finalize_psbt(&mut self, mut psbt: Psbt) -> Result<Transaction> {
-        // Extract the final transaction (validates PSBT structure and finalization)
+        use bdk_wallet::bitcoin::Witness;
+
+        info!("🔍 Finalizing PSBT with {} inputs", psbt.inputs.len());
+
+        // For each input, finalize if it has all required signatures
+        // This is a generic finalizer that works for multi-party PSBTs (like SNICKER)
+        for (i, input) in psbt.inputs.iter_mut().enumerate() {
+            // Skip if already finalized
+            if input.final_script_witness.is_some() {
+                info!("    Input {}: already finalized", i);
+                continue;
+            }
+
+            // For taproot key-path spends: finalize if we have tap_key_sig
+            if let Some(sig) = input.tap_key_sig {
+                info!("    Input {}: finalizing taproot key-path spend", i);
+                // Taproot key-path witness is just the signature
+                input.final_script_witness = Some(Witness::from_slice(&[sig.to_vec()]));
+                // Clear all non-final fields per BIP 174
+                input.partial_sigs.clear();
+                input.sighash_type = None;
+                input.redeem_script = None;
+                input.witness_script = None;
+                input.bip32_derivation.clear();
+                input.tap_key_sig = None;
+                input.tap_script_sigs.clear();
+                input.tap_scripts.clear();
+                input.tap_key_origins.clear();
+                input.tap_internal_key = None;
+                input.tap_merkle_root = None;
+            } else {
+                return Err(anyhow::anyhow!("Input {} missing signature - cannot finalize", i));
+            }
+        }
+
+        info!("✅ All inputs finalized");
+
+        // Extract the final transaction
         let tx = psbt.extract_tx()?;
 
         Ok(tx)
@@ -461,6 +563,8 @@ impl WalletNode {
 
     /// Convenience method: Build, sign, finalize, and broadcast a transaction in one step.
     /// This is the simple "send" interface for basic usage.
+    ///
+    /// SIMPLIFIED VERSION: Uses BDK's integrated approach without manual PSBT manipulation
     pub async fn send_to_address(
         &mut self,
         address_str: &str,
@@ -473,38 +577,47 @@ impl WalletNode {
             .require_network(self.network)
             .map_err(|e| anyhow!("Address network mismatch: {}", e))?;
 
-        // Build transaction
-        let recipients = vec![(address, Amount::from_sat(amount_sats))];
-        let fee_rate = FeeRate::from_sat_per_vb_unchecked(fee_rate_sat_vb as u64);
+        let mut wallet = self.wallet.lock().await;
 
         info!("🔨 Building transaction...");
-        let mut psbt = self.build_transaction(recipients, fee_rate).await?;
+        let mut tx_builder = wallet.build_tx();
+        tx_builder.add_recipient(address.script_pubkey(), Amount::from_sat(amount_sats));
+        tx_builder.fee_rate(FeeRate::from_sat_per_vb_unchecked(fee_rate_sat_vb as u64));
 
-        // Sign transaction
+        let mut psbt = tx_builder.finish()?;
+        info!("✅ PSBT created with {} inputs, {} outputs", psbt.inputs.len(), psbt.outputs.len());
+
+        // PHASE 1 DEBUG: Dump PSBT state after tx_builder.finish() (working case)
+        Self::dump_psbt_state(&psbt, "After tx_builder.finish() - WORKING");
+
+        // Sign
         info!("✍️  Signing transaction...");
-        let finalized = self.sign_psbt(&mut psbt).await?;
+        let sign_options = SignOptions::default();
+        let finalized = wallet.sign(&mut psbt, sign_options)?;
+        info!("🔍 Sign result - finalized: {}", finalized);
 
-        if finalized {
-            info!("✅ PSBT fully signed and finalized");
-        } else {
-            info!("⚠️  PSBT signed but needs finalization");
+        // Finalize
+        info!("🔐 Finalizing transaction...");
+        let finalize_result = wallet.finalize_psbt(&mut psbt, SignOptions::default())?;
+        info!("🔍 Finalize result: {}", finalize_result);
+
+        if !finalize_result {
+            return Err(anyhow!("PSBT could not be finalized - missing signatures"));
         }
 
-        // Finalize transaction (extract_tx will fail if not properly signed)
-        info!("🔐 Finalizing transaction...");
-        let tx = self.finalize_psbt(psbt).await?;
+        // Extract transaction
+        let tx = psbt.extract_tx()?;
+        info!("✅ Transaction extracted, txid: {}", tx.compute_txid());
 
-        // Persist wallet state (update used UTXOs, change address, etc.)
-        {
-            let mut conn = self.conn.lock().await;
-            let mut wallet = self.wallet.lock().await;
-            wallet.persist(&mut conn)?;
-        } // Drop locks before broadcast
+        // Persist wallet state
+        let mut conn = self.conn.lock().await;
+        wallet.persist(&mut conn)?;
+        drop(conn);
+        drop(wallet);
 
-        // Broadcast transaction
+        // Broadcast
         info!("📡 Broadcasting transaction...");
         let txid = self.broadcast_transaction(tx).await?;
-
         info!("✅ Transaction sent: {}", txid);
 
         Ok(txid)
@@ -666,63 +779,159 @@ impl WalletNode {
     }
 
     // ============================================================
-    // BLOCKCHAIN SCANNING
+    // BITCOIN CORE RPC (for proposer mode)
     // ============================================================
 
-    /// Scan the last N blocks for transactions matching a filter
-    ///
-    /// Generic blockchain scanner - returns transactions that pass the provided filter.
-    /// The caller is responsible for storing or processing the results.
+    /// Set the Bitcoin Core RPC client (required for proposer mode scanning)
     ///
     /// # Arguments
-    /// * `num_blocks` - Number of recent blocks to scan (e.g., 10)
-    /// * `filter` - Function that returns true for transactions to include
+    /// * `url` - RPC URL (e.g., "http://127.0.0.1:18443")
+    /// * `auth` - Authentication (username, password)
+    pub fn set_rpc_client(&mut self, url: &str, auth: (String, String)) -> Result<()> {
+        use bdk_bitcoind_rpc::bitcoincore_rpc::{Auth, Client};
+
+        let rpc_auth = Auth::UserPass(auth.0, auth.1);
+        let client = Client::new(url, rpc_auth)?;
+        self.rpc_client = Some(Arc::new(client));
+
+        info!("✅ Bitcoin Core RPC client connected: {}", url);
+        Ok(())
+    }
+
+    /// Get block hashes from Kyoto's headers database for a height range
+    ///
+    /// Queries the headers.db that Kyoto maintains with all block headers.
+    ///
+    /// # Arguments
+    /// * `start_height` - Starting block height (inclusive)
+    /// * `end_height` - Ending block height (inclusive)
     ///
     /// # Returns
-    /// Vector of (block_height, transaction) tuples for matching transactions
-    pub async fn scan_for_transactions<F>(
+    /// Vector of (height, block_hash) tuples
+    pub fn get_block_hashes_from_headers_db(
         &self,
-        num_blocks: u32,
-        filter: F,
-    ) -> Result<Vec<(u32, Transaction)>>
-    where
-        F: Fn(&Transaction) -> bool,
-    {
+        start_height: u32,
+        end_height: u32,
+    ) -> Result<Vec<(u32, bdk_wallet::bitcoin::BlockHash)>> {
         use bdk_wallet::bitcoin::BlockHash;
+        use bdk_wallet::bitcoin::hashes::Hash;
+        use bdk_wallet::rusqlite::Connection;
 
-        let wallet = self.wallet.lock().await;
-        let tip = wallet.local_chain().tip();
-        let tip_height = tip.height();
-        let start_height = tip_height.saturating_sub(num_blocks - 1);
+        // Construct path to Kyoto's headers database
+        let project_dirs = directories::ProjectDirs::from("org", "code", "ambient")
+            .ok_or_else(|| anyhow::anyhow!("Could not determine data directory"))?;
 
-        info!("🔍 Scanning {} blocks (heights {}-{})", num_blocks, start_height, tip_height);
+        let network_str = match self.network {
+            bdk_wallet::bitcoin::Network::Bitcoin => "mainnet",
+            bdk_wallet::bitcoin::Network::Testnet => "testnet",
+            bdk_wallet::bitcoin::Network::Signet => "signet",
+            bdk_wallet::bitcoin::Network::Regtest => "regtest",
+            _ => return Err(anyhow::anyhow!("Unsupported network")),
+        };
 
-        // Collect block hashes to fetch
-        let mut block_requests = Vec::new();
-        let mut checkpoint = Some(tip.clone());
+        // Construct direct path to this wallet's headers.db
+        let headers_db_path = project_dirs.data_local_dir()
+            .join(network_str)
+            .join(&self.wallet_name)
+            .join("kyoto_peers")
+            .join("light_client_data")
+            .join(network_str)
+            .join("headers.db");
 
-        while let Some(cp) = checkpoint {
-            let height = cp.height();
-            if height < start_height {
-                break;
-            }
-            let hash = BlockHash::from_raw_hash(*cp.hash().as_raw_hash());
-            block_requests.push((height, hash));
-            checkpoint = cp.prev();
+        if !headers_db_path.exists() {
+            return Err(anyhow::anyhow!("Headers database not found at {:?}", headers_db_path));
         }
 
-        drop(wallet); // Release lock before async operations
+        // Open Kyoto's header database (read-only)
+        let conn = Connection::open_with_flags(
+            &headers_db_path,
+            bdk_wallet::rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+
+        // Query for block hashes in the height range
+        let mut stmt = conn.prepare(
+            "SELECT height, block_hash FROM headers WHERE height >= ? AND height <= ? ORDER BY height"
+        )?;
+
+        let mut block_hashes = Vec::new();
+        let rows = stmt.query_map([start_height, end_height], |row| {
+            let height: u32 = row.get(0)?;
+            let hash_bytes: Vec<u8> = row.get(1)?;
+            Ok((height, hash_bytes))
+        })?;
+
+        for row in rows {
+            let (height, hash_bytes) = row?;
+            // Database stores hashes in internal byte order, which is what BlockHash::from_slice expects
+            // (BlockHash handles display order conversion when printing)
+            let hash = BlockHash::from_slice(&hash_bytes)
+                .map_err(|e| anyhow::anyhow!("Invalid block hash: {}", e))?;
+            block_hashes.push((height, hash));
+        }
+
+        Ok(block_hashes)
+    }
+
+    /// Scan blocks for taproot UTXOs matching size criteria
+    ///
+    /// Gets block hashes from Kyoto's headers.db, fetches blocks via P2P,
+    /// and scans for taproot outputs matching the size range.
+    ///
+    /// # Arguments
+    /// * `num_blocks` - Number of recent blocks to scan
+    /// * `size_min` - Minimum output value in sats
+    /// * `size_max` - Maximum output value in sats
+    ///
+    /// # Returns
+    /// Vector of (block_height, txid, full_transaction) for transactions with matching outputs
+    pub async fn scan_blocks_for_taproot_utxos(
+        &self,
+        num_blocks: u32,
+        size_min: u64,
+        size_max: u64,
+    ) -> Result<Vec<(u32, Txid, Transaction)>> {
+        // Get current tip height from wallet
+        let wallet = self.wallet.lock().await;
+        let tip_height = wallet.local_chain().tip().height();
+        drop(wallet);
+
+        let start_height = tip_height.saturating_sub(num_blocks - 1);
+
+        info!("🔍 Scanning {} blocks via Kyoto P2P (heights {}-{})", num_blocks, start_height, tip_height);
+
+        // Get block hashes from Kyoto's headers database
+        let block_hashes = self.get_block_hashes_from_headers_db(start_height, tip_height)?;
+        info!("📊 Retrieved {} block hashes from headers.db", block_hashes.len());
 
         let mut results = Vec::new();
 
-        // Scan each block
-        for (height, block_hash) in block_requests {
+        // Fetch and scan each block
+        for (height, block_hash) in block_hashes {
             match self.requester.get_block(block_hash).await {
                 Ok(indexed_block) => {
+                    let block = &indexed_block.block;
+                    tracing::debug!("📦 Block {} at height {}: {} transactions",
+                                   block_hash, height, block.txdata.len());
+
                     // Scan each transaction in the block
-                    for tx in &indexed_block.block.txdata {
-                        if filter(tx) {
-                            results.push((height, tx.clone()));
+                    for tx in &block.txdata {
+                        let txid = tx.compute_txid();
+                        let mut has_match = false;
+
+                        // Check each output for taproot + size match
+                        for (vout, output) in tx.output.iter().enumerate() {
+                            if output.script_pubkey.is_p2tr() {
+                                let amount = output.value.to_sat();
+                                if amount >= size_min && amount <= size_max {
+                                    tracing::info!("✅ Found taproot UTXO: {}:{} ({} sats)",
+                                                 txid, vout, amount);
+                                    has_match = true;
+                                }
+                            }
+                        }
+
+                        if has_match {
+                            results.push((height, txid, tx.clone()));
                         }
                     }
                 }
@@ -733,7 +942,8 @@ impl WalletNode {
             }
         }
 
-        info!("📦 Scanned {} blocks, found {} matching transactions", num_blocks, results.len());
+        info!("📦 Scanned {} blocks via P2P, found {} transactions with matching taproot outputs",
+              num_blocks, results.len());
         Ok(results)
     }
 

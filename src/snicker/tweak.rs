@@ -262,7 +262,7 @@ fn create_p2tr_script(xonly_pubkey: &[u8; 32]) -> ScriptBuf {
 /// The taproot tweak as a Scalar
 pub fn calculate_taproot_tweak_scalar(internal_pubkey_xonly: &[u8; 32]) -> Result<Scalar> {
     use bdk_wallet::bitcoin::secp256k1::XOnlyPublicKey;
-    use bdk_wallet::bitcoin::key::{TapTweak, UntweakedPublicKey};
+    use bdk_wallet::bitcoin::key::UntweakedPublicKey;
     use bdk_wallet::bitcoin::taproot::TapTweakHash;
 
     // Convert to XOnlyPublicKey

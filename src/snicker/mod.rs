@@ -58,12 +58,25 @@ use serde::{Serialize, Deserialize};
 /// # Returns
 /// `true` if the transaction has at least one qualifying P2TR output
 pub fn is_snicker_candidate(tx: &Transaction, size_min: u64, size_max: u64) -> bool {
-    tx.output.iter().any(|output| {
+    let txid = tx.compute_txid();
+    let mut found_match = false;
+
+    for (vout, output) in tx.output.iter().enumerate() {
         let is_p2tr = output.script_pubkey.is_p2tr();
-        let in_range = output.value.to_sat() >= size_min
-                    && output.value.to_sat() <= size_max;
-        is_p2tr && in_range
-    })
+        let amount = output.value.to_sat();
+        let in_range = amount >= size_min && amount <= size_max;
+
+        if is_p2tr && in_range {
+            tracing::info!("✅ Candidate match: {}:{} ({} sats, range {}-{})",
+                txid, vout, amount, size_min, size_max);
+            found_match = true;
+        } else if is_p2tr {
+            tracing::debug!("⏭️  Skipping P2TR output {}:{} ({} sats, out of range {}-{})",
+                txid, vout, amount, size_min, size_max);
+        }
+    }
+
+    found_match
 }
 
 /// Information about a key tweak applied to create a SNICKER output
@@ -80,6 +93,8 @@ pub struct TweakInfo {
 /// A SNICKER transaction proposal
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Proposal {
+    /// Tag for identifying this proposal (from EncryptedProposal)
+    pub tag: [u8; 8],
     /// The partially signed Bitcoin transaction
     pub psbt: Psbt,
     /// Information about the tweak applied
@@ -137,6 +152,7 @@ impl Snicker {
         let mut conn_guard = conn.lock().unwrap();
         Self::init_candidates_table(&mut conn_guard)?;
         Self::init_proposals_table(&mut conn_guard)?;
+        Self::init_decrypted_proposals_table(&mut conn_guard)?;
         Self::init_snicker_utxos_table(&mut conn_guard)?;
         drop(conn_guard);
 
@@ -184,7 +200,7 @@ impl Snicker {
         delta_sats: i64,
         fee_rate: bdk_wallet::bitcoin::FeeRate,
         sign_psbt: F,
-    ) -> Result<(Psbt, EncryptedProposal)>
+    ) -> Result<(Proposal, EncryptedProposal)>
     where
         F: FnOnce(&mut Psbt) -> Result<()>,
     {
@@ -224,10 +240,6 @@ impl Snicker {
             tweaked_output,
             proposer_pubkey: proposer_input_pubkey,
         };
-        let proposal = Proposal {
-            psbt: psbt.clone(),
-            tweak_info
-        };
 
         // 5. Generate ephemeral keypair for encryption (separate from SNICKER tweak)
         let mut rng = rand::thread_rng();
@@ -254,6 +266,13 @@ impl Snicker {
         // Receiver tries each UTXO with ephemeral key to check tag before decrypting
         let tag = tweak::compute_proposal_tag(&encryption_shared_secret);
 
+        // Create proposal with tag
+        let proposal = Proposal {
+            tag,
+            psbt: psbt.clone(),
+            tweak_info
+        };
+
         // 9. Serialize and encrypt the proposal (contains partially-signed PSBT)
         // After decryption, receiver will extract proposer's input key from PSBT witness
         let proposal_bytes = serde_json::to_vec(&proposal)?;
@@ -265,8 +284,8 @@ impl Snicker {
             encrypted_data,
         };
 
-        // Return both the partially-signed PSBT and the encrypted proposal (for sharing)
-        Ok((psbt, encrypted_proposal))
+        // Return both the Proposal (with PSBT + tag) and the encrypted proposal (for sharing)
+        Ok((proposal, encrypted_proposal))
     }
 
     // ============================================================
@@ -462,13 +481,60 @@ impl Snicker {
         // Create PSBT from transaction
         let mut psbt = Psbt::from_unsigned_tx(tx)?;
 
-        // Add witness_utxo for receiver's input
+        // Add witness_utxo for receiver's input (input 0 - hardcoded for now)
         psbt.inputs[0].witness_utxo = Some(receiver_output.clone());
 
-        // Add witness_utxo for proposer's input
-        psbt.inputs[1].witness_utxo = Some(proposer_txout);
+        // Add witness_utxo for proposer's input (input 1 - hardcoded for now)
+        psbt.inputs[1].witness_utxo = Some(proposer_txout.clone());
+
+        // Set sighash type for taproot signing (SIGHASH_ALL is standard)
+        use bdk_wallet::bitcoin::sighash::TapSighashType;
+        psbt.inputs[0].sighash_type = Some(TapSighashType::All.into());
+        psbt.inputs[1].sighash_type = Some(TapSighashType::All.into());
+
+        // PHASE 1 DEBUG: Dump PSBT state after manual creation (before adding tap fields)
+        Self::dump_psbt_state(&psbt, "After manual SNICKER PSBT creation - BEFORE adding tap fields");
 
         Ok(psbt)
+    }
+
+    /// Dump complete PSBT state for debugging (same as in wallet_node.rs)
+    fn dump_psbt_state(psbt: &Psbt, label: &str) {
+        tracing::info!("========== PSBT STATE: {} ==========", label);
+        tracing::info!("Transaction inputs: {}", psbt.unsigned_tx.input.len());
+        tracing::info!("Transaction outputs: {}", psbt.unsigned_tx.output.len());
+
+        for (i, input) in psbt.inputs.iter().enumerate() {
+            tracing::info!("--- Input {} ---", i);
+            tracing::info!("  witness_utxo: {}", input.witness_utxo.is_some());
+            if let Some(ref utxo) = input.witness_utxo {
+                tracing::info!("    value: {} sats", utxo.value.to_sat());
+                tracing::info!("    script: {}", utxo.script_pubkey);
+            }
+            tracing::info!("  non_witness_utxo: {}", input.non_witness_utxo.is_some());
+            tracing::info!("  sighash_type: {:?}", input.sighash_type);
+            tracing::info!("  tap_internal_key: {:?}", input.tap_internal_key);
+            tracing::info!("  tap_merkle_root: {:?}", input.tap_merkle_root);
+            tracing::info!("  tap_key_sig: {:?}", input.tap_key_sig);
+            tracing::info!("  tap_script_sigs: {}", input.tap_script_sigs.len());
+            tracing::info!("  tap_key_origins: {}", input.tap_key_origins.len());
+            for (xonly, (leaf_hashes, (fingerprint, path))) in &input.tap_key_origins {
+                tracing::info!("    xonly: {}", xonly);
+                tracing::info!("    fingerprint: {}", fingerprint);
+                tracing::info!("    path: {}", path);
+                tracing::info!("    leaf_hashes: {} entries", leaf_hashes.len());
+            }
+            tracing::info!("  bip32_derivation: {}", input.bip32_derivation.len());
+            tracing::info!("  partial_sigs: {}", input.partial_sigs.len());
+            tracing::info!("  final_script_witness: {}", input.final_script_witness.is_some());
+        }
+
+        for (i, output) in psbt.outputs.iter().enumerate() {
+            tracing::info!("--- Output {} ---", i);
+            tracing::info!("  tap_internal_key: {:?}", output.tap_internal_key);
+            tracing::info!("  tap_key_origins: {}", output.tap_key_origins.len());
+        }
+        tracing::info!("========================================");
     }
 
     /// Create a tweaked output from an original output using the proposer's input key
@@ -744,21 +810,45 @@ impl Snicker {
         Ok(())
     }
 
-    /// Initialize the proposals database table
+    /// Initialize the encrypted proposals database table
     fn init_proposals_table(conn: &mut Connection) -> Result<()> {
         conn.execute(
             "CREATE TABLE IF NOT EXISTS snicker_proposals (
+                tag BLOB PRIMARY KEY,
                 ephemeral_pubkey BLOB NOT NULL,
-                tag BLOB NOT NULL,
                 encrypted_data BLOB NOT NULL,
+                created_at INTEGER NOT NULL
+            )",
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// Initialize the decrypted proposals database table
+    fn init_decrypted_proposals_table(conn: &mut Connection) -> Result<()> {
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS decrypted_proposals (
+                tag BLOB PRIMARY KEY,
+                psbt BLOB NOT NULL,
+                tweak_info BLOB NOT NULL,
+                role TEXT NOT NULL,
+                status TEXT NOT NULL,
+                our_utxo TEXT NOT NULL,
+                counterparty_utxo TEXT NOT NULL,
+                delta_sats INTEGER NOT NULL,
                 created_at INTEGER NOT NULL,
-                PRIMARY KEY (ephemeral_pubkey, tag)
+                updated_at INTEGER NOT NULL
             )",
             [],
         )?;
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_proposals_tag
-             ON snicker_proposals(tag)",
+            "CREATE INDEX IF NOT EXISTS idx_decrypted_status
+             ON decrypted_proposals(status)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_decrypted_delta
+             ON decrypted_proposals(delta_sats)",
             [],
         )?;
         Ok(())
@@ -853,11 +943,11 @@ impl Snicker {
 
         conn.execute(
             "INSERT OR REPLACE INTO snicker_proposals
-             (ephemeral_pubkey, tag, encrypted_data, created_at)
+             (tag, ephemeral_pubkey, encrypted_data, created_at)
              VALUES (?1, ?2, ?3, ?4)",
             (
-                &pubkey_bytes[..],
                 &proposal.tag[..],
+                &pubkey_bytes[..],
                 &proposal.encrypted_data,
                 timestamp,
             ),
@@ -871,6 +961,14 @@ impl Snicker {
         use bdk_wallet::bitcoin::secp256k1::PublicKey;
 
         let conn = self.conn.lock().unwrap();
+
+        // First check how many rows we have
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM snicker_proposals",
+            [],
+            |row| row.get(0)
+        )?;
+        tracing::info!("📊 Database contains {} encrypted proposals", count);
 
         let mut stmt = conn.prepare(
             "SELECT ephemeral_pubkey, tag, encrypted_data FROM snicker_proposals
@@ -888,11 +986,15 @@ impl Snicker {
         for proposal in proposals {
             let (pubkey_bytes, tag_bytes, encrypted_data) = proposal?;
 
+            tracing::debug!("Deserializing proposal: pubkey_len={}, tag_len={}, data_len={}",
+                           pubkey_bytes.len(), tag_bytes.len(), encrypted_data.len());
+
             let ephemeral_pubkey = PublicKey::from_slice(&pubkey_bytes)
                 .map_err(|e| anyhow::anyhow!("Invalid pubkey in database: {}", e))?;
 
             let mut tag = [0u8; 8];
             if tag_bytes.len() != 8 {
+                tracing::warn!("Skipping proposal with invalid tag length: {}", tag_bytes.len());
                 continue; // Skip invalid entries
             }
             tag.copy_from_slice(&tag_bytes);
@@ -904,6 +1006,7 @@ impl Snicker {
             });
         }
 
+        tracing::info!("✅ Successfully deserialized {} proposals", result.len());
         Ok(result)
     }
 
@@ -913,6 +1016,170 @@ impl Snicker {
         let count = conn.execute("DELETE FROM snicker_proposals", [])?;
         tracing::info!("🗑️  Cleared {} SNICKER proposals from database", count);
         Ok(count)
+    }
+
+    // ============================================================
+    // Decrypted Proposals Methods
+    // ============================================================
+
+    /// Store a decrypted proposal in the database
+    pub async fn store_decrypted_proposal(
+        &self,
+        proposal: &Proposal,
+        role: &str,  // "proposer" or "receiver"
+        our_utxo: &str,  // "txid:vout"
+        counterparty_utxo: &str,  // "txid:vout"
+        delta_sats: i64,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+
+        let psbt_bytes = proposal.psbt.serialize();
+        let tweak_info_bytes = serde_json::to_vec(&proposal.tweak_info)?;
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64;
+
+        conn.execute(
+            "INSERT OR REPLACE INTO decrypted_proposals
+             (tag, psbt, tweak_info, role, status, our_utxo, counterparty_utxo, delta_sats, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            (
+                &proposal.tag[..],
+                &psbt_bytes,
+                &tweak_info_bytes,
+                role,
+                "pending",
+                our_utxo,
+                counterparty_utxo,
+                delta_sats,
+                timestamp,
+                timestamp,
+            ),
+        )?;
+
+        Ok(())
+    }
+
+    /// Get decrypted proposals filtered by delta range and status
+    pub async fn get_decrypted_proposals_by_delta_range(
+        &self,
+        min_delta: i64,
+        max_delta: i64,
+        status: &str,  // e.g., "pending"
+    ) -> Result<Vec<Proposal>> {
+        let conn = self.conn.lock().unwrap();
+
+        let mut stmt = conn.prepare(
+            "SELECT tag, psbt, tweak_info FROM decrypted_proposals
+             WHERE delta_sats BETWEEN ?1 AND ?2 AND status = ?3
+             ORDER BY created_at DESC"
+        )?;
+
+        let proposals = stmt.query_map((min_delta, max_delta, status), |row| {
+            let tag_bytes: Vec<u8> = row.get(0)?;
+            let psbt_bytes: Vec<u8> = row.get(1)?;
+            let tweak_info_bytes: Vec<u8> = row.get(2)?;
+
+            let mut tag = [0u8; 8];
+            tag.copy_from_slice(&tag_bytes);
+
+            let psbt: Psbt = Psbt::deserialize(&psbt_bytes)
+                .map_err(|e| bdk_wallet::rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+
+            let tweak_info: TweakInfo = serde_json::from_slice(&tweak_info_bytes)
+                .map_err(|e| bdk_wallet::rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+
+            Ok(Proposal { tag, psbt, tweak_info })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok(proposals)
+    }
+
+    /// Get a specific decrypted proposal by tag
+    pub async fn get_decrypted_proposal_by_tag(&self, tag: &[u8; 8]) -> Result<Option<Proposal>> {
+        let conn = self.conn.lock().unwrap();
+
+        let mut stmt = conn.prepare(
+            "SELECT psbt, tweak_info FROM decrypted_proposals WHERE tag = ?1"
+        )?;
+
+        let result = stmt.query_row([&tag[..]], |row| {
+            let psbt_bytes: Vec<u8> = row.get(0)?;
+            let tweak_info_bytes: Vec<u8> = row.get(1)?;
+
+            let psbt: Psbt = Psbt::deserialize(&psbt_bytes)
+                .map_err(|e| bdk_wallet::rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+
+            let tweak_info: TweakInfo = serde_json::from_slice(&tweak_info_bytes)
+                .map_err(|e| bdk_wallet::rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+
+            Ok(Proposal { tag: *tag, psbt, tweak_info })
+        });
+
+        match result {
+            Ok(proposal) => Ok(Some(proposal)),
+            Err(bdk_wallet::rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Update the status of a decrypted proposal
+    pub async fn update_proposal_status(&self, tag: &[u8; 8], new_status: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64;
+
+        conn.execute(
+            "UPDATE decrypted_proposals SET status = ?1, updated_at = ?2 WHERE tag = ?3",
+            (new_status, timestamp, &tag[..]),
+        )?;
+
+        Ok(())
+    }
+
+    // ============================================================
+    // Helper Methods
+    // ============================================================
+
+    /// Calculate delta from a proposal's PSBT
+    /// Delta = receiver's contribution (how much receiver loses)
+    /// Positive delta = receiver contributes/loses sats
+    /// Negative delta = receiver gains sats (proposer incentivizes)
+    pub fn calculate_delta_from_proposal(&self, proposal: &Proposal) -> Result<i64> {
+        // Receiver's input value (what they're putting in)
+        let receiver_input_value = proposal.tweak_info.original_output.value.to_sat();
+
+        // Find receiver's output by matching the tweaked script_pubkey
+        // The receiver's output is the one with the tweaked script pubkey
+        let tweaked_script = &proposal.tweak_info.tweaked_output.script_pubkey;
+        let receiver_output = proposal.psbt.unsigned_tx.output.iter()
+            .find(|output| &output.script_pubkey == tweaked_script)
+            .ok_or_else(|| anyhow::anyhow!("Could not find receiver's output in transaction"))?;
+
+        let receiver_output_value = receiver_output.value.to_sat();
+
+        // Delta = contribution = input - output
+        // Positive means receiver loses (contributes), negative means receiver gains
+        let delta = receiver_input_value as i64 - receiver_output_value as i64;
+
+        Ok(delta)
+    }
+
+    /// Extract proposer's UTXO from a proposal's PSBT
+    pub fn extract_proposer_utxo(&self, proposal: &Proposal) -> Result<String> {
+        let proposer_input = proposal.psbt.unsigned_tx.input.first()
+            .ok_or_else(|| anyhow::anyhow!("No inputs in PSBT"))?;
+
+        Ok(format!("{}:{}", proposer_input.previous_output.txid, proposer_input.previous_output.vout))
+    }
+
+    /// Extract receiver's UTXO from a proposal's tweak info
+    pub fn extract_receiver_utxo(&self, proposal: &Proposal, target_tx: &Transaction, output_index: usize) -> Result<String> {
+        let txid = target_tx.compute_txid();
+        Ok(format!("{}:{}", txid, output_index))
     }
 
     /// Store a SNICKER UTXO after accepting a proposal
@@ -1091,11 +1358,14 @@ impl Snicker {
             let our_value = our_utxo.txout.value;
             let mut matches_for_this_utxo = 0;
 
-            // Find all candidates where output value < our UTXO value
+            // Find all candidates where output value is in range [min_utxo_sats, our_value)
             for (_height, _txid, target_tx) in &candidates {
                 for (output_index, output) in target_tx.output.iter().enumerate() {
-                    // Only consider P2TR outputs smaller than our UTXO
-                    if output.script_pubkey.is_p2tr() && output.value < our_value {
+                    let candidate_sats = output.value.to_sat();
+                    // Only consider P2TR outputs >= min_utxo_sats AND smaller than our UTXO
+                    if output.script_pubkey.is_p2tr()
+                        && candidate_sats >= min_utxo_sats
+                        && output.value < our_value {
                         opportunities.push(ProposalOpportunity {
                             our_outpoint: our_utxo.outpoint,
                             our_value,

@@ -1,13 +1,82 @@
 use anyhow::Result;
 use std::io::{self, Write};
+use std::fs;
 
 use crate::manager::Manager;
+use crate::snicker::{ProposalOpportunity, EncryptedProposal};
+use std::str::FromStr;
 
-pub async fn repl(network_str: &str, recovery_height: u32) -> Result<()> {
+/// Format an EncryptedProposal for display with hex-encoded data
+fn format_encrypted_proposal(proposal: &EncryptedProposal) -> String {
+    format!(
+        "{{\n  \"ephemeral_pubkey\": \"{}\",\n  \"tag\": \"{}\",\n  \"encrypted_data\": \"{}\"\n}}",
+        proposal.ephemeral_pubkey,
+        ::hex::encode(&proposal.tag),
+        ::hex::encode(&proposal.encrypted_data)
+    )
+}
+
+/// Parse an EncryptedProposal from hex-encoded format
+fn parse_encrypted_proposal(text: &str) -> Result<EncryptedProposal> {
+    use bdk_wallet::bitcoin::secp256k1::PublicKey;
+
+    // Simple JSON-like parser for our specific format
+    let lines: Vec<&str> = text.lines().collect();
+
+    let mut ephemeral_pubkey_str = None;
+    let mut tag_hex = None;
+    let mut encrypted_data_hex = None;
+
+    for line in lines {
+        let line = line.trim();
+        if line.contains("ephemeral_pubkey") {
+            if let Some(value) = line.split('"').nth(3) {
+                ephemeral_pubkey_str = Some(value);
+            }
+        } else if line.contains("tag") {
+            if let Some(value) = line.split('"').nth(3) {
+                tag_hex = Some(value);
+            }
+        } else if line.contains("encrypted_data") {
+            if let Some(value) = line.split('"').nth(3) {
+                encrypted_data_hex = Some(value);
+            }
+        }
+    }
+
+    let ephemeral_pubkey = PublicKey::from_str(
+        ephemeral_pubkey_str.ok_or_else(|| anyhow::anyhow!("Missing ephemeral_pubkey"))?
+    )?;
+
+    let tag_bytes = ::hex::decode(
+        tag_hex.ok_or_else(|| anyhow::anyhow!("Missing tag"))?
+    )?;
+    let mut tag = [0u8; 8];
+    tag.copy_from_slice(&tag_bytes);
+
+    let encrypted_data = ::hex::decode(
+        encrypted_data_hex.ok_or_else(|| anyhow::anyhow!("Missing encrypted_data"))?
+    )?;
+
+    Ok(EncryptedProposal {
+        ephemeral_pubkey,
+        tag,
+        encrypted_data,
+    })
+}
+
+pub async fn repl(
+    network_str: &str,
+    recovery_height: u32,
+    rpc_config: Option<(String, String, String)>,
+) -> Result<()> {
     println!("RustSnicker Wallet 🥷");
     println!("Type 'help' for commands.\n");
 
     let mut current: Option<Manager> = None;
+    let mut opportunities: Vec<ProposalOpportunity> = Vec::new();
+    let mut last_scan_delta_range: Option<(i64, i64)> = None;
+    let mut last_created_proposal: Option<EncryptedProposal> = None;
 
     loop {
         print!("wallet> ");
@@ -35,10 +104,19 @@ pub async fn repl(network_str: &str, recovery_height: u32) -> Result<()> {
                 }
                 let name = args[0];
                 println!("🪄 Creating wallet '{name}' …");
-                let (manager, mnemonic) =
+                let (mut manager, mnemonic) =
                     Manager::generate(name, network_str, recovery_height).await?;
                 println!("🔑 New mnemonic (store this safely!):\n{mnemonic}\n");
                 io::stdout().flush()?;
+
+                // Configure RPC if provided
+                if let Some((ref url, ref user, ref password)) = rpc_config {
+                    if let Err(e) = manager.wallet_node.set_rpc_client(url, (user.clone(), password.clone())) {
+                        println!("⚠️  Warning: Failed to connect to Bitcoin Core RPC: {}", e);
+                        println!("           Proposer mode disabled. Receiver mode still available.");
+                    }
+                }
+
                 current = Some(manager);
             }
 
@@ -49,7 +127,17 @@ pub async fn repl(network_str: &str, recovery_height: u32) -> Result<()> {
                 }
                 let name = args[0];
                 println!("📁 Loading wallet '{name}' …");
-                current = Some(Manager::load(name, network_str, recovery_height).await?);
+                let mut manager = Manager::load(name, network_str, recovery_height).await?;
+
+                // Configure RPC if provided
+                if let Some((ref url, ref user, ref password)) = rpc_config {
+                    if let Err(e) = manager.wallet_node.set_rpc_client(url, (user.clone(), password.clone())) {
+                        println!("⚠️  Warning: Failed to connect to Bitcoin Core RPC: {}", e);
+                        println!("           Proposer mode disabled. Receiver mode still available.");
+                    }
+                }
+
+                current = Some(manager);
             }
 
             "balance" => {
@@ -216,6 +304,87 @@ pub async fn repl(network_str: &str, recovery_height: u32) -> Result<()> {
                 }
             }
 
+            "test_get_block" => {
+                if args.len() != 1 {
+                    println!("Usage: test_get_block <block_hash>");
+                    println!("Example: test_get_block 0000000000000000000000000000000000000000000000000000000000000000");
+                    continue;
+                }
+                if let Some(mgr) = current.as_mut() {
+                    let hash_str = args[0];
+                    match hash_str.parse::<bdk_wallet::bitcoin::BlockHash>() {
+                        Ok(block_hash) => {
+                            println!("🔍 Fetching block {} via Kyoto P2P...", block_hash);
+                            match mgr.wallet_node.requester.get_block(block_hash).await {
+                                Ok(indexed_block) => {
+                                    let block = &indexed_block.block;
+                                    println!("✅ Successfully fetched block:");
+                                    println!("   Hash: {}", block_hash);
+                                    println!("   Transactions: {}", block.txdata.len());
+                                    println!("   Version: {:?}", block.header.version);
+                                    println!("   Prev block: {}", block.header.prev_blockhash);
+
+                                    // Count taproot outputs
+                                    let mut p2tr_count = 0;
+                                    for tx in &block.txdata {
+                                        for output in &tx.output {
+                                            if output.script_pubkey.is_p2tr() {
+                                                p2tr_count += 1;
+                                            }
+                                        }
+                                    }
+                                    println!("   P2TR outputs: {}", p2tr_count);
+                                }
+                                Err(e) => println!("❌ Failed to fetch block: {}", e),
+                            }
+                        }
+                        Err(_) => println!("❌ Invalid block hash format"),
+                    }
+                } else {
+                    println!("No wallet loaded.");
+                }
+            }
+
+            "test_headers_db" => {
+                if args.len() != 2 {
+                    println!("Usage: test_headers_db <start_height> <end_height>");
+                    println!("Example: test_headers_db 100 110");
+                    continue;
+                }
+                if let Some(mgr) = current.as_mut() {
+                    let start_height: u32 = match args[0].parse() {
+                        Ok(h) => h,
+                        Err(_) => {
+                            println!("Invalid start_height");
+                            continue;
+                        }
+                    };
+                    let end_height: u32 = match args[1].parse() {
+                        Ok(h) => h,
+                        Err(_) => {
+                            println!("Invalid end_height");
+                            continue;
+                        }
+                    };
+
+                    println!("🔍 Querying Kyoto headers.db for heights {}-{}...", start_height, end_height);
+                    match mgr.wallet_node.get_block_hashes_from_headers_db(start_height, end_height) {
+                        Ok(hashes) => {
+                            println!("✅ Retrieved {} block hashes:", hashes.len());
+                            for (height, hash) in hashes.iter().take(10) {
+                                println!("   Height {}: {}", height, hash);
+                            }
+                            if hashes.len() > 10 {
+                                println!("   ... and {} more", hashes.len() - 10);
+                            }
+                        }
+                        Err(e) => println!("❌ Failed to query headers.db: {}", e),
+                    }
+                } else {
+                    println!("No wallet loaded.");
+                }
+            }
+
             "find_opportunities" => {
                 if args.len() != 1 {
                     println!("Usage: find_opportunities <min_utxo_sats>");
@@ -233,22 +402,27 @@ pub async fn repl(network_str: &str, recovery_height: u32) -> Result<()> {
 
                     println!("🔍 Finding SNICKER opportunities...");
                     match mgr.find_snicker_opportunities(min_utxo_sats).await {
-                        Ok(opportunities) => {
-                            if opportunities.is_empty() {
+                        Ok(found) => {
+                            if found.is_empty() {
                                 println!("No opportunities found.");
+                                opportunities.clear();
                             } else {
-                                println!("✅ Found {} opportunities:", opportunities.len());
-                                for (i, opp) in opportunities.iter().enumerate().take(10) {
-                                    println!("  [{}] Our UTXO: {}:{} ({} sats) → Target: {} sats",
+                                println!("✅ Found {} opportunities:", found.len());
+                                for (i, opp) in found.iter().enumerate().take(10) {
+                                    println!("  [{}] Our UTXO: {}:{} ({} sats) + Candidate UTXO: {}:{} ({} sats)",
                                              i,
                                              opp.our_outpoint.txid,
                                              opp.our_outpoint.vout,
                                              opp.our_value.to_sat(),
+                                             opp.target_tx.compute_txid(),
+                                             opp.target_output_index,
                                              opp.target_value.to_sat());
                                 }
-                                if opportunities.len() > 10 {
-                                    println!("  ... and {} more", opportunities.len() - 10);
+                                if found.len() > 10 {
+                                    println!("  ... and {} more", found.len() - 10);
                                 }
+                                println!("\nUse 'create_proposal <index> <delta_sats>' to create a proposal");
+                                opportunities = found;
                             }
                         }
                         Err(e) => println!("❌ Error: {}", e),
@@ -266,8 +440,13 @@ pub async fn repl(network_str: &str, recovery_height: u32) -> Result<()> {
                                 println!("No candidates stored.");
                             } else {
                                 println!("Stored candidates ({}):", candidates.len());
-                                for (height, txid, _tx) in candidates.iter().take(20) {
+                                for (height, txid, tx) in candidates.iter().take(20) {
                                     println!("  Block {}: {}", height, txid);
+                                    for (vout, output) in tx.output.iter().enumerate() {
+                                        if output.script_pubkey.is_p2tr() {
+                                            println!("    - vout {}: {} sats", vout, output.value.to_sat());
+                                        }
+                                    }
                                 }
                                 if candidates.len() > 20 {
                                     println!("  ... and {} more", candidates.len() - 20);
@@ -303,6 +482,242 @@ pub async fn repl(network_str: &str, recovery_height: u32) -> Result<()> {
                 }
             }
 
+            "create_proposal" => {
+                if args.len() != 2 {
+                    println!("Usage: create_proposal <index> <delta_sats>");
+                    println!("Example: create_proposal 0 5000");
+                    continue;
+                }
+                if let Some(mgr) = current.as_mut() {
+                    // Parse index
+                    let index: usize = match args[0].parse() {
+                        Ok(i) => i,
+                        Err(_) => {
+                            println!("Invalid index");
+                            continue;
+                        }
+                    };
+
+                    let delta_sats: i64 = match args[1].parse() {
+                        Ok(d) => d,
+                        Err(_) => {
+                            println!("Invalid delta_sats");
+                            continue;
+                        }
+                    };
+
+                    // Look up opportunity by index
+                    let opp = match opportunities.get(index) {
+                        Some(o) => o,
+                        None => {
+                            println!("❌ No opportunity at index {}. Run 'find_opportunities' to see available opportunities.", index);
+                            continue;
+                        }
+                    };
+
+                    println!("🔨 Creating proposal for opportunity [{}]...", index);
+                    println!("   Our UTXO: {}:{} ({} sats)",
+                             opp.our_outpoint.txid,
+                             opp.our_outpoint.vout,
+                             opp.our_value.to_sat());
+                    println!("   Target: {} sats, Delta: {} sats", opp.target_value.to_sat(), delta_sats);
+
+                    match mgr.create_snicker_proposal(opp, delta_sats).await {
+                        Ok((proposal, encrypted_proposal)) => {
+                            println!("✅ Proposal created!");
+                            println!("   Tag: {}", ::hex::encode(&proposal.tag));
+                            println!("\n📝 Encrypted proposal (hex-encoded, share this with receiver):");
+                            println!("{}", format_encrypted_proposal(&encrypted_proposal));
+                            println!("\n💾 Use 'save_proposal <filename>' to save to a file");
+                            last_created_proposal = Some(encrypted_proposal);
+                        }
+                        Err(e) => println!("❌ Error: {}", e),
+                    }
+                } else {
+                    println!("No wallet loaded.");
+                }
+            }
+
+            "scan_proposals" => {
+                if args.len() != 2 {
+                    println!("Usage: scan_proposals <min_delta_sats> <max_delta_sats>");
+                    println!("Example: scan_proposals -10000 10000");
+                    continue;
+                }
+                if let Some(mgr) = current.as_mut() {
+                    let min_delta: i64 = match args[0].parse() {
+                        Ok(m) => m,
+                        Err(_) => {
+                            println!("Invalid min_delta_sats");
+                            continue;
+                        }
+                    };
+                    let max_delta: i64 = match args[1].parse() {
+                        Ok(m) => m,
+                        Err(_) => {
+                            println!("Invalid max_delta_sats");
+                            continue;
+                        }
+                    };
+
+                    println!("🔍 Scanning for SNICKER proposals (delta range: {} to {} sats)...",
+                             min_delta, max_delta);
+
+                    // Store delta range for later use in accept_proposal
+                    last_scan_delta_range = Some((min_delta, max_delta));
+
+                    match mgr.scan_for_our_proposals((min_delta, max_delta)).await {
+                        Ok(found) => {
+                            if found.is_empty() {
+                                println!("No proposals found for our UTXOs.");
+                            } else {
+                                println!("✅ Found {} proposals:", found.len());
+                                for proposal in found.iter().take(10) {
+                                    // Display tag
+                                    let tag_hex = ::hex::encode(&proposal.tag);
+
+                                    // Extract info from PSBT
+                                    let tx = &proposal.psbt.unsigned_tx;
+                                    let proposer_input = tx.input.first()
+                                        .map(|inp| format!("{}:{}", inp.previous_output.txid, inp.previous_output.vout))
+                                        .unwrap_or_else(|| "unknown".to_string());
+
+                                    // Get proposer value from witness_utxo if available
+                                    let proposer_value = proposal.psbt.inputs.first()
+                                        .and_then(|inp| inp.witness_utxo.as_ref())
+                                        .map(|txout| txout.value.to_sat())
+                                        .unwrap_or(0);
+
+                                    // Calculate delta: receiver_input - receiver_output
+                                    let receiver_input = proposal.tweak_info.original_output.value.to_sat();
+                                    let tweaked_script = &proposal.tweak_info.tweaked_output.script_pubkey;
+                                    let receiver_output = tx.output.iter()
+                                        .find(|output| &output.script_pubkey == tweaked_script)
+                                        .map(|output| output.value.to_sat())
+                                        .unwrap_or(receiver_input);
+                                    let delta = receiver_input as i64 - receiver_output as i64;
+
+                                    println!("  [{}] Proposer: {} ({} sats) → Our output: {} sats (delta: {})",
+                                             tag_hex, proposer_input, proposer_value, receiver_output, delta);
+                                }
+                                if found.len() > 10 {
+                                    println!("  ... and {} more", found.len() - 10);
+                                }
+                                println!("\nUse 'accept_proposal <tag>' to accept and broadcast");
+                            }
+                        }
+                        Err(e) => println!("❌ Error: {}", e),
+                    }
+                } else {
+                    println!("No wallet loaded.");
+                }
+            }
+
+            "accept_proposal" => {
+                if args.len() != 1 {
+                    println!("Usage: accept_proposal <tag>");
+                    println!("Example: accept_proposal a1b2c3d4e5f6a7b8");
+                    continue;
+                }
+                if let Some(mgr) = current.as_mut() {
+                    // Parse hex tag
+                    let tag_hex = args[0];
+                    let tag_bytes = match ::hex::decode(tag_hex) {
+                        Ok(bytes) if bytes.len() == 8 => bytes,
+                        Ok(_) => {
+                            println!("❌ Tag must be exactly 8 bytes (16 hex chars)");
+                            continue;
+                        }
+                        Err(_) => {
+                            println!("❌ Invalid hex tag");
+                            continue;
+                        }
+                    };
+                    let mut tag = [0u8; 8];
+                    tag.copy_from_slice(&tag_bytes);
+
+                    // Use stored delta range or default wide range
+                    let acceptable_range = last_scan_delta_range
+                        .unwrap_or((-100_000_000, 100_000_000));
+
+                    println!("✍️  Accepting proposal {}...", tag_hex);
+
+                    match mgr.accept_snicker_proposal(&tag, acceptable_range).await {
+                        Ok(psbt) => {
+                            println!("✅ Proposal signed");
+                            match mgr.finalize_psbt(psbt).await {
+                                Ok(tx) => {
+                                    println!("✅ Transaction finalized");
+                                    match mgr.broadcast_transaction(tx).await {
+                                        Ok(txid) => {
+                                            println!("✅ Coinjoin transaction broadcast: {}", txid);
+                                            println!("🎉 SNICKER coinjoin complete!");
+                                        }
+                                        Err(e) => println!("❌ Broadcast error: {}", e),
+                                    }
+                                }
+                                Err(e) => println!("❌ Finalization error: {}", e),
+                            }
+                        }
+                        Err(e) => println!("❌ Error accepting proposal: {}", e),
+                    }
+                } else {
+                    println!("No wallet loaded.");
+                }
+            }
+
+            "save_proposal" => {
+                if args.len() != 1 {
+                    println!("Usage: save_proposal <filename>");
+                    println!("Example: save_proposal proposal.json");
+                    continue;
+                }
+                match &last_created_proposal {
+                    Some(proposal) => {
+                        let filename = args[0];
+                        let formatted = format_encrypted_proposal(proposal);
+                        match fs::write(filename, formatted) {
+                            Ok(_) => println!("✅ Proposal saved to {}", filename),
+                            Err(e) => println!("❌ Error saving file: {}", e),
+                        }
+                    }
+                    None => {
+                        println!("❌ No proposal to save. Create a proposal first with 'create_proposal'");
+                    }
+                }
+            }
+
+            "load_proposal" => {
+                if args.len() != 1 {
+                    println!("Usage: load_proposal <filename>");
+                    println!("Example: load_proposal proposal.json");
+                    continue;
+                }
+                if let Some(mgr) = current.as_mut() {
+                    let filename = args[0];
+                    match fs::read_to_string(filename) {
+                        Ok(contents) => {
+                            // Parse the hex-encoded format back to EncryptedProposal
+                            match parse_encrypted_proposal(&contents) {
+                                Ok(proposal) => {
+                                    match mgr.store_snicker_proposal(&proposal).await {
+                                        Ok(_) => {
+                                            println!("✅ Proposal loaded and stored");
+                                            println!("   Use 'scan_proposals' to find it among your UTXOs");
+                                        }
+                                        Err(e) => println!("❌ Error storing proposal: {}", e),
+                                    }
+                                }
+                                Err(e) => println!("❌ Error parsing proposal: {}", e),
+                            }
+                        }
+                        Err(e) => println!("❌ Error reading file: {}", e),
+                    }
+                } else {
+                    println!("No wallet loaded.");
+                }
+            }
+
             "quit" | "exit" => {
                 println!("👋 Goodbye.");
                 break;
@@ -328,10 +743,21 @@ fn print_help() {
     println!("  send <addr> <amt> <fee>            - send transaction (addr, sats, sat/vB)");
     println!("  sync                               - rescan recent blocks");
     println!();
-    println!("SNICKER Commands:");
+    println!("SNICKER Commands (Proposer side):");
     println!("  scan_candidates <n> <min> <max>    - scan N blocks for candidates (min-max sats)");
+    println!("  test_get_block <hash>              - test: fetch block by hash via Kyoto P2P");
+    println!("  test_headers_db <start> <end>      - test: query headers.db for block hashes");
     println!("  list_candidates                    - list stored candidate transactions");
     println!("  find_opportunities <min_utxo>      - find proposal opportunities (min UTXO sats)");
+    println!("  create_proposal <index> <delta>    - create proposal (use index from find_opportunities)");
+    println!("  save_proposal <file>               - save last proposal to file");
+    println!();
+    println!("SNICKER Commands (Receiver side):");
+    println!("  load_proposal <file>               - load proposal from file");
+    println!("  scan_proposals <min> <max>         - scan for proposals (min-max delta in sats)");
+    println!("  accept_proposal <tag>              - accept and broadcast coinjoin (16 hex chars)");
+    println!();
+    println!("SNICKER Maintenance:");
     println!("  clear_candidates                   - clear candidate database");
     println!("  clear_proposals                    - clear proposals database");
     println!();

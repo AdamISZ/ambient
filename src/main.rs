@@ -6,7 +6,8 @@ mod wallet_node;
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use tracing_subscriber;
-use tracing_subscriber::fmt::writer::BoxMakeWriter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 use std::fs::OpenOptions;
 
 /// CLI arguments
@@ -20,6 +21,18 @@ struct Args {
     /// Recovery start height
     #[arg(long, default_value_t = 200_000)]
     recovery_height: u32,
+
+    /// Bitcoin Core RPC URL (required for proposer mode)
+    #[arg(long)]
+    rpc_url: Option<String>,
+
+    /// Bitcoin Core RPC username
+    #[arg(long)]
+    rpc_user: Option<String>,
+
+    /// Bitcoin Core RPC password
+    #[arg(long)]
+    rpc_password: Option<String>,
 }
 
 #[derive(ValueEnum, Clone)]
@@ -53,18 +66,29 @@ async fn main() -> Result<()> {
         .append(true)
         .open(&log_path)?;
 
-    let subscriber = tracing_subscriber::FmtSubscriber::builder()
-    .with_writer(BoxMakeWriter::new(log_file))
-    .with_ansi(false)
-    .finish();
-    //let subscriber =
-    //tracing_subscriber::FmtSubscriber::builder()
-    //.with_writer(std::io::stderr).finish();
-    tracing::subscriber::set_global_default(subscriber)?;
+    // Write logs to file only (not stderr)
+    // Include bdk_wallet logs to see debug output from patched BDK
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().with_writer(log_file))
+        .with(tracing_subscriber::filter::LevelFilter::INFO)
+        .init();
 
+    // Print log location to stderr so user knows where to find it
+    eprintln!("📝 Logging to: {}", log_path.display());
+
+    // Prepare RPC configuration (if provided)
+    let rpc_config = match (args.rpc_url, args.rpc_user, args.rpc_password) {
+        (Some(url), Some(user), Some(password)) => Some((url, user, password)),
+        (None, None, None) => None,
+        _ => {
+            eprintln!("⚠️  Warning: RPC configuration incomplete. All of --rpc-url, --rpc-user, and --rpc-password must be provided together.");
+            eprintln!("           Proceeding in receiver-only mode (proposer scanning disabled).");
+            None
+        }
+    };
 
     // delegate all user interactions to the CLI layer
-    cli::repl(args.network.as_str(), args.recovery_height).await?;
+    cli::repl(args.network.as_str(), args.recovery_height, rpc_config).await?;
 
     Ok(())
 }
