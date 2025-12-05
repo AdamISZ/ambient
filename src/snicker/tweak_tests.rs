@@ -166,7 +166,7 @@ fn test_create_tweaked_output_valid() -> Result<()> {
 
     // Create proposer's keypair (for SNICKER tweak)
     let proposer_seckey = SecretKey::from_slice(&[0x01; 32])?;
-    let proposer_pubkey = PublicKey::from_secret_key(&secp, &proposer_seckey);
+    let _proposer_pubkey = PublicKey::from_secret_key(&secp, &proposer_seckey);
 
     // Create tweaked output
     let (tweaked_output, snicker_shared_secret) = create_tweaked_output(
@@ -256,7 +256,7 @@ fn test_verify_tweaked_output_wrong_key() -> Result<()> {
 
     // Create proposer's keypair
     let proposer_seckey = SecretKey::from_slice(&[0x01; 32])?;
-    let proposer_pubkey = PublicKey::from_secret_key(&secp, &proposer_seckey);
+    let _proposer_pubkey = PublicKey::from_secret_key(&secp, &proposer_seckey);
 
     // Create tweaked output using proposer's key
     let (tweaked_output, _) = create_tweaked_output(
@@ -286,7 +286,6 @@ fn test_verify_tweaked_output_wrong_key() -> Result<()> {
 #[test]
 fn test_derive_tweaked_seckey_spendable() -> Result<()> {
     use bdk_wallet::bitcoin::{Amount, TxOut, ScriptBuf, secp256k1::XOnlyPublicKey};
-    use bdk_wallet::bitcoin::secp256k1::Scalar;
 
     let secp = Secp256k1::new();
 
@@ -364,7 +363,7 @@ fn test_decrypt_with_wrong_key() -> Result<()> {
 
     // Generate proposer keypair
     let proposer_seckey = SecretKey::from_slice(&[0x01; 32])?;
-    let proposer_pubkey = PublicKey::from_secret_key(&secp, &proposer_seckey);
+    let _proposer_pubkey = PublicKey::from_secret_key(&secp, &proposer_seckey);
 
     // Generate receiver keypair
     let receiver_seckey = SecretKey::from_slice(&[0x02; 32])?;
@@ -403,7 +402,7 @@ fn test_decrypt_corrupted_data() -> Result<()> {
 
     // Generate proposer keypair
     let proposer_seckey = SecretKey::from_slice(&[0x01; 32])?;
-    let proposer_pubkey = PublicKey::from_secret_key(&secp, &proposer_seckey);
+    let _proposer_pubkey = PublicKey::from_secret_key(&secp, &proposer_seckey);
 
     // Generate receiver keypair
     let receiver_seckey = SecretKey::from_slice(&[0x02; 32])?;

@@ -5,6 +5,7 @@
 
 use anyhow::Result;
 use bdk_wallet::bitcoin::{Transaction, psbt::Psbt};
+use tracing::info;
 
 use crate::wallet_node::WalletNode;
 use crate::snicker::{Snicker, ProposalOpportunity, EncryptedProposal, Proposal};
@@ -106,6 +107,23 @@ impl Manager {
         fee_rate_sat_vb: f32,
     ) -> Result<bdk_wallet::bitcoin::Txid> {
         self.wallet_node.send_to_address(address_str, amount_sats, fee_rate_sat_vb).await
+    }
+
+    /// Build a SNICKER spending transaction WITHOUT broadcasting (for testing)
+    ///
+    /// Returns the signed transaction hex that can be tested with testmempoolaccept
+    /// before broadcasting via RPC.
+    pub async fn build_snicker_tx(
+        &mut self,
+        address_str: &str,
+        amount_sats: u64,
+        fee_rate_sat_vb: f32,
+    ) -> Result<String> {
+        use bdk_wallet::bitcoin::consensus::encode::serialize_hex;
+
+        let tx = self.wallet_node.build_snicker_spend_tx(address_str, amount_sats, fee_rate_sat_vb).await?;
+        let tx_hex = serialize_hex(&tx);
+        Ok(tx_hex)
     }
 
     /// Print wallet summary
@@ -621,6 +639,11 @@ impl Manager {
         self.snicker.get_snicker_candidates().await
     }
 
+    /// Get a decrypted proposal by tag
+    pub async fn get_decrypted_proposal_by_tag(&self, tag: &[u8; 8]) -> Result<Option<crate::snicker::Proposal>> {
+        self.snicker.get_decrypted_proposal_by_tag(tag).await
+    }
+
     /// Clear all SNICKER candidates from database
     pub async fn clear_snicker_candidates(&self) -> Result<usize> {
         self.snicker.clear_snicker_candidates().await
@@ -678,6 +701,13 @@ impl Manager {
         let output_index = 0;
         let tweaked_output = &tx.output[output_index];
         let txid = tx.compute_txid();
+
+        // Add the tweaked scriptPubKey to Kyoto's watch list so it gets detected during sync
+        {
+            let mut update_subscriber = self.wallet_node.update_subscriber.lock().await;
+            update_subscriber.add_script(tweaked_output.script_pubkey.clone());
+            info!("✅ Added SNICKER tweaked script to Kyoto watch list: {:?}", tweaked_output.script_pubkey);
+        }
 
         // Store in database
         self.snicker.store_snicker_utxo(

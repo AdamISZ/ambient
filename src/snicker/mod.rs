@@ -1193,11 +1193,10 @@ impl Snicker {
         snicker_shared_secret: &[u8; 32],
         block_height: Option<u32>,
     ) -> Result<()> {
-        use bdk_wallet::bitcoin::consensus::encode::serialize;
-
         let conn = self.conn.lock().unwrap();
 
-        let script_pubkey_bytes = serialize(script_pubkey);
+        // Store raw script bytes (not consensus-encoded, which adds length prefix)
+        let script_pubkey_bytes = script_pubkey.to_bytes();
         let tweaked_privkey_bytes = tweaked_privkey.secret_bytes();
 
         conn.execute(
@@ -1257,10 +1256,9 @@ impl Snicker {
 
         let mut result = Vec::new();
         for (txid_str, vout, amount, script_bytes, privkey_bytes, secret_bytes, block_height) in utxos {
-            use bdk_wallet::bitcoin::consensus::encode::deserialize;
-
             let txid = bdk_wallet::bitcoin::Txid::from_str(&txid_str)?;
-            let script_pubkey: bdk_wallet::bitcoin::ScriptBuf = deserialize(&script_bytes)?;
+            // ScriptPubKey is stored as raw bytes (not consensus-encoded)
+            let script_pubkey = bdk_wallet::bitcoin::ScriptBuf::from_bytes(script_bytes);
             let tweaked_privkey = bdk_wallet::bitcoin::secp256k1::SecretKey::from_slice(&privkey_bytes)?;
 
             let mut snicker_shared_secret = [0u8; 32];
@@ -1505,10 +1503,10 @@ pub struct ProposalOpportunity {
 mod tests {
     use super::*;
     use bdk_wallet::bitcoin::{
-        Transaction, TxOut, Amount, ScriptBuf, OutPoint,
+        Transaction, TxOut, Amount, ScriptBuf,
         transaction::Version, locktime::absolute::LockTime,
     };
-    use bdk_wallet::bitcoin::secp256k1::{Secp256k1, SecretKey, PublicKey};
+    use bdk_wallet::bitcoin::secp256k1::{Secp256k1, SecretKey};
 
     fn create_test_snicker() -> Snicker {
         let db_path = std::env::temp_dir().join(format!(
@@ -1702,12 +1700,13 @@ mod tests {
         let secp = Secp256k1::new();
         let mut rng = bdk_wallet::bitcoin::secp256k1::rand::thread_rng();
 
-        // Store some proposals
+        // Store some proposals with unique tags
         for _ in 0..3 {
+            use bdk_wallet::bitcoin::secp256k1::rand::RngCore;
             let ephemeral_key = SecretKey::new(&mut rng);
             let proposal = EncryptedProposal {
                 ephemeral_pubkey: ephemeral_key.public_key(&secp),
-                tag: [0xFF; 8],
+                tag: rng.next_u64().to_le_bytes(),
                 encrypted_data: vec![1, 2, 3],
             };
             snicker.store_snicker_proposal(&proposal).await.unwrap();

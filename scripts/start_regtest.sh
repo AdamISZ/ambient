@@ -1,5 +1,9 @@
 #!/bin/bash
 # Start bitcoind in regtest mode and mine initial blocks
+#
+# IMPORTANT: If you get wallet errors, clean the data directory first:
+#   rm -rf ~/.bitcoin/regtest_ambient/data
+#   ./scripts/start_regtest.sh
 
 set -e
 

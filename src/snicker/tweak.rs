@@ -70,10 +70,15 @@ pub fn apply_taproot_tweak(
     original_pubkey_xonly: &[u8; 32],
     tweak: &[u8; 32],
 ) -> Result<[u8; 32]> {
+    use bdk_wallet::bitcoin::secp256k1::XOnlyPublicKey;
+
     let secp = Secp256k1::new();
 
+    // original_pubkey_xonly is the BIP86 output key (already taproot tweaked)
+    // We only need to apply the SNICKER tweak: tweaked_pubkey = output_pubkey + tweak*G
+
     // Convert x-only pubkey to a full public key
-    // For x-only keys, we assume even parity (standard in BIP340/Taproot)
+    // For x-only keys in BIP340, we ALWAYS use even Y parity
     let mut pubkey_bytes = [0u8; 33];
     pubkey_bytes[0] = 0x02; // Even parity
     pubkey_bytes[1..].copy_from_slice(original_pubkey_xonly);
@@ -88,12 +93,12 @@ pub fn apply_taproot_tweak(
     // Add tweak to public key: tweaked_pubkey = pubkey + tweak*G
     let tweaked_pubkey = pubkey.add_exp_tweak(&secp, &tweak_scalar)?;
 
-    // Extract x-only coordinate
-    let tweaked_bytes = tweaked_pubkey.serialize();
-    let mut tweaked_xonly = [0u8; 32];
-    tweaked_xonly.copy_from_slice(&tweaked_bytes[1..33]);
+    // CRITICAL: Extract x-only coordinate and ensure even Y parity
+    // XOnlyPublicKey automatically uses the even-Y version
+    let tweaked_xonly = XOnlyPublicKey::from(tweaked_pubkey);
+    let tweaked_xonly_bytes = tweaked_xonly.serialize();
 
-    Ok(tweaked_xonly)
+    Ok(tweaked_xonly_bytes)
 }
 
 /// Create a tweaked P2TR output using DH shared secret
@@ -229,12 +234,22 @@ pub fn derive_tweaked_seckey(
     receiver_seckey: &SecretKey,
     shared_secret: &[u8; 32],
 ) -> Result<SecretKey> {
-    // Convert shared secret to scalar
+    let secp = Secp256k1::new();
+
+    // receiver_seckey is the BIP86 output key (already taproot tweaked from derive_utxo_privkey)
+    // Apply the SNICKER tweak: snicker_privkey = output_privkey + shared_secret
     let tweak_scalar = Scalar::from_be_bytes(*shared_secret)
         .map_err(|_| anyhow!("Invalid tweak scalar"))?;
 
-    // Add tweak to secret key: tweaked_seckey = seckey + tweak
-    let tweaked_seckey = receiver_seckey.add_tweak(&tweak_scalar)?;
+    let mut tweaked_seckey = receiver_seckey.add_tweak(&tweak_scalar)?;
+
+    // After adding the SNICKER scalar, check if resulting pubkey has even Y parity
+    // X-only keys always assume even Y, so if odd, negate the private key
+    let tweaked_pubkey = tweaked_seckey.public_key(&secp);
+    let parity = tweaked_pubkey.serialize()[0];
+    if parity == 0x03 {  // Odd Y coordinate
+        tweaked_seckey = tweaked_seckey.negate();
+    }
 
     Ok(tweaked_seckey)
 }
@@ -528,5 +543,140 @@ mod tests {
             final_pubkey_xonly,
             "Pubkey from tweaked seckey should match directly tweaked pubkey"
         );
+    }
+
+    /// Test that SNICKER output creation and signing key derivation are consistent
+    ///
+    /// This verifies that the actual functions used in production agree:
+    /// - `apply_taproot_tweak()` used by proposer to create SNICKER outputs
+    /// - `derive_tweaked_seckey()` used by receiver to derive signing keys
+    ///
+    /// The test simulates:
+    /// 1. Receiver has a BIP86 output key (already taproot-tweaked with x-only handling)
+    /// 2. Proposer extracts receiver's BIP86 output pubkey and applies SNICKER tweak
+    /// 3. Receiver derives signing key from BIP86 output privkey
+    /// 4. Verify that signing_key * G = snicker_output_pubkey
+    ///
+    /// IMPORTANT: Tests with multiple random inputs to cover all parity scenarios
+    #[test]
+    fn test_snicker_output_and_signing_key_consistency() {
+        use bdk_wallet::bitcoin::secp256k1::rand::{thread_rng, RngCore};
+
+        let secp = Secp256k1::new();
+        let mut rng = thread_rng();
+
+        println!("\n🧪 Testing SNICKER output/signing key consistency with 10 random inputs...\n");
+
+        let mut negation_count = 0;
+        let mut no_negation_count = 0;
+
+        // Test with 10 different random inputs to cover various parity scenarios
+        for iteration in 0..10 {
+
+        // Step 1: Simulate receiver's BIP86 output keypair
+        // (In real code this comes from derive_utxo_privkey() which already does taproot tweak + parity)
+        let mut internal_seckey = SecretKey::new(&mut rng);
+        let internal_pubkey_full = PublicKey::from_secret_key(&secp, &internal_seckey);
+
+        // Ensure internal key has even parity
+        let has_odd_y = internal_pubkey_full.serialize()[0] == 0x03;
+        if has_odd_y {
+            internal_seckey = internal_seckey.negate();
+        }
+
+        // Get x-only internal pubkey
+        let internal_pubkey_xonly = {
+            let pubkey = PublicKey::from_secret_key(&secp, &internal_seckey);
+            let bytes = pubkey.serialize();
+            let mut xonly = [0u8; 32];
+            xonly.copy_from_slice(&bytes[1..33]);
+            xonly
+        };
+
+        // Apply BIP86 taproot tweak to get BIP86 output keypair
+        let taproot_tweak_scalar = calculate_taproot_tweak_scalar(&internal_pubkey_xonly).unwrap();
+        let bip86_output_privkey = apply_tweak_to_seckey_with_parity(
+            &internal_seckey,
+            &taproot_tweak_scalar
+        ).unwrap();
+
+        // Get BIP86 output pubkey (what appears in receiver's P2TR scriptPubKey)
+        let bip86_output_pubkey_xonly = {
+            let pubkey = PublicKey::from_secret_key(&secp, &bip86_output_privkey);
+            let bytes = pubkey.serialize();
+            let mut xonly = [0u8; 32];
+            xonly.copy_from_slice(&bytes[1..33]);
+            xonly
+        };
+
+        // Step 2: Proposer creates SNICKER output
+        // Extracts receiver's BIP86 output pubkey and applies SNICKER tweak
+        // Use random shared secret for each iteration to test different parity scenarios
+        let mut shared_secret = [0u8; 32];
+        for i in 0..32 {
+            shared_secret[i] = (rng.next_u32() % 256) as u8;
+        }
+
+        let snicker_output_pubkey = apply_taproot_tweak(
+            &bip86_output_pubkey_xonly,
+            &shared_secret
+        ).unwrap();
+
+        // Step 3: Receiver derives SNICKER signing key
+        // Takes BIP86 output privkey and applies SNICKER tweak
+
+        // First check what parity the key WOULD have before negation
+        let tweak_scalar = Scalar::from_be_bytes(shared_secret).unwrap();
+        let intermediate_key = bip86_output_privkey.add_tweak(&tweak_scalar).unwrap();
+        let intermediate_pubkey = PublicKey::from_secret_key(&secp, &intermediate_key);
+        let intermediate_parity = intermediate_pubkey.serialize()[0];
+        let negation_occurred = intermediate_parity == 0x03;
+
+        let snicker_signing_key = derive_tweaked_seckey(
+            &bip86_output_privkey,
+            &shared_secret
+        ).unwrap();
+
+        // Step 4: Verify consistency: signing_key * G = output_pubkey
+        let pubkey_from_signing_key = PublicKey::from_secret_key(&secp, &snicker_signing_key);
+        let pubkey_from_signing_key_xonly = {
+            let bytes = pubkey_from_signing_key.serialize();
+            let mut xonly = [0u8; 32];
+            xonly.copy_from_slice(&bytes[1..33]);
+            xonly
+        };
+
+        assert_eq!(
+            pubkey_from_signing_key_xonly,
+            snicker_output_pubkey,
+            "SNICKER signing key * G must equal SNICKER output pubkey!\n\
+             This means apply_taproot_tweak() and derive_tweaked_seckey() disagree.\n\
+             Proposer creates outputs that receiver cannot spend.\n\
+             Iteration: {}", iteration
+        );
+
+        if negation_occurred {
+            negation_count += 1;
+        } else {
+            no_negation_count += 1;
+        }
+
+        println!("Iteration {}: ✅ Consistent | Negation: {}",
+                 iteration + 1,
+                 if negation_occurred { "YES (odd→even)" } else { "NO (even→even)" });
+        println!("   BIP86 output pubkey: {}", hex::encode(&bip86_output_pubkey_xonly[..8]));
+        println!("   SNICKER output pubkey: {}", hex::encode(&snicker_output_pubkey[..8]));
+        }
+
+        println!("\n✅ All 10 iterations passed! SNICKER output creation and signing key derivation are consistent!");
+        println!("📊 Parity scenarios covered:");
+        println!("   - Negation required (odd→even): {} times", negation_count);
+        println!("   - No negation (even→even): {} times", no_negation_count);
+
+        if negation_count > 0 && no_negation_count > 0 {
+            println!("   ✅ Both parity scenarios tested!");
+        } else {
+            println!("   ⚠️  Only one parity scenario occurred. Re-run test for better coverage.");
+        }
     }
 }

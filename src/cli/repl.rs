@@ -263,6 +263,56 @@ pub async fn repl(
                 }
             }
 
+            "build_snicker_tx" => {
+                if args.len() != 3 {
+                    println!("Usage: build_snicker_tx <address> <amount_sats> <fee_rate_sat_vb>");
+                    println!("Example: build_snicker_tx bcrt1q... 500000 5.0");
+                    println!("");
+                    println!("Builds a SNICKER spending transaction without broadcasting.");
+                    println!("Use this to test transaction validity before broadcasting:");
+                    println!("  bitcoin-cli testmempoolaccept '[\"<hex>\"]'");
+                    println!("  bitcoin-cli sendrawtransaction \"<hex>\"");
+                    continue;
+                }
+                if let Some(mgr) = current.as_mut() {
+                    let address = args[0];
+                    let amount: u64 = match args[1].parse() {
+                        Ok(a) => a,
+                        Err(_) => {
+                            println!("Invalid amount");
+                            continue;
+                        }
+                    };
+                    let fee_rate: f32 = match args[2].parse() {
+                        Ok(f) => f,
+                        Err(_) => {
+                            println!("Invalid fee rate");
+                            continue;
+                        }
+                    };
+
+                    println!("Building SNICKER transaction: {} sats to {} (fee rate: {} sat/vB)...",
+                             amount, address, fee_rate);
+                    match mgr.build_snicker_tx(address, amount, fee_rate).await {
+                        Ok(tx_hex) => {
+                            println!("✅ Transaction built successfully!");
+                            println!("");
+                            println!("Transaction hex:");
+                            println!("{}", tx_hex);
+                            println!("");
+                            println!("Test with:");
+                            println!("  bitcoin-cli testmempoolaccept '[\"{}\" ]'", tx_hex);
+                            println!("");
+                            println!("Broadcast with:");
+                            println!("  bitcoin-cli sendrawtransaction \"{}\"", tx_hex);
+                        },
+                        Err(e) => println!("❌ Error: {}", e),
+                    }
+                } else {
+                    println!("No wallet loaded.");
+                }
+            }
+
             // SNICKER commands
             "scan_candidates" => {
                 if args.len() != 3 {
@@ -642,15 +692,42 @@ pub async fn repl(
 
                     println!("✍️  Accepting proposal {}...", tag_hex);
 
+                    // Get the proposal first so we can store UTXO info after broadcast
+                    let proposal = match mgr.get_decrypted_proposal_by_tag(&tag).await {
+                        Ok(Some(p)) => p,
+                        Ok(None) => {
+                            println!("❌ Proposal not found");
+                            continue;
+                        }
+                        Err(e) => {
+                            println!("❌ Error fetching proposal: {}", e);
+                            continue;
+                        }
+                    };
+
+                    // Get our UTXOs before accepting (needed for UTXO tracking)
+                    let our_utxos: Vec<_> = {
+                        let wallet = mgr.wallet_node.wallet.lock().await;
+                        wallet.list_unspent().collect()
+                    };
+
                     match mgr.accept_snicker_proposal(&tag, acceptable_range).await {
                         Ok(psbt) => {
                             println!("✅ Proposal signed");
                             match mgr.finalize_psbt(psbt).await {
                                 Ok(tx) => {
                                     println!("✅ Transaction finalized");
+                                    let tx_clone = tx.clone();
                                     match mgr.broadcast_transaction(tx).await {
                                         Ok(txid) => {
                                             println!("✅ Coinjoin transaction broadcast: {}", txid);
+
+                                            // Track the SNICKER UTXO for future detection during sync
+                                            match mgr.store_accepted_snicker_utxo(&proposal, &tx_clone, &our_utxos).await {
+                                                Ok(()) => println!("📋 SNICKER UTXO tracked (will be detected during sync)"),
+                                                Err(e) => println!("⚠️  Warning: Failed to track SNICKER UTXO: {}", e),
+                                            }
+
                                             println!("🎉 SNICKER coinjoin complete!");
                                         }
                                         Err(e) => println!("❌ Broadcast error: {}", e),
@@ -741,6 +818,7 @@ fn print_help() {
     println!("  listunspent                        - show UTXOs");
     println!("  summary                            - show wallet summary");
     println!("  send <addr> <amt> <fee>            - send transaction (addr, sats, sat/vB)");
+    println!("  build_snicker_tx <addr> <amt> <f>  - build SNICKER tx without broadcasting (testing)");
     println!("  sync                               - rescan recent blocks");
     println!();
     println!("SNICKER Commands (Proposer side):");

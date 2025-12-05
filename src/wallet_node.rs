@@ -12,7 +12,7 @@ use tracing::info;
 
 use bdk_wallet::{
     PersistedWallet,
-    bitcoin::{Network, Address, Amount, FeeRate, Transaction, Txid, psbt::Psbt},
+    bitcoin::{Network, Address, Amount, FeeRate, Transaction, Txid, psbt::Psbt, hashes::Hash, BlockHash},
     keys::{
         bip39::{Language, Mnemonic, WordCount},
         DerivableKey, ExtendedKey, GeneratedKey, GeneratableKey,
@@ -22,8 +22,8 @@ use bdk_wallet::{
     KeychainKind, Wallet, SignOptions,
 };
 
-use bdk_kyoto::builder::{NodeBuilder, NodeBuilderExt};
-use bdk_kyoto::{Info, LightClient, Receiver, ScanType, UnboundedReceiver, Warning, TxBroadcast, TxBroadcastPolicy};
+use bdk_kyoto::builder::{Builder, BuilderExt};
+use bdk_kyoto::{Info, LightClient, Receiver, ScanType, UnboundedReceiver, Warning, TxBroadcast, TxBroadcastPolicy, HeaderCheckpoint};
 
 const RECOVERY_LOOKAHEAD: u32 = 50;
 const NUM_CONNECTIONS: u8 = 1;
@@ -42,6 +42,8 @@ pub struct WalletNode {
     pub(crate) rpc_client: Option<Arc<bdk_bitcoind_rpc::bitcoincore_rpc::Client>>,
     /// Wallet name (for locating correct headers.db)
     wallet_name: String,
+    /// Path to SNICKER database for checking pending UTXOs
+    snicker_db_path: std::path::PathBuf,
 }
 
 impl WalletNode {
@@ -107,12 +109,51 @@ impl WalletNode {
         let conn = Arc::new(Mutex::new(conn));
         let update_subscriber = Arc::new(Mutex::new(update_subscriber));
 
+        // Construct path to SNICKER database (before spawning background task)
+        let project_dirs = directories::ProjectDirs::from("org", "code", "ambient")
+            .ok_or_else(|| anyhow::anyhow!("Could not determine data directory"))?;
+        let snicker_db_path = project_dirs
+            .data_local_dir()
+            .join(network_str)
+            .join(name)
+            .join("snicker.sqlite");
+
+        let wallet_db_path_for_bg = project_dirs
+            .data_local_dir()
+            .join(network_str)
+            .join(name)
+            .join("wallet.sqlite");
+
+        // Derive descriptors for SNICKER UTXO detection
+        let coin_type = if network == Network::Bitcoin { 0 } else { 1 };
+        let external_desc = format!("tr({}/86h/{}h/0h/0/*)", xprv, coin_type);
+        let internal_desc = format!("tr({}/86h/{}h/0h/1/*)", xprv, coin_type);
+
         // Spawn background task to auto-sync
         let wallet_clone = wallet.clone();
         let conn_clone = conn.clone();
         let sub_clone = update_subscriber.clone();
+        let snicker_db_clone = snicker_db_path.clone();
+        let wallet_db_clone = wallet_db_path_for_bg.clone();
+        let requester_clone = requester.clone();
+        let wallet_name_clone = name.to_string();
+        let network_clone = network;
+        let external_desc_clone = external_desc.clone();
+        let internal_desc_clone = internal_desc.clone();
         tokio::spawn(async move {
-            Self::background_sync(wallet_clone, conn_clone, sub_clone).await;
+            Self::background_sync(
+                wallet_clone,
+                conn_clone,
+                sub_clone,
+                snicker_db_clone,
+                wallet_db_clone,
+                requester_clone,
+                wallet_name_clone,
+                network_clone,
+                external_desc_clone,
+                internal_desc_clone,
+            )
+            .await;
         });
 
         info!("✅ Wallet loaded. Auto-sync enabled in background.");
@@ -126,6 +167,7 @@ impl WalletNode {
             xprv,
             rpc_client: None,
             wallet_name: name.to_string(),
+            snicker_db_path,
         })
     }
 
@@ -199,6 +241,11 @@ impl WalletNode {
         let wallet = if let Some(mut loaded) = maybe_wallet {
             info!("✅ Loaded existing wallet from database");
 
+            let initial_external_index = loaded.derivation_index(KeychainKind::External).unwrap_or(0);
+            let initial_internal_index = loaded.derivation_index(KeychainKind::Internal).unwrap_or(0);
+            info!("📊 Initial derivation indices: External={}, Internal={}",
+                initial_external_index, initial_internal_index);
+
             // CRITICAL FIX: After loading, we must ensure the SPK index is populated!
             // When a wallet is loaded from DB, the index might not include all UTXOs
             // that were added in previous sessions. We need to reveal addresses up to
@@ -214,18 +261,27 @@ impl WalletNode {
                 }
             }
 
-            info!("🔧 Repopulating SPK index: External up to {}, Internal up to {}",
-                max_external, max_internal);
+            info!("🔧 Ensuring SPK index includes lookahead: External up to {}, Internal up to {}",
+                max_external + RECOVERY_LOOKAHEAD, max_internal + RECOVERY_LOOKAHEAD);
 
-            // Use reveal_addresses_to() which actually updates the SPK index
-            // (peek_address() only reads, doesn't update!)
-            let _ = loaded.reveal_addresses_to(KeychainKind::External, max_external + RECOVERY_LOOKAHEAD).collect::<Vec<_>>();
-            let _ = loaded.reveal_addresses_to(KeychainKind::Internal, max_internal + RECOVERY_LOOKAHEAD).collect::<Vec<_>>();
+            // Use peek_address() to ensure scripts are in SPK index WITHOUT advancing derivation index
+            // This allows the light client to scan for these addresses while keeping
+            // the next user-facing address at the first unused one
+            for index in 0..=(max_external + RECOVERY_LOOKAHEAD) {
+                let _ = loaded.peek_address(KeychainKind::External, index);
+            }
+            for index in 0..=(max_internal + RECOVERY_LOOKAHEAD) {
+                let _ = loaded.peek_address(KeychainKind::Internal, index);
+            }
 
-            // Persist the index changes to database
-            loaded.persist(&mut conn)?;
+            // No need to persist - peek doesn't change derivation index
+            let final_external_index = loaded.derivation_index(KeychainKind::External).unwrap_or(0);
+            let final_internal_index = loaded.derivation_index(KeychainKind::Internal).unwrap_or(0);
 
-            info!("✅ SPK index repopulated and persisted");
+            info!("✅ SPK index populated with {} external and {} internal scripts",
+                max_external + RECOVERY_LOOKAHEAD + 1, max_internal + RECOVERY_LOOKAHEAD + 1);
+            info!("📊 Final derivation indices: External={}, Internal={} (should be unchanged)",
+                final_external_index, final_internal_index);
             loaded
         } else {
             info!("✅ Creating new wallet with descriptors");
@@ -241,6 +297,10 @@ impl WalletNode {
             }
             new_wallet.persist(&mut conn)?;
             info!("🔧 Derived and persisted {} lookahead scripts", RECOVERY_LOOKAHEAD);
+
+            let external_index = new_wallet.derivation_index(KeychainKind::External).unwrap_or(0);
+            let internal_index = new_wallet.derivation_index(KeychainKind::Internal).unwrap_or(0);
+            info!("📊 New wallet derivation indices: External={}, Internal={}", external_index, internal_index);
 
             new_wallet
         };
@@ -264,10 +324,20 @@ impl WalletNode {
         from_height: u32,
         wallet_name: &str,
     ) -> Result<(bdk_kyoto::Requester, bdk_kyoto::UpdateSubscriber)> {
-        let scan_type = ScanType::Recovery {
-            from_height,
+        // Use actual genesis block hash for height 0, otherwise all_zeros as placeholder
+        let checkpoint_hash = if from_height == 0 {
+            use bdk_wallet::bitcoin::blockdata::constants::genesis_block;
+            genesis_block(network).block_hash()
+        } else {
+            BlockHash::all_zeros()
         };
-        info!("🔍 Recovery starting height: {}", from_height);
+
+        let checkpoint = HeaderCheckpoint::new(from_height, checkpoint_hash);
+        let scan_type = ScanType::Recovery {
+            used_script_index: RECOVERY_LOOKAHEAD,
+            checkpoint,
+        };
+        info!("🔍 Recovery starting from height {} with hash {}", from_height, checkpoint_hash);
 
         // Select peer based on network
         let peer = match network {
@@ -305,19 +375,18 @@ impl WalletNode {
 
         let LightClient {
             requester,
-            log_subscriber,
             info_subscriber,
             warning_subscriber,
             update_subscriber,
             node,
-        } = NodeBuilder::new(network)
+        } = Builder::new(network)
             .add_peer(peer)
             .required_peers(NUM_CONNECTIONS)
             .data_dir(kyoto_db_path)
             .build_with_wallet(wallet, scan_type)
             .unwrap();
 
-        info!("🔧 Node built - bdk_kyoto 0.13.1 will auto-register wallet scripts");
+        info!("🔧 Node built - bdk_kyoto 0.15.3 will auto-register wallet scripts");
 
         tokio::spawn(async move {
             if let Err(e) = node.run().await {
@@ -328,7 +397,7 @@ impl WalletNode {
         });
 
         tokio::spawn(async move {
-            trace_logs(log_subscriber, info_subscriber, warning_subscriber).await;
+            trace_logs(info_subscriber, warning_subscriber).await;
         });
 
         Ok((requester, update_subscriber))
@@ -338,6 +407,13 @@ impl WalletNode {
         wallet: Arc<Mutex<PersistedWallet<Connection>>>,
         conn: Arc<Mutex<Connection>>,
         update_subscriber: Arc<Mutex<bdk_kyoto::UpdateSubscriber>>,
+        snicker_db_path: std::path::PathBuf,
+        wallet_db_path: std::path::PathBuf,
+        requester: bdk_kyoto::Requester,
+        wallet_name: String,
+        network: Network,
+        external_descriptor: String,
+        internal_descriptor: String,
     ) {
         loop {
             let mut sub = update_subscriber.lock().await;
@@ -368,8 +444,15 @@ impl WalletNode {
                     if max_external > 0 || max_internal > 0 {
                         tracing::debug!("🔧 Repopulating SPK index after scan: External up to {}, Internal up to {}",
                             max_external, max_internal);
-                        let _ = wallet.reveal_addresses_to(KeychainKind::External, max_external + RECOVERY_LOOKAHEAD).collect::<Vec<_>>();
-                        let _ = wallet.reveal_addresses_to(KeychainKind::Internal, max_internal + RECOVERY_LOOKAHEAD).collect::<Vec<_>>();
+                        // Use peek_address() to add scripts to SPK index WITHOUT advancing derivation index
+                        // This allows the light client to scan for these addresses while keeping
+                        // the next user-facing address at the first unused one
+                        for index in 0..=(max_external + RECOVERY_LOOKAHEAD) {
+                            let _ = wallet.peek_address(KeychainKind::External, index);
+                        }
+                        for index in 0..=(max_internal + RECOVERY_LOOKAHEAD) {
+                            let _ = wallet.peek_address(KeychainKind::Internal, index);
+                        }
                     }
 
                     if let Err(e) = wallet.persist(&mut conn) {
@@ -378,6 +461,34 @@ impl WalletNode {
 
                     let height = wallet.local_chain().tip().height();
                     info!("✅ Auto-sync: updated to height {height}");
+
+                    // Release wallet lock before checking SNICKER UTXOs
+                    drop(wallet);
+                    drop(conn);
+
+                    // Check for pending SNICKER UTXOs and insert them if confirmed
+                    if let Err(e) = Self::check_pending_snicker_utxos(
+                        &snicker_db_path,
+                        &requester,
+                        &wallet_name,
+                        network,
+                        &external_descriptor,
+                        &internal_descriptor,
+                    )
+                    .await
+                    {
+                        tracing::error!("Failed to process pending SNICKER UTXOs: {e}");
+                    }
+
+                    // Check for spent SNICKER UTXOs and mark them as spent
+                    if let Err(e) = Self::check_spent_snicker_utxos(
+                        &snicker_db_path,
+                        &wallet_db_path,
+                    )
+                    .await
+                    {
+                        tracing::error!("Failed to check spent SNICKER UTXOs: {e}");
+                    }
                 }
                 Err(e) => {
                     tracing::error!("Auto-sync stopped: {e:?}");
@@ -553,7 +664,7 @@ impl WalletNode {
 
         // Broadcast via Kyoto requester to all connected peers
         let tx_broadcast = TxBroadcast::new(tx, TxBroadcastPolicy::AllPeers);
-        self.requester.broadcast_tx(tx_broadcast)
+        self.requester.broadcast_tx(tx_broadcast).await
             .map_err(|e| anyhow!("Broadcast failed: {}", e))?;
 
         info!("✅ Transaction broadcast successful");
@@ -571,6 +682,27 @@ impl WalletNode {
         amount_sats: u64,
         fee_rate_sat_vb: f32,
     ) -> Result<Txid> {
+        // Check if we have SNICKER UTXOs available
+        let snicker_balance = self.get_snicker_balance_sats().await?;
+
+        if snicker_balance > 0 {
+            // Prefer SNICKER UTXOs (coinjoined funds have better privacy & reduces recovery burden)
+            info!("💰 SNICKER balance available ({} sats), preferring coinjoined UTXOs", snicker_balance);
+            self.send_with_snicker_utxos(address_str, amount_sats, fee_rate_sat_vb).await
+        } else {
+            // Fall back to regular descriptor-derived UTXOs
+            info!("💰 Using regular UTXOs (no SNICKER funds available)");
+            self.try_send_regular_only(address_str, amount_sats, fee_rate_sat_vb).await
+        }
+    }
+
+    /// Try to send using only regular descriptor-derived UTXOs
+    async fn try_send_regular_only(
+        &mut self,
+        address_str: &str,
+        amount_sats: u64,
+        fee_rate_sat_vb: f32,
+    ) -> Result<Txid> {
         // Parse address
         let address = Address::from_str(address_str)
             .map_err(|e| anyhow!("Invalid address: {}", e))?
@@ -579,16 +711,13 @@ impl WalletNode {
 
         let mut wallet = self.wallet.lock().await;
 
-        info!("🔨 Building transaction...");
+        info!("🔨 Building transaction with regular UTXOs...");
         let mut tx_builder = wallet.build_tx();
         tx_builder.add_recipient(address.script_pubkey(), Amount::from_sat(amount_sats));
         tx_builder.fee_rate(FeeRate::from_sat_per_vb_unchecked(fee_rate_sat_vb as u64));
 
         let mut psbt = tx_builder.finish()?;
         info!("✅ PSBT created with {} inputs, {} outputs", psbt.inputs.len(), psbt.outputs.len());
-
-        // PHASE 1 DEBUG: Dump PSBT state after tx_builder.finish() (working case)
-        Self::dump_psbt_state(&psbt, "After tx_builder.finish() - WORKING");
 
         // Sign
         info!("✍️  Signing transaction...");
@@ -618,7 +747,436 @@ impl WalletNode {
         // Broadcast
         info!("📡 Broadcasting transaction...");
         let txid = self.broadcast_transaction(tx).await?;
-        info!("✅ Transaction sent: {}", txid);
+
+        Ok(txid)
+    }
+
+    /// Build a transaction using SNICKER UTXOs WITHOUT broadcasting it.
+    /// Returns the signed transaction for external verification/broadcasting.
+    ///
+    /// This is useful for testing transaction validity with `testmempoolaccept`
+    /// before actual broadcast.
+    pub async fn build_snicker_spend_tx(
+        &mut self,
+        address_str: &str,
+        amount_sats: u64,
+        fee_rate_sat_vb: f32,
+    ) -> Result<Transaction> {
+        use bdk_wallet::bitcoin::{
+            psbt::Psbt, transaction::Version, ScriptBuf, Sequence, TxIn, TxOut,
+            OutPoint, Witness, absolute::LockTime,
+        };
+        use bdk_wallet::bitcoin::secp256k1::{Secp256k1, SecretKey, Message};
+        use bdk_wallet::bitcoin::sighash::{SighashCache, TapSighashType, Prevouts};
+        use bdk_wallet::rusqlite::Connection;
+        use std::str::FromStr;
+
+        // Parse address
+        let address = Address::from_str(address_str)?
+            .require_network(self.network)?;
+
+        // Get available SNICKER UTXOs
+        let snicker_utxos: Vec<(String, u32, u64, Vec<u8>, Vec<u8>)> = {
+            let conn = Connection::open(&self.snicker_db_path)?;
+            let mut stmt = conn.prepare(
+                "SELECT txid, vout, amount, script_pubkey, tweaked_privkey FROM snicker_utxos WHERE block_height IS NOT NULL AND spent = 0"
+            )?;
+            let mut rows = stmt.query([])?;
+            let mut result = Vec::new();
+            while let Some(row) = rows.next()? {
+                result.push((
+                    row.get(0)?, row.get(1)?, row.get(2)?,
+                    row.get(3)?, row.get(4)?,
+                ));
+            }
+            result
+        };
+
+        if snicker_utxos.is_empty() {
+            return Err(anyhow!("No SNICKER UTXOs available"));
+        }
+
+        info!("💰 Found {} SNICKER UTXOs available", snicker_utxos.len());
+
+        // Simple coin selection: use SNICKER UTXOs until we have enough
+        let mut selected_utxos = Vec::new();
+        let mut total_input = 0u64;
+
+        // Estimate fee (rough estimate for initial selection)
+        let estimated_fee_per_input = (150.0 * fee_rate_sat_vb) as u64;
+
+        for utxo in &snicker_utxos {
+            selected_utxos.push(utxo);
+            total_input += utxo.2;
+            let estimated_total_fee = estimated_fee_per_input * selected_utxos.len() as u64;
+            if total_input >= amount_sats + estimated_total_fee {
+                break;
+            }
+        }
+
+        if total_input < amount_sats {
+            return Err(anyhow!("Insufficient funds: have {}, need {}", total_input, amount_sats));
+        }
+
+        info!("✅ Selected {} SNICKER UTXOs (total {} sats)", selected_utxos.len(), total_input);
+
+        // Build transaction manually
+        let mut tx_inputs = Vec::new();
+        let mut prevouts_for_sighash = Vec::new();
+
+        for (txid_str, vout, amount, script_pubkey, _) in &selected_utxos {
+            let txid = Txid::from_str(txid_str)?;
+            tx_inputs.push(TxIn {
+                previous_output: OutPoint::new(txid, *vout),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            });
+            prevouts_for_sighash.push(TxOut {
+                value: Amount::from_sat(*amount),
+                script_pubkey: ScriptBuf::from_bytes(script_pubkey.clone()),
+            });
+        }
+
+        // Calculate change
+        let num_inputs = selected_utxos.len() as u64;
+        let num_outputs = 2; // payment + change (we'll adjust if no change later)
+        let estimated_vsize = 11 + (num_inputs * 57) + (num_outputs * 43);
+        let estimated_fee = estimated_vsize * fee_rate_sat_vb as u64;
+        let change_amount = total_input.saturating_sub(amount_sats + estimated_fee);
+
+        let mut tx_outputs = vec![TxOut {
+            value: Amount::from_sat(amount_sats),
+            script_pubkey: address.script_pubkey(),
+        }];
+
+        // Add change output if any
+        if change_amount > 0 {
+            let mut wallet = self.wallet.lock().await;
+            let mut conn = self.conn.lock().await;
+            let change_addr = wallet.reveal_next_address(KeychainKind::Internal);
+            wallet.persist(&mut conn)?; // Persist the revealed address
+            drop(conn);
+            drop(wallet);
+            tx_outputs.push(TxOut {
+                value: Amount::from_sat(change_amount),
+                script_pubkey: change_addr.script_pubkey(),
+            });
+            info!("💸 Change output: {} sats to {}", change_amount, change_addr.address);
+        }
+
+        let unsigned_tx = bdk_wallet::bitcoin::Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: tx_inputs,
+            output: tx_outputs,
+        };
+
+        let mut psbt = Psbt::from_unsigned_tx(unsigned_tx)?;
+
+        // Fill in witness_utxo for each input
+        for (i, (_, _, amount, script_pubkey, _)) in selected_utxos.iter().enumerate() {
+            psbt.inputs[i].witness_utxo = Some(TxOut {
+                value: Amount::from_sat(*amount),
+                script_pubkey: ScriptBuf::from_bytes(script_pubkey.clone()),
+            });
+        }
+
+        // Sign each SNICKER input with its tweaked private key
+        let secp = Secp256k1::new();
+        let prevouts = Prevouts::All(&prevouts_for_sighash);
+        let mut sighash_cache = SighashCache::new(&psbt.unsigned_tx);
+
+        for (i, (_, _, _, script_pubkey, tweaked_privkey_bytes)) in selected_utxos.iter().enumerate() {
+            // Deserialize tweaked private key
+            let tweaked_seckey = SecretKey::from_slice(tweaked_privkey_bytes)?;
+            let tweaked_keypair = bdk_wallet::bitcoin::secp256k1::Keypair::from_secret_key(&secp, &tweaked_seckey);
+
+            // SANITY CHECK: Verify that tweaked_seckey * G = expected_pubkey
+            use bdk_wallet::bitcoin::secp256k1::{PublicKey, XOnlyPublicKey};
+            let derived_pubkey = PublicKey::from_secret_key(&secp, &tweaked_seckey);
+            let derived_xonly = XOnlyPublicKey::from(derived_pubkey);
+
+            // Extract expected pubkey from scriptPubkey (P2TR format: OP_1 <32-byte-xonly>)
+            let script_bytes = script_pubkey;
+            if script_bytes.len() != 34 || script_bytes[0] != 0x51 || script_bytes[1] != 0x20 {
+                return Err(anyhow!("Invalid P2TR script format for input {}", i));
+            }
+            let expected_xonly_bytes = &script_bytes[2..34];
+            let expected_xonly = XOnlyPublicKey::from_slice(expected_xonly_bytes)?;
+
+            if derived_xonly != expected_xonly {
+                return Err(anyhow!(
+                    "SANITY CHECK FAILED for input {}:\n\
+                     Tweaked private key does not match expected public key!\n\
+                     Expected: {}\n\
+                     Derived:  {}\n\
+                     This means the SNICKER tweak derivation is incorrect.",
+                    i,
+                    hex::encode(expected_xonly.serialize()),
+                    hex::encode(derived_xonly.serialize())
+                ));
+            }
+
+            info!("✅ Input {}: Sanity check passed (privkey * G = pubkey)", i);
+
+            // Compute sighash
+            let sighash = sighash_cache.taproot_key_spend_signature_hash(
+                i,
+                &prevouts,
+                TapSighashType::Default,
+            )?;
+
+            // Sign
+            let msg = Message::from_digest_slice(sighash.as_byte_array())?;
+            let sig = secp.sign_schnorr(&msg, &tweaked_keypair);
+
+            // Add signature to PSBT
+            psbt.inputs[i].tap_key_sig = Some(bdk_wallet::bitcoin::taproot::Signature {
+                signature: sig,
+                sighash_type: TapSighashType::Default,
+            });
+
+            info!("✍️  Signed SNICKER input {}", i);
+        }
+
+        // Finalize all inputs
+        for i in 0..psbt.inputs.len() {
+            if let Some(sig) = &psbt.inputs[i].tap_key_sig {
+                psbt.inputs[i].final_script_witness = Some(Witness::from_slice(&[sig.to_vec()]));
+                psbt.inputs[i].tap_key_sig = None; // Clear after finalizing
+            }
+        }
+
+        // Extract transaction
+        let tx = psbt.extract_tx()?;
+        let txid = tx.compute_txid();
+        info!("✅ Transaction built with SNICKER UTXOs, txid: {}", txid);
+
+        Ok(tx)
+    }
+
+    /// Send transaction using SNICKER UTXOs (fallback when regular UTXOs insufficient)
+    async fn send_with_snicker_utxos(
+        &mut self,
+        address_str: &str,
+        amount_sats: u64,
+        fee_rate_sat_vb: f32,
+    ) -> Result<Txid> {
+        use bdk_wallet::bitcoin::{
+            psbt::Psbt, transaction::Version, ScriptBuf, Sequence, TxIn, TxOut,
+            OutPoint, Witness, absolute::LockTime,
+        };
+        use bdk_wallet::bitcoin::secp256k1::{Secp256k1, SecretKey, Message};
+        use bdk_wallet::bitcoin::sighash::{SighashCache, TapSighashType, Prevouts};
+        use bdk_wallet::rusqlite::Connection;
+        use std::str::FromStr;
+
+        // Parse address
+        let address = Address::from_str(address_str)?
+            .require_network(self.network)?;
+
+        // Get available SNICKER UTXOs
+        let snicker_utxos: Vec<(String, u32, u64, Vec<u8>, Vec<u8>)> = {
+            let conn = Connection::open(&self.snicker_db_path)?;
+            let mut stmt = conn.prepare(
+                "SELECT txid, vout, amount, script_pubkey, tweaked_privkey FROM snicker_utxos WHERE block_height IS NOT NULL AND spent = 0"
+            )?;
+            let mut rows = stmt.query([])?;
+            let mut result = Vec::new();
+            while let Some(row) = rows.next()? {
+                result.push((
+                    row.get(0)?, row.get(1)?, row.get(2)?,
+                    row.get(3)?, row.get(4)?,
+                ));
+            }
+            result
+        };
+
+        if snicker_utxos.is_empty() {
+            return Err(anyhow!("No SNICKER UTXOs available"));
+        }
+
+        info!("💰 Found {} SNICKER UTXOs available", snicker_utxos.len());
+
+        // Simple coin selection: use SNICKER UTXOs until we have enough
+        // TODO: Smarter selection, include regular UTXOs too
+        let mut selected_utxos = Vec::new();
+        let mut total_input = 0u64;
+
+        // Estimate fee (rough estimate: 1 input + 1 output + overhead = ~150 vbytes per input)
+        let estimated_fee_per_input = (150.0 * fee_rate_sat_vb) as u64;
+
+        for utxo in &snicker_utxos {
+            selected_utxos.push(utxo);
+            total_input += utxo.2;
+            let estimated_total_fee = estimated_fee_per_input * selected_utxos.len() as u64;
+            if total_input >= amount_sats + estimated_total_fee {
+                break;
+            }
+        }
+
+        if total_input < amount_sats {
+            return Err(anyhow!("Insufficient funds even with SNICKER UTXOs: have {}, need {}", total_input, amount_sats));
+        }
+
+        info!("✅ Selected {} SNICKER UTXOs (total {} sats)", selected_utxos.len(), total_input);
+
+        // Build transaction manually
+        let mut tx_inputs = Vec::new();
+        let mut prevouts_for_sighash = Vec::new();
+
+        for (txid_str, vout, amount, script_pubkey, _) in &selected_utxos {
+            let txid = Txid::from_str(txid_str)?;
+            tx_inputs.push(TxIn {
+                previous_output: OutPoint::new(txid, *vout),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            });
+            prevouts_for_sighash.push(TxOut {
+                value: Amount::from_sat(*amount),
+                script_pubkey: ScriptBuf::from_bytes(script_pubkey.clone()),
+            });
+        }
+
+        // Calculate change
+        // Estimate transaction size in vbytes (weight / 4):
+        // Non-witness (1 vbyte per byte): base(10) + per_input(40) + per_output(43)
+        // Witness (0.25 vbytes per byte): overhead(2) + per_input_sig(~66)
+        // Formula: 10.5 + (num_inputs * 56.5) + (num_outputs * 43)
+        let num_inputs = selected_utxos.len() as u64;
+        let num_outputs = 2; // payment + change (we'll adjust if no change later)
+        let estimated_vsize = 11 + (num_inputs * 57) + (num_outputs * 43);
+        let estimated_fee = estimated_vsize * fee_rate_sat_vb as u64;
+        let change_amount = total_input.saturating_sub(amount_sats + estimated_fee);
+
+        let mut tx_outputs = vec![TxOut {
+            value: Amount::from_sat(amount_sats),
+            script_pubkey: address.script_pubkey(),
+        }];
+
+        // Add change output if any
+        if change_amount > 0 {
+            let mut wallet = self.wallet.lock().await;
+            let mut conn = self.conn.lock().await;
+            let change_addr = wallet.reveal_next_address(KeychainKind::Internal);
+            wallet.persist(&mut conn)?; // Persist the revealed address
+            drop(conn);
+            drop(wallet);
+            tx_outputs.push(TxOut {
+                value: Amount::from_sat(change_amount),
+                script_pubkey: change_addr.script_pubkey(),
+            });
+            info!("💸 Change output: {} sats to {}", change_amount, change_addr.address);
+        }
+
+        let unsigned_tx = bdk_wallet::bitcoin::Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: tx_inputs,
+            output: tx_outputs,
+        };
+
+        let mut psbt = Psbt::from_unsigned_tx(unsigned_tx)?;
+
+        // Fill in witness_utxo for each input
+        for (i, (_, _, amount, script_pubkey, _)) in selected_utxos.iter().enumerate() {
+            psbt.inputs[i].witness_utxo = Some(TxOut {
+                value: Amount::from_sat(*amount),
+                script_pubkey: ScriptBuf::from_bytes(script_pubkey.clone()),
+            });
+        }
+
+        // Sign each SNICKER input with its tweaked private key
+        let secp = Secp256k1::new();
+        let prevouts = Prevouts::All(&prevouts_for_sighash);
+        let mut sighash_cache = SighashCache::new(&psbt.unsigned_tx);
+
+        for (i, (_, _, _, script_pubkey, tweaked_privkey_bytes)) in selected_utxos.iter().enumerate() {
+            // Deserialize tweaked private key
+            let tweaked_seckey = SecretKey::from_slice(tweaked_privkey_bytes)?;
+            let tweaked_keypair = bdk_wallet::bitcoin::secp256k1::Keypair::from_secret_key(&secp, &tweaked_seckey);
+
+            // SANITY CHECK: Verify that tweaked_seckey * G = expected_pubkey
+            use bdk_wallet::bitcoin::secp256k1::{PublicKey, XOnlyPublicKey};
+            let derived_pubkey = PublicKey::from_secret_key(&secp, &tweaked_seckey);
+            let derived_xonly = XOnlyPublicKey::from(derived_pubkey);
+
+            // Extract expected pubkey from scriptPubkey (P2TR format: OP_1 <32-byte-xonly>)
+            let script_bytes = script_pubkey;
+            if script_bytes.len() != 34 || script_bytes[0] != 0x51 || script_bytes[1] != 0x20 {
+                return Err(anyhow!("Invalid P2TR script format for input {}", i));
+            }
+            let expected_xonly_bytes = &script_bytes[2..34];
+            let expected_xonly = XOnlyPublicKey::from_slice(expected_xonly_bytes)?;
+
+            if derived_xonly != expected_xonly {
+                return Err(anyhow!(
+                    "SANITY CHECK FAILED for input {}:\n\
+                     Tweaked private key does not match expected public key!\n\
+                     Expected: {}\n\
+                     Derived:  {}\n\
+                     This means the SNICKER tweak derivation is incorrect.",
+                    i,
+                    hex::encode(expected_xonly.serialize()),
+                    hex::encode(derived_xonly.serialize())
+                ));
+            }
+
+            info!("✅ Input {}: Sanity check passed (privkey * G = pubkey)", i);
+
+            // Compute sighash
+            let sighash = sighash_cache.taproot_key_spend_signature_hash(
+                i,
+                &prevouts,
+                TapSighashType::Default,
+            )?;
+
+            // Sign
+            let msg = Message::from_digest_slice(sighash.as_byte_array())?;
+            let sig = secp.sign_schnorr(&msg, &tweaked_keypair);
+
+            // Add signature to PSBT
+            psbt.inputs[i].tap_key_sig = Some(bdk_wallet::bitcoin::taproot::Signature {
+                signature: sig,
+                sighash_type: TapSighashType::Default,
+            });
+
+            info!("✍️  Signed SNICKER input {}", i);
+        }
+
+        // Finalize all inputs
+        for i in 0..psbt.inputs.len() {
+            if let Some(sig) = &psbt.inputs[i].tap_key_sig {
+                psbt.inputs[i].final_script_witness = Some(Witness::from_slice(&[sig.to_vec()]));
+                psbt.inputs[i].tap_key_sig = None; // Clear after finalizing
+            }
+        }
+
+        // Extract transaction
+        let tx = psbt.extract_tx()?;
+        let txid = tx.compute_txid();
+        info!("✅ Transaction built with SNICKER UTXOs, txid: {}", txid);
+
+        // Don't manually insert - let auto-sync discover it via the change output
+        // The change output uses a descriptor-derived script, so Kyoto will detect it
+
+        // Mark SNICKER UTXOs as spent in SNICKER database
+        {
+            let conn = Connection::open(&self.snicker_db_path)?;
+            for (txid_str, vout, _, _, _) in &selected_utxos {
+                conn.execute(
+                    "UPDATE snicker_utxos SET spent = 1 WHERE txid = ? AND vout = ?",
+                    (txid_str, vout),
+                )?;
+            }
+        }
+
+        // Broadcast
+        info!("📡 Broadcasting transaction...");
+        self.broadcast_transaction(tx).await?;
+        info!("✅ Transaction sent using SNICKER UTXOs");
 
         Ok(txid)
     }
@@ -679,8 +1237,26 @@ impl WalletNode {
 
     pub async fn get_balance(&self) -> Result<String> {
         let wallet = self.wallet.lock().await;
-        let sats = wallet.balance().total().to_sat();
-        Ok(format!("{sats} sats"))
+        let regular_balance = wallet.balance().total().to_sat();
+        drop(wallet);
+
+        let snicker_balance = self.get_snicker_balance_sats().await?;
+
+        let total = regular_balance + snicker_balance;
+        Ok(format!("{} sats", total))
+    }
+
+    /// Get SNICKER balance in satoshis (helper for coin selection)
+    async fn get_snicker_balance_sats(&self) -> Result<u64> {
+        use bdk_wallet::rusqlite::Connection;
+
+        let conn = Connection::open(&self.snicker_db_path)?;
+        let balance: Option<i64> = conn.query_row(
+            "SELECT SUM(amount) FROM snicker_utxos WHERE block_height IS NOT NULL AND spent = 0",
+            [],
+            |row| row.get(0),
+        ).unwrap_or(None);
+        Ok(balance.unwrap_or(0) as u64)
     }
 
     /// Get next address and persist derivation index.
@@ -689,7 +1265,12 @@ impl WalletNode {
         let mut wallet = self.wallet.lock().await;
         let mut conn = self.conn.lock().await;
 
+        let before_index = wallet.derivation_index(KeychainKind::External).unwrap_or(0);
         let info = wallet.reveal_next_address(KeychainKind::External);
+        let after_index = wallet.derivation_index(KeychainKind::External).unwrap_or(0);
+
+        info!("📍 Address revealed: {} (derivation index: {} -> {}, address index: {})",
+            info.address, before_index, after_index, info.index);
 
         // persist updated derivation index
         wallet.persist(&mut conn)?;
@@ -747,8 +1328,12 @@ impl WalletNode {
   }
 
     pub async fn list_unspent(&self) -> Result<Vec<String>> {
+        use bdk_wallet::rusqlite::Connection;
+
         let wallet = self.wallet.lock().await;
         let mut out = vec![];
+
+        // Regular wallet UTXOs
         for utxo in wallet.list_unspent() {
             out.push(format!(
                 "{}:{} ({} sats)",
@@ -757,6 +1342,26 @@ impl WalletNode {
                 utxo.txout.value.to_sat()
             ));
         }
+        drop(wallet);
+
+        // SNICKER UTXOs from separate database
+        let snicker_utxos: Vec<(String, u32, u64)> = {
+            let conn = Connection::open(&self.snicker_db_path)?;
+            let mut stmt = conn.prepare(
+                "SELECT txid, vout, amount FROM snicker_utxos WHERE block_height IS NOT NULL AND spent = 0"
+            )?;
+            let mut rows = stmt.query([])?;
+            let mut result = Vec::new();
+            while let Some(row) = rows.next()? {
+                result.push((row.get(0)?, row.get(1)?, row.get(2)?));
+            }
+            result
+        };
+
+        for (txid, vout, amount) in snicker_utxos {
+            out.push(format!("{}:{} ({} sats) [SNICKER]", txid, vout, amount));
+        }
+
         Ok(out)
     }
 
@@ -814,10 +1419,10 @@ impl WalletNode {
         end_height: u32,
     ) -> Result<Vec<(u32, bdk_wallet::bitcoin::BlockHash)>> {
         use bdk_wallet::bitcoin::BlockHash;
-        use bdk_wallet::bitcoin::hashes::Hash;
         use bdk_wallet::rusqlite::Connection;
+        use std::str::FromStr;
 
-        // Construct path to Kyoto's headers database
+        // Construct path to wallet database (headers are stored in bdk_blocks table)
         let project_dirs = directories::ProjectDirs::from("org", "code", "ambient")
             .ok_or_else(|| anyhow::anyhow!("Could not determine data directory"))?;
 
@@ -829,43 +1434,39 @@ impl WalletNode {
             _ => return Err(anyhow::anyhow!("Unsupported network")),
         };
 
-        // Construct direct path to this wallet's headers.db
-        let headers_db_path = project_dirs.data_local_dir()
+        // Construct path to wallet database
+        let wallet_db_path = project_dirs.data_local_dir()
             .join(network_str)
             .join(&self.wallet_name)
-            .join("kyoto_peers")
-            .join("light_client_data")
-            .join(network_str)
-            .join("headers.db");
+            .join("wallet.sqlite");
 
-        if !headers_db_path.exists() {
-            return Err(anyhow::anyhow!("Headers database not found at {:?}", headers_db_path));
+        if !wallet_db_path.exists() {
+            return Err(anyhow::anyhow!("Wallet database not found at {:?}", wallet_db_path));
         }
 
-        // Open Kyoto's header database (read-only)
+        // Open wallet database (read-only)
         let conn = Connection::open_with_flags(
-            &headers_db_path,
+            &wallet_db_path,
             bdk_wallet::rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         )?;
 
-        // Query for block hashes in the height range
+        // Query for block hashes in the height range from bdk_blocks table
         let mut stmt = conn.prepare(
-            "SELECT height, block_hash FROM headers WHERE height >= ? AND height <= ? ORDER BY height"
+            "SELECT block_height, block_hash FROM bdk_blocks WHERE block_height >= ? AND block_height <= ? ORDER BY block_height"
         )?;
 
         let mut block_hashes = Vec::new();
         let rows = stmt.query_map([start_height, end_height], |row| {
             let height: u32 = row.get(0)?;
-            let hash_bytes: Vec<u8> = row.get(1)?;
-            Ok((height, hash_bytes))
+            let hash_hex: String = row.get(1)?;
+            Ok((height, hash_hex))
         })?;
 
         for row in rows {
-            let (height, hash_bytes) = row?;
-            // Database stores hashes in internal byte order, which is what BlockHash::from_slice expects
-            // (BlockHash handles display order conversion when printing)
-            let hash = BlockHash::from_slice(&hash_bytes)
-                .map_err(|e| anyhow::anyhow!("Invalid block hash: {}", e))?;
+            let (height, hash_hex) = row?;
+            // Parse hex string to BlockHash
+            let hash = BlockHash::from_str(&hash_hex)
+                .map_err(|e| anyhow::anyhow!("Invalid block hash hex: {}", e))?;
             block_hashes.push((height, hash));
         }
 
@@ -874,7 +1475,7 @@ impl WalletNode {
 
     /// Scan blocks for taproot UTXOs matching size criteria
     ///
-    /// Gets block hashes from Kyoto's headers.db, fetches blocks via P2P,
+    /// Gets block hashes from wallet's bdk_blocks table, fetches blocks via P2P,
     /// and scans for taproot outputs matching the size range.
     ///
     /// # Arguments
@@ -899,9 +1500,9 @@ impl WalletNode {
 
         info!("🔍 Scanning {} blocks via Kyoto P2P (heights {}-{})", num_blocks, start_height, tip_height);
 
-        // Get block hashes from Kyoto's headers database
+        // Get block hashes from wallet database (bdk_blocks table)
         let block_hashes = self.get_block_hashes_from_headers_db(start_height, tip_height)?;
-        info!("📊 Retrieved {} block hashes from headers.db", block_hashes.len());
+        info!("📊 Retrieved {} block hashes from wallet database", block_hashes.len());
 
         let mut results = Vec::new();
 
@@ -951,12 +1552,286 @@ impl WalletNode {
     // PRIVATE KEY DERIVATION (for SNICKER DH operations)
     // ============================================================
 
-    /// Derive the private key for a specific UTXO
+    /// Check for pending SNICKER UTXOs and insert confirmed ones into the wallet (static helper)
+    async fn check_pending_snicker_utxos(
+        snicker_db_path: &std::path::Path,
+        requester: &bdk_kyoto::Requester,
+        wallet_name: &str,
+        network: Network,
+        external_descriptor: &str,
+        internal_descriptor: &str,
+    ) -> Result<()> {
+        use bdk_wallet::rusqlite::Connection;
+        use std::str::FromStr;
+
+        // Open SNICKER database and query for pending UTXOs (all synchronous, before any async)
+        let pending: Vec<(String, u32)> = {
+            let conn = Connection::open(snicker_db_path)?;
+            let mut stmt = conn.prepare(
+                "SELECT txid, vout FROM snicker_utxos WHERE block_height IS NULL AND spent = 0"
+            )?;
+            let mut rows = stmt.query([])?;
+            let mut result = Vec::new();
+            while let Some(row) = rows.next()? {
+                result.push((row.get(0)?, row.get(1)?));
+            }
+            result
+        }; // All rusqlite objects dropped here before any async code
+
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        tracing::debug!("🔍 Checking {} pending SNICKER UTXOs", pending.len());
+
+        // Get wallet database path
+        let project_dirs = directories::ProjectDirs::from("org", "code", "ambient")
+            .ok_or_else(|| anyhow::anyhow!("Could not determine data directory"))?;
+        let network_str = match network {
+            Network::Bitcoin => "mainnet",
+            Network::Testnet => "testnet",
+            Network::Signet => "signet",
+            Network::Regtest => "regtest",
+            _ => return Err(anyhow::anyhow!("Unsupported network")),
+        };
+        let wallet_db_path = project_dirs
+            .data_local_dir()
+            .join(network_str)
+            .join(wallet_name)
+            .join("wallet.sqlite");
+
+        // Open wallet database to get tip height and block hashes
+        let wallet_conn_read = Connection::open_with_flags(
+            &wallet_db_path,
+            bdk_wallet::rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+
+        let tip_height: u32 = wallet_conn_read.query_row(
+            "SELECT MAX(block_height) FROM bdk_blocks",
+            [],
+            |row| row.get(0),
+        )?;
+
+        // Scan recent blocks (last 10) for pending transactions
+        let start_height = tip_height.saturating_sub(10);
+
+        let block_hashes: Vec<(u32, String)> = {
+            let mut stmt = wallet_conn_read.prepare(
+                "SELECT block_height, block_hash FROM bdk_blocks WHERE block_height >= ? AND block_height <= ? ORDER BY block_height"
+            )?;
+            let mut rows = stmt.query([start_height, tip_height])?;
+            let mut result = Vec::new();
+            while let Some(row) = rows.next()? {
+                result.push((row.get(0)?, row.get(1)?));
+            }
+            result
+        };
+
+        // Close read connection before async operations
+        drop(wallet_conn_read);
+
+        for (height, block_hash_hex) in block_hashes {
+            // Parse block hash
+            let block_hash = bdk_wallet::bitcoin::BlockHash::from_str(&block_hash_hex)?;
+
+            // Fetch the block from Kyoto
+            if let Ok(indexed_block) = requester.get_block(block_hash).await {
+                let block = &indexed_block.block;
+
+                // Check if any pending transactions are in this block
+                for tx in &block.txdata {
+                    let txid = tx.compute_txid();
+                    let txid_str = txid.to_string();
+
+                    // Is this one of our pending SNICKER transactions?
+                    if pending.iter().any(|(pending_txid, _)| pending_txid == &txid_str) {
+                        // Insert transaction into wallet database
+                        use bdk_wallet::chain::{BlockId, ConfirmationBlockTime};
+                        use std::sync::Arc;
+
+                        // Open wallet database for writing (scoped to avoid holding across awaits)
+                        {
+                            let mut wallet_write_conn = Connection::open(&wallet_db_path)?;
+
+                            // Create TxUpdate with the transaction
+                            let mut tx_update = bdk_wallet::chain::TxUpdate::default();
+                            tx_update.txs.push(Arc::new(tx.clone()));
+                            tx_update.anchors.insert((
+                                ConfirmationBlockTime {
+                                    block_id: BlockId {
+                                        height,
+                                        hash: block_hash,
+                                    },
+                                    confirmation_time: 0,
+                                },
+                                txid,
+                            ));
+
+                            // Load wallet, apply update, and commit
+                            // Use Box::leak to convert &str to &'static str (required by BDK API)
+                            let external_desc_static: &'static str = Box::leak(external_descriptor.to_string().into_boxed_str());
+                            let internal_desc_static: &'static str = Box::leak(internal_descriptor.to_string().into_boxed_str());
+
+                            let mut wallet = bdk_wallet::Wallet::load()
+                                .descriptor(bdk_wallet::KeychainKind::External, Some(external_desc_static))
+                                .descriptor(bdk_wallet::KeychainKind::Internal, Some(internal_desc_static))
+                                .extract_keys()
+                                .check_network(network)
+                                .load_wallet(&mut wallet_write_conn)?
+                                .ok_or_else(|| anyhow::anyhow!("Wallet not found"))?;
+
+                            let update = bdk_wallet::Update {
+                                tx_update,
+                                chain: None,
+                                last_active_indices: Default::default(),
+                            };
+                            wallet.apply_update(update)?;
+                            wallet.persist(&mut wallet_write_conn)?;
+                            drop(wallet);
+                            drop(wallet_write_conn);
+                        }
+
+                        // Update block_height in SNICKER database (scoped)
+                        {
+                            let snicker_update_conn = Connection::open(snicker_db_path)?;
+                            snicker_update_conn.execute(
+                                "UPDATE snicker_utxos SET block_height = ? WHERE txid = ?",
+                                (height, &txid_str),
+                            )?;
+                            drop(snicker_update_conn);
+                        }
+
+                        info!("✅ SNICKER UTXO confirmed and inserted into wallet: {} at height {}", txid, height);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Check for spent SNICKER UTXOs and mark them as spent (static helper)
+    async fn check_spent_snicker_utxos(
+        snicker_db_path: &std::path::Path,
+        wallet_db_path: &std::path::Path,
+    ) -> Result<()> {
+        use bdk_wallet::rusqlite::Connection;
+
+        // Get all unspent SNICKER UTXOs from database
+        let unspent: Vec<(String, u32)> = {
+            let conn = Connection::open(snicker_db_path)?;
+            let mut stmt = conn.prepare(
+                "SELECT txid, vout FROM snicker_utxos WHERE block_height IS NOT NULL AND spent = 0"
+            )?;
+            let mut rows = stmt.query([])?;
+            let mut result = Vec::new();
+            while let Some(row) = rows.next()? {
+                result.push((row.get(0)?, row.get(1)?));
+            }
+            result
+        };
+
+        if unspent.is_empty() {
+            return Ok(());
+        }
+
+        tracing::debug!("🔍 Checking {} unspent SNICKER UTXOs for spending", unspent.len());
+
+        // Open wallet database to check for spending transactions
+        let wallet_conn = Connection::open_with_flags(
+            wallet_db_path,
+            bdk_wallet::rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+
+        // Check each UTXO to see if it's been spent by scanning wallet transactions
+        for (txid_str, vout) in unspent {
+            // Query wallet database for any transaction that spends this outpoint
+            let spending_txid: Result<String, _> = wallet_conn.query_row(
+                "SELECT DISTINCT tx.txid FROM bdk_tx tx
+                 INNER JOIN bdk_txin txin ON tx.id = txin.tx_id
+                 WHERE txin.prev_tx = ?1 AND txin.prev_vout = ?2",
+                (&txid_str, vout),
+                |row| row.get(0),
+            );
+
+            if let Ok(spending_txid_str) = spending_txid {
+                tracing::info!("🔍 SNICKER UTXO {}:{} has been spent in {}", txid_str, vout, spending_txid_str);
+
+                // Mark as spent in SNICKER database
+                let snicker_conn = Connection::open(snicker_db_path)?;
+                snicker_conn.execute(
+                    "UPDATE snicker_utxos SET spent = 1, spent_in_txid = ? WHERE txid = ? AND vout = ?",
+                    (spending_txid_str, &txid_str, vout),
+                )?;
+                tracing::info!("✅ Marked SNICKER UTXO {}:{} as spent", txid_str, vout);
+            }
+        }
+
+        drop(wallet_conn);
+        Ok(())
+    }
+
+    /// Manually insert a transaction into the wallet
     ///
-    /// Used for SNICKER DH operations and tweak validation.
+    /// This is used for SNICKER transactions where the output script is not derived
+    /// from the wallet's descriptor. The transaction will be inserted as confirmed
+    /// at the specified block height, making it appear in balance/listunspent.
     ///
     /// # Arguments
-    /// * `keychain` - External or Internal keychain
+    /// * `tx` - The transaction to insert
+    /// * `block_height` - Block height where the transaction was confirmed
+    pub async fn insert_tx_at_height(
+        &mut self,
+        tx: &Transaction,
+        block_height: u32,
+    ) -> Result<()> {
+        use bdk_wallet::chain::{BlockId, ConfirmationBlockTime};
+        use std::sync::Arc;
+
+        let mut wallet = self.wallet.lock().await;
+        let mut conn = self.conn.lock().await;
+
+        // Get the block hash at this height from the wallet's chain
+        let block_hash = wallet
+            .local_chain()
+            .iter_checkpoints()
+            .find(|cp| cp.height() == block_height)
+            .map(|cp| cp.hash())
+            .ok_or_else(|| anyhow::anyhow!("Block height {} not in wallet's chain", block_height))?;
+
+        // Create a TxUpdate with the transaction anchored at this block
+        let mut tx_update = bdk_wallet::chain::TxUpdate::default();
+        tx_update.txs.push(Arc::new(tx.clone()));
+        tx_update.anchors.insert((
+            ConfirmationBlockTime {
+                block_id: BlockId {
+                    height: block_height,
+                    hash: block_hash,
+                },
+                confirmation_time: 0, // We don't have the actual timestamp
+            },
+            tx.compute_txid(),
+        ));
+
+        // Apply the update to the wallet
+        let update = bdk_wallet::Update {
+            tx_update,
+            chain: None,
+            last_active_indices: Default::default(),
+        };
+        wallet.apply_update(update)?;
+
+        // Commit changes to persist to database
+        wallet.persist(&mut conn)?;
+
+        info!("✅ Manually inserted transaction {} at height {}", tx.compute_txid(), block_height);
+        Ok(())
+    }
+
+    /// Derive the private key for a specific UTXO
+    ///
+    /// # Arguments
+    /// * `keychain` - External or Internal (change)
     /// * `derivation_index` - The derivation index for this key
     ///
     /// # Returns
@@ -1032,13 +1907,11 @@ impl WalletNode {
 }
 
 async fn trace_logs(
-    mut log_rx: Receiver<String>,
     mut info_rx: Receiver<Info>,
     mut warn_rx: UnboundedReceiver<Warning>,
 ) {
     loop {
         select! {
-            log = log_rx.recv() => if let Some(log) = log { tracing::info!("{log}") },
             warn = warn_rx.recv() => if let Some(warn) = warn { tracing::warn!("{warn}") },
             info = info_rx.recv() => if let Some(info) = info { tracing::info!("{info}") },
         }

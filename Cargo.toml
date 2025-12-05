@@ -9,7 +9,7 @@ default = []
 gui = ["iced"]
 
 [dependencies]
-bdk_kyoto = { version = "0.13.1" }
+bdk_kyoto = { version = "0.15.3" }
 bdk_wallet = { version = "2.2.0", features = ["rusqlite", "keys-bip39"] }
 bdk_bitcoind_rpc = "0.15"
 tokio = { version = "1", features = ["full"], default-features = false }
@@ -34,3 +34,6 @@ which = "6"
 base64 = "0.22"
 serde_json = "1"
 hex = "0.4"
+
+[patch.crates-io]
+bdk_kyoto = { path = "/home/waxwing/code/bdk-kyoto-patched" }
