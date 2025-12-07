@@ -51,6 +51,11 @@ impl WalletNode {
     // PUBLIC ENTRY POINTS
     // ============================================================
 
+    /// Get the wallet name
+    pub fn name(&self) -> &str {
+        &self.wallet_name
+    }
+
     /// Generate a new wallet (new mnemonic), persist it, and then load it.
     pub async fn generate(
         name: &str,
@@ -214,7 +219,7 @@ impl WalletNode {
         let external_desc = format!("tr({}/86h/{}h/0h/0/*)", xprv, coin_type);
         let internal_desc = format!("tr({}/86h/{}h/0h/1/*)", xprv, coin_type);
 
-        info!("🔍 Descriptor contains private key: {}", external_desc.contains("prv"));
+        tracing::debug!("Descriptor contains private key: {}", external_desc.contains("prv"));
 
         let mut conn = Connection::open(db_path)?;
         info!("💾 Wallet database path: {:?}", db_path);
@@ -225,7 +230,7 @@ impl WalletNode {
         let external_desc_static: &'static str = Box::leak(external_desc.clone().into_boxed_str());
         let internal_desc_static: &'static str = Box::leak(internal_desc.clone().into_boxed_str());
 
-        info!("🔍 Loading wallet with descriptors and extract_keys():");
+        tracing::debug!("Loading wallet with descriptors and extract_keys()");
         info!("   External: {} chars", external_desc_static.len());
         info!("   Internal: {} chars", internal_desc_static.len());
 
@@ -261,7 +266,7 @@ impl WalletNode {
                 }
             }
 
-            info!("🔧 Ensuring SPK index includes lookahead: External up to {}, Internal up to {}",
+            tracing::debug!("Ensuring SPK index includes lookahead: External up to {}, Internal up to {}",
                 max_external + RECOVERY_LOOKAHEAD, max_internal + RECOVERY_LOOKAHEAD);
 
             // Use peek_address() to ensure scripts are in SPK index WITHOUT advancing derivation index
@@ -278,7 +283,7 @@ impl WalletNode {
             let final_external_index = loaded.derivation_index(KeychainKind::External).unwrap_or(0);
             let final_internal_index = loaded.derivation_index(KeychainKind::Internal).unwrap_or(0);
 
-            info!("✅ SPK index populated with {} external and {} internal scripts",
+            tracing::debug!("SPK index populated with {} external and {} internal scripts",
                 max_external + RECOVERY_LOOKAHEAD + 1, max_internal + RECOVERY_LOOKAHEAD + 1);
             info!("📊 Final derivation indices: External={}, Internal={} (should be unchanged)",
                 final_external_index, final_internal_index);
@@ -296,7 +301,7 @@ impl WalletNode {
                 let _ = new_wallet.peek_address(KeychainKind::Internal, index);
             }
             new_wallet.persist(&mut conn)?;
-            info!("🔧 Derived and persisted {} lookahead scripts", RECOVERY_LOOKAHEAD);
+            tracing::debug!("Derived and persisted {} lookahead scripts", RECOVERY_LOOKAHEAD);
 
             let external_index = new_wallet.derivation_index(KeychainKind::External).unwrap_or(0);
             let internal_index = new_wallet.derivation_index(KeychainKind::Internal).unwrap_or(0);
@@ -386,7 +391,7 @@ impl WalletNode {
             .build_with_wallet(wallet, scan_type)
             .unwrap();
 
-        info!("🔧 Node built - bdk_kyoto 0.15.3 will auto-register wallet scripts");
+        tracing::debug!("Node built - bdk_kyoto 0.15.3 will auto-register wallet scripts");
 
         tokio::spawn(async move {
             if let Err(e) = node.run().await {
@@ -514,14 +519,14 @@ impl WalletNode {
             info!("  witness_utxo: {}", input.witness_utxo.is_some());
             if let Some(ref utxo) = input.witness_utxo {
                 info!("    value: {} sats", utxo.value.to_sat());
-                info!("    script: {}", utxo.script_pubkey);
+                tracing::debug!("    script: {}", utxo.script_pubkey);
             }
             info!("  non_witness_utxo: {}", input.non_witness_utxo.is_some());
             info!("  sighash_type: {:?}", input.sighash_type);
             info!("  tap_internal_key: {:?}", input.tap_internal_key);
             info!("  tap_merkle_root: {:?}", input.tap_merkle_root);
             info!("  tap_key_sig: {:?}", input.tap_key_sig);
-            info!("  tap_script_sigs: {}", input.tap_script_sigs.len());
+            tracing::debug!("  tap_script_sigs: {}", input.tap_script_sigs.len());
             info!("  tap_key_origins: {}", input.tap_key_origins.len());
             for (xonly, (leaf_hashes, (fingerprint, path))) in &input.tap_key_origins {
                 info!("    xonly: {}", xonly);
@@ -531,7 +536,7 @@ impl WalletNode {
             }
             info!("  bip32_derivation: {}", input.bip32_derivation.len());
             info!("  partial_sigs: {}", input.partial_sigs.len());
-            info!("  final_script_witness: {}", input.final_script_witness.is_some());
+            tracing::debug!("  final_script_witness: {}", input.final_script_witness.is_some());
         }
 
         for (i, output) in psbt.outputs.iter().enumerate() {

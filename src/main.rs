@@ -2,6 +2,7 @@ mod manager;
 mod snicker;
 mod cli;
 mod wallet_node;
+mod config;
 
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
@@ -9,14 +10,15 @@ use tracing_subscriber;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use std::fs::OpenOptions;
+use config::Config;
 
 /// CLI arguments
 #[derive(Parser)]
 #[command(author, version, about)]
 struct Args {
-    /// Network to use (regtest, signet, or mainnet)
+    /// Network to use (regtest, signet, or mainnet). Defaults to config file value.
     #[arg(short, long, value_enum)]
-    network: Net,
+    network: Option<Net>,
 
     /// Recovery start height
     #[arg(long, default_value_t = 200_000)]
@@ -50,15 +52,32 @@ impl Net {
             Net::Mainnet => "mainnet",
         }
     }
+
+    fn from_config_network(network: config::Network) -> Self {
+        match network {
+            config::Network::Regtest => Net::Regtest,
+            config::Network::Signet => Net::Signet,
+            config::Network::Mainnet => Net::Mainnet,
+        }
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+
+    // Load configuration
+    let config = Config::load()?;
+    config.validate()?;
+
+    // Use network from CLI args if provided, otherwise from config
+    let network = args.network
+        .unwrap_or_else(|| Net::from_config_network(config.network));
+
     let project_dirs = directories::ProjectDirs
     ::from("org", "code", "ambient").unwrap();
     let log_path = project_dirs.data_local_dir()
-    .join(args.network.as_str()).join( "logs")
+    .join(network.as_str()).join( "logs")
     .join("ambient.log");
     std::fs::create_dir_all(log_path.parent().unwrap())?;
     let log_file = OpenOptions::new()
@@ -73,8 +92,11 @@ async fn main() -> Result<()> {
         .with(tracing_subscriber::filter::LevelFilter::INFO)
         .init();
 
-    // Print log location to stderr so user knows where to find it
+    // Print log and config location to stderr so user knows where to find them
     eprintln!("📝 Logging to: {}", log_path.display());
+    if let Ok(config_path) = config::get_config_path() {
+        eprintln!("⚙️  Config: {}", config_path.display());
+    }
 
     // Prepare RPC configuration (if provided)
     let rpc_config = match (args.rpc_url, args.rpc_user, args.rpc_password) {
@@ -88,7 +110,7 @@ async fn main() -> Result<()> {
     };
 
     // delegate all user interactions to the CLI layer
-    cli::repl(args.network.as_str(), args.recovery_height, rpc_config).await?;
+    cli::repl(network.as_str(), args.recovery_height, rpc_config).await?;
 
     Ok(())
 }

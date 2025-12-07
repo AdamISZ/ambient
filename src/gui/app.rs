@@ -1,114 +1,769 @@
 //! Main Iced application
 
-use iced::{Application, Command, Element, Settings, Theme, executor};
+use iced::{Element, Task, Theme};
+use iced::widget;
 
-use crate::gui::message::{Message, View};
+use crate::gui::message::{Message, ManagerWrapper};
 use crate::gui::state::AppState;
+use crate::config::Config;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 /// Main application struct
 pub struct AmbientApp {
     state: AppState,
+    config: Config,
+    // Active modal dialog (if any)
+    active_modal: Option<crate::gui::modal::Modal>,
+    // Long-lived Tokio runtime for wallet operations
+    tokio_runtime: tokio::runtime::Runtime,
 }
 
-impl Application for AmbientApp {
-    type Message = Message;
-    type Executor = executor::Default;
-    type Flags = ();
-    type Theme = Theme;
+impl AmbientApp {
+    pub fn new() -> (Self, Task<Message>) {
+        // Load configuration (use default if fails)
+        let config = Config::load().unwrap_or_else(|e| {
+            eprintln!("⚠️  Failed to load config: {}", e);
+            eprintln!("    Using default configuration");
+            Config::default()
+        });
 
-    fn new(_flags: Self::Flags) -> (Self, Command<Self::Message>) {
+        // Create long-lived Tokio runtime for wallet operations
+        let tokio_runtime = tokio::runtime::Runtime::new()
+            .expect("Failed to create Tokio runtime");
+
         (
             Self {
                 state: AppState::new(),
+                config,
+                active_modal: None,
+                tokio_runtime,
             },
-            Command::none(),
+            Task::none(),
         )
     }
 
-    fn title(&self) -> String {
+    pub fn title(&self) -> String {
         String::from("Ambient Wallet")
     }
 
-    fn update(&mut self, message: Self::Message) -> Command<Self::Message> {
+    pub fn update(&mut self, message: Message) -> Task<Message> {
+        self.handle_message(message)
+    }
+
+    pub fn view(&self) -> Element<Message> {
+        self.render_view()
+    }
+
+    pub fn theme(&self) -> Theme {
+        Theme::Dark
+    }
+
+    pub fn subscription(&self) -> iced::Subscription<Message> {
+        use std::time::{Duration, Instant};
+        use iced::futures::StreamExt;
+
+        // Only poll balance when wallet is loaded
+        match &self.state {
+            AppState::WalletLoaded { .. } => {
+                // Create a stream that emits every 2 seconds
+                // Use futures::stream::unfold with manual timing
+                iced::Subscription::run_with_id(
+                    "balance_poller",
+                    iced::futures::stream::unfold(Instant::now(), |last_tick| async move {
+                        // Calculate time until next tick
+                        let now = Instant::now();
+                        let elapsed = now.duration_since(last_tick);
+                        let interval = Duration::from_secs(2);
+
+                        if elapsed < interval {
+                            // Sleep using async-std which is runtime-agnostic
+                            async_std::task::sleep(interval - elapsed).await;
+                        }
+
+                        let next_tick = Instant::now();
+                        Some((Message::SyncRequested, next_tick))
+                    })
+                )
+            }
+            _ => iced::Subscription::none()
+        }
+    }
+
+    fn handle_message(&mut self, message: Message) -> Task<Message> {
         match message {
+            Message::OpenModal(modal) => {
+                self.active_modal = Some(modal);
+                Task::none()
+            }
+
+            Message::CloseModal => {
+                self.active_modal = None;
+                Task::none()
+            }
+
+            Message::MenuOpenWallet => {
+                // TODO: Show file dialog to open wallet
+                println!("Menu: Open Wallet clicked");
+                Task::none()
+            }
+
+            Message::MenuSettings => {
+                // Open settings modal
+                let modal = crate::gui::modal::Modal::Settings {
+                    edited_config: self.config.clone(),
+                };
+                self.active_modal = Some(modal);
+                Task::none()
+            }
+
+            Message::MenuExit => {
+                // Exit the application
+                println!("Menu: Exit clicked");
+                std::process::exit(0);
+            }
+
             Message::WalletSelected(name) => {
                 // TODO: Load wallet
                 println!("Loading wallet: {}", name);
-                Command::none()
+                Task::none()
             }
 
             Message::CreateWalletRequested => {
-                // TODO: Show create wallet screen
-                println!("Create wallet requested");
-                Command::none()
+                // Open wallet generation wizard modal
+                let modal = crate::gui::modal::Modal::GenerateWallet {
+                    step: crate::gui::modal::GenerateWalletStep::EnterName,
+                    data: crate::gui::modal::GenerateWalletData::new(
+                        self.config.network.as_str().to_string()
+                    ),
+                };
+                self.active_modal = Some(modal);
+                Task::none()
+            }
+
+            Message::WalletNameChanged(name) => {
+                // Update wallet name in modal data
+                if let Some(crate::gui::modal::Modal::GenerateWallet { data, .. }) = &mut self.active_modal {
+                    data.wallet_name = name;
+                }
+                Task::none()
+            }
+
+            Message::GenerateWalletRequested => {
+                // Get the wallet name and network from modal
+                if let Some(crate::gui::modal::Modal::GenerateWallet { data, .. }) = &self.active_modal {
+                    let name = data.wallet_name.clone();
+                    let network = data.network.clone();
+                    let recovery_height = self.config.recovery_height;
+                    let rt_handle = self.tokio_runtime.handle().clone();
+
+                    // Validate wallet name
+                    if name.is_empty() {
+                        eprintln!("❌ Wallet name cannot be empty");
+                        return Task::none();
+                    }
+
+                    println!("🪄 Generating wallet '{}' (recovery_height: {})...", name, recovery_height);
+
+                    // Spawn async task to generate wallet using the LONG-LIVED Tokio runtime
+                    // This ensures background auto-sync tasks continue running
+                    return Task::perform(
+                        async move {
+                            rt_handle.spawn(async move {
+                                match crate::manager::Manager::generate(&name, &network, recovery_height).await {
+                                    Ok((_manager, mnemonic)) => {
+                                        // Manager is dropped here, wallet is already saved to disk
+                                        Ok((name.clone(), mnemonic.to_string()))
+                                    }
+                                    Err(e) => Err(format!("Failed to generate wallet: {}", e))
+                                }
+                            }).await.unwrap()
+                        },
+                        Message::WalletGenerated
+                    );
+                }
+                Task::none()
+            }
+
+            Message::WalletGenerated(result) => {
+                match result {
+                    Ok((wallet_name, mnemonic)) => {
+                        // Update modal to show mnemonic step
+                        if let Some(crate::gui::modal::Modal::GenerateWallet { step, data }) = &mut self.active_modal {
+                            *step = crate::gui::modal::GenerateWalletStep::DisplayMnemonic;
+                            data.mnemonic = Some(mnemonic);
+                            println!("✅ Wallet '{}' generated successfully", wallet_name);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("❌ Wallet generation failed: {}", e);
+                        // Close modal and show error
+                        self.active_modal = None;
+                        self.state = AppState::Error {
+                            message: e,
+                        };
+                    }
+                }
+                Task::none()
+            }
+
+            Message::WalletGenerationConfirmed => {
+                // User has confirmed they saved the mnemonic
+                // Load the wallet we just created
+                if let Some(crate::gui::modal::Modal::GenerateWallet { data, .. }) = &self.active_modal {
+                    let name = data.wallet_name.clone();
+
+                    // Close the modal
+                    self.active_modal = None;
+
+                    println!("Loading generated wallet '{}'...", name);
+                    return Task::done(Message::LoadWalletRequested(name));
+                }
+                Task::none()
+            }
+
+            Message::LoadWalletRequested(wallet_name) => {
+                // Load a wallet from disk
+                let network = self.config.network.as_str().to_string();
+                let name = wallet_name.clone();
+                let recovery_height = self.config.recovery_height;
+                let rt_handle = self.tokio_runtime.handle().clone();
+
+                println!("📁 Loading wallet '{}' (recovery_height: {})...", name, recovery_height);
+
+                // Spawn async task to load wallet using the LONG-LIVED Tokio runtime
+                // This ensures background auto-sync tasks continue running
+                Task::perform(
+                    async move {
+                        rt_handle.spawn(async move {
+                            crate::manager::Manager::load(&name, &network, recovery_height).await
+                        }).await.unwrap()
+                    },
+                    move |result| match result {
+                        Ok(manager) => {
+                            let name = wallet_name.clone();
+                            let wrapper = ManagerWrapper(Arc::new(Some(manager)));
+                            Message::WalletLoadComplete(Ok((name, wrapper)))
+                        }
+                        Err(e) => Message::WalletLoadComplete(Err(format!("Failed to load wallet: {}", e))),
+                    }
+                )
+            }
+
+            Message::WalletLoadComplete(result) => {
+                match result {
+                    Ok((wallet_name, manager_wrapper)) => {
+                        // Extract the manager from the wrapper
+                        let manager = Arc::try_unwrap(manager_wrapper.0)
+                            .ok()
+                            .and_then(|opt| opt)
+                            .expect("Failed to unwrap manager");
+
+                        println!("✅ Wallet '{}' loaded", wallet_name);
+
+                        // Wrap manager in Arc<Mutex<>> for shared mutable access
+                        let manager = Arc::new(Mutex::new(manager));
+
+                        // Transition to WalletLoaded state
+                        self.state = AppState::WalletLoaded {
+                            manager,
+                            wallet_data: crate::gui::state::WalletData::default(),
+                        };
+
+                        // Fetch initial balance
+                        return Task::done(Message::SyncRequested);
+                    }
+                    Err(e) => {
+                        eprintln!("❌ Failed to load wallet: {}", e);
+                        self.state = AppState::Error {
+                            message: e,
+                        };
+                    }
+                }
+                Task::none()
             }
 
             Message::ViewChanged(view) => {
-                // TODO: Change view
-                println!("View changed to: {:?}", view);
-                Command::none()
+                // ViewChanged is deprecated - tabs are now handled within WalletData
+                // Settings is now a modal, not a view
+                // TODO: Remove this message variant or repurpose for tab changes
+                println!("ViewChanged message is deprecated: {:?}", view);
+                Task::none()
+            }
+
+            Message::SettingsNetworkChanged(network_str) => {
+                if let Some(crate::gui::modal::Modal::Settings { edited_config }) = &mut self.active_modal {
+                    if let Ok(network) = network_str.parse() {
+                        edited_config.network = network;
+                    }
+                }
+                Task::none()
+            }
+
+            Message::SettingsPeerChanged(peer) => {
+                if let Some(crate::gui::modal::Modal::Settings { edited_config }) = &mut self.active_modal {
+                    edited_config.peer = if peer.is_empty() {
+                        None
+                    } else {
+                        Some(peer)
+                    };
+                }
+                Task::none()
+            }
+
+            Message::SettingsWalletDirChanged(dir) => {
+                if let Some(crate::gui::modal::Modal::Settings { edited_config }) = &mut self.active_modal {
+                    edited_config.wallet_dir = std::path::PathBuf::from(dir);
+                }
+                Task::none()
+            }
+
+            Message::SettingsRecoveryHeightChanged(height_str) => {
+                if let Some(crate::gui::modal::Modal::Settings { edited_config }) = &mut self.active_modal {
+                    if let Ok(height) = height_str.parse::<u32>() {
+                        edited_config.recovery_height = height;
+                    }
+                }
+                Task::none()
+            }
+
+            Message::SettingsSave => {
+                if let Some(crate::gui::modal::Modal::Settings { edited_config }) = &self.active_modal {
+                    match edited_config.validate() {
+                        Ok(_) => {
+                            match edited_config.save() {
+                                Ok(_) => {
+                                    self.config = edited_config.clone();
+                                    self.active_modal = None;
+                                    println!("✅ Settings saved successfully");
+                                }
+                                Err(e) => {
+                                    eprintln!("❌ Failed to save settings: {}", e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("❌ Invalid settings: {}", e);
+                        }
+                    }
+                }
+                Task::none()
+            }
+
+            Message::SettingsSaved(_result) => {
+                // TODO: Handle save result (show success/error message)
+                Task::none()
+            }
+
+            Message::WizardStepChanged(new_step) => {
+                // Update the wizard step in the modal
+                if let Some(crate::gui::modal::Modal::GenerateWallet { step, .. }) = &mut self.active_modal {
+                    *step = new_step;
+                }
+                Task::none()
+            }
+
+            Message::WizardNextStep => {
+                // Move to next wizard step
+                if let Some(crate::gui::modal::Modal::GenerateWallet { step, .. }) = &mut self.active_modal {
+                    *step = match step {
+                        crate::gui::modal::GenerateWalletStep::EnterName =>
+                            crate::gui::modal::GenerateWalletStep::ReviewAndGenerate,
+                        crate::gui::modal::GenerateWalletStep::ReviewAndGenerate =>
+                            crate::gui::modal::GenerateWalletStep::DisplayMnemonic,
+                        crate::gui::modal::GenerateWalletStep::DisplayMnemonic =>
+                            crate::gui::modal::GenerateWalletStep::VerifyMnemonic,
+                        crate::gui::modal::GenerateWalletStep::VerifyMnemonic =>
+                            crate::gui::modal::GenerateWalletStep::Complete,
+                        crate::gui::modal::GenerateWalletStep::Complete =>
+                            crate::gui::modal::GenerateWalletStep::Complete, // Stay at complete
+                    };
+                }
+                Task::none()
+            }
+
+            Message::WizardPreviousStep => {
+                // Move to previous wizard step
+                if let Some(crate::gui::modal::Modal::GenerateWallet { step, .. }) = &mut self.active_modal {
+                    *step = match step {
+                        crate::gui::modal::GenerateWalletStep::EnterName =>
+                            crate::gui::modal::GenerateWalletStep::EnterName, // Stay at first
+                        crate::gui::modal::GenerateWalletStep::ReviewAndGenerate =>
+                            crate::gui::modal::GenerateWalletStep::EnterName,
+                        crate::gui::modal::GenerateWalletStep::DisplayMnemonic =>
+                            crate::gui::modal::GenerateWalletStep::ReviewAndGenerate,
+                        crate::gui::modal::GenerateWalletStep::VerifyMnemonic =>
+                            crate::gui::modal::GenerateWalletStep::DisplayMnemonic,
+                        crate::gui::modal::GenerateWalletStep::Complete =>
+                            crate::gui::modal::GenerateWalletStep::VerifyMnemonic,
+                    };
+                }
+                Task::none()
+            }
+
+            Message::TabChanged(new_tab) => {
+                // Change the active tab in WalletLoaded state
+                if let AppState::WalletLoaded { wallet_data, .. } = &mut self.state {
+                    wallet_data.current_tab = new_tab;
+                }
+                Task::none()
+            }
+
+            Message::CopyToClipboard(text) => {
+                println!("📋 Copied to clipboard: {}", text);
+                iced::clipboard::write(text)
+            }
+
+            Message::NewAddressRequested => {
+                // Generate a new address
+                if let AppState::WalletLoaded { manager, .. } = &self.state {
+                    let manager_clone = manager.clone();
+                    let rt_handle = self.tokio_runtime.handle().clone();
+
+                    return Task::perform(
+                        async move {
+                            rt_handle.spawn(async move {
+                                let mut manager = manager_clone.lock().await;
+                                manager.get_next_address().await
+                            }).await.unwrap()
+                        },
+                        |result| match result {
+                            Ok(addr_str) => {
+                                match addr_str.parse::<bdk_wallet::bitcoin::Address<bdk_wallet::bitcoin::address::NetworkUnchecked>>() {
+                                    Ok(addr) => Message::AddressGenerated(addr.assume_checked()),
+                                    Err(e) => {
+                                        eprintln!("❌ Failed to parse address: {}", e);
+                                        Message::Placeholder
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("❌ Failed to generate address: {}", e);
+                                Message::Placeholder
+                            }
+                        }
+                    );
+                }
+                Task::none()
+            }
+
+            Message::AddressGenerated(address) => {
+                // Store the generated address
+                if let AppState::WalletLoaded { wallet_data, .. } = &mut self.state {
+                    wallet_data.last_address = Some(address.to_string());
+                    println!("✅ Generated address: {}", address);
+                }
+                Task::none()
+            }
+
+            Message::SyncRequested => {
+                // Trigger wallet sync and balance update
+                // Called both manually (button) and automatically (subscription)
+                if let AppState::WalletLoaded { manager, wallet_data } = &mut self.state {
+                    // Don't spam logs for automatic polls
+                    wallet_data.is_syncing = true;
+
+                    let manager_clone = manager.clone();
+                    let rt_handle = self.tokio_runtime.handle().clone();
+
+                    return Task::perform(
+                        async move {
+                            rt_handle.spawn(async move {
+                                let manager = manager_clone.lock().await;
+                                manager.get_balance().await
+                            }).await.unwrap()
+                        },
+                        |result| match result {
+                            Ok(balance_str) => {
+                                // Parse balance string to Amount
+                                // get_balance returns a formatted string like "12345 sats"
+                                // Parse the satoshi value directly
+                                if let Some(sats_part) = balance_str.split_whitespace().next() {
+                                    if let Ok(sats) = sats_part.parse::<u64>() {
+                                        Message::BalanceUpdated(bdk_wallet::bitcoin::Amount::from_sat(sats))
+                                    } else {
+                                        eprintln!("❌ Failed to parse balance: {}", balance_str);
+                                        Message::Placeholder
+                                    }
+                                } else {
+                                    eprintln!("❌ Invalid balance format: {}", balance_str);
+                                    Message::Placeholder
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("❌ Failed to fetch balance: {}", e);
+                                Message::Placeholder
+                            }
+                        }
+                    );
+                }
+                Task::none()
+            }
+
+            Message::BalanceUpdated(amount) => {
+                // Update the displayed balance
+                if let AppState::WalletLoaded { wallet_data, .. } = &mut self.state {
+                    // Only log if balance actually changed
+                    if wallet_data.balance != amount {
+                        println!("💰 Balance updated: {} → {}", wallet_data.balance, amount);
+                    }
+                    wallet_data.balance = amount;
+                    wallet_data.is_syncing = false;
+                }
+                Task::none()
+            }
+
+            Message::SendAddressChanged(address) => {
+                if let AppState::WalletLoaded { wallet_data, .. } = &mut self.state {
+                    wallet_data.send_address = address;
+                }
+                Task::none()
+            }
+
+            Message::SendAmountChanged(amount) => {
+                if let AppState::WalletLoaded { wallet_data, .. } = &mut self.state {
+                    wallet_data.send_amount = amount;
+                }
+                Task::none()
+            }
+
+            Message::SendFeeRateChanged(fee_rate) => {
+                if let AppState::WalletLoaded { wallet_data, .. } = &mut self.state {
+                    wallet_data.send_fee_rate = fee_rate;
+                }
+                Task::none()
+            }
+
+            Message::SendRequested => {
+                // Validate and send transaction
+                if let AppState::WalletLoaded { manager, wallet_data } = &mut self.state {
+                    let address = wallet_data.send_address.clone();
+                    let amount_str = wallet_data.send_amount.clone();
+                    let fee_rate_str = wallet_data.send_fee_rate.clone();
+
+                    // Basic validation
+                    if address.is_empty() {
+                        eprintln!("❌ Address cannot be empty");
+                        return Task::none();
+                    }
+                    if amount_str.is_empty() {
+                        eprintln!("❌ Amount cannot be empty");
+                        return Task::none();
+                    }
+
+                    // Parse amount (expecting BTC value like "0.001")
+                    let amount_sats = match amount_str.parse::<f64>() {
+                        Ok(btc) => {
+                            if btc <= 0.0 {
+                                eprintln!("❌ Amount must be positive");
+                                return Task::none();
+                            }
+                            (btc * 100_000_000.0) as u64
+                        }
+                        Err(_) => {
+                            eprintln!("❌ Invalid amount: {}", amount_str);
+                            return Task::none();
+                        }
+                    };
+
+                    // Parse fee rate
+                    let fee_rate = match fee_rate_str.parse::<f32>() {
+                        Ok(rate) => {
+                            if rate <= 0.0 {
+                                eprintln!("❌ Fee rate must be positive");
+                                return Task::none();
+                            }
+                            rate
+                        }
+                        Err(_) => {
+                            eprintln!("❌ Invalid fee rate: {}", fee_rate_str);
+                            return Task::none();
+                        }
+                    };
+
+                    println!("📤 Sending transaction:");
+                    println!("   To: {}", address);
+                    println!("   Amount: {} sats ({} BTC)", amount_sats, amount_str);
+                    println!("   Fee rate: {} sat/vB", fee_rate);
+
+                    let manager_clone = manager.clone();
+                    let rt_handle = self.tokio_runtime.handle().clone();
+
+                    return Task::perform(
+                        async move {
+                            rt_handle.spawn(async move {
+                                let mut manager = manager_clone.lock().await;
+                                manager.send_to_address(&address, amount_sats, fee_rate).await
+                            }).await.unwrap()
+                        },
+                        |result| match result {
+                            Ok(txid) => Message::TransactionSent(Ok(txid)),
+                            Err(e) => Message::TransactionSent(Err(e.to_string())),
+                        }
+                    );
+                }
+                Task::none()
+            }
+
+            Message::TransactionSent(result) => {
+                match result {
+                    Ok(txid) => {
+                        println!("✅ Transaction sent successfully!");
+                        println!("   Txid: {}", txid);
+
+                        // Clear the send form
+                        if let AppState::WalletLoaded { wallet_data, .. } = &mut self.state {
+                            wallet_data.send_address.clear();
+                            wallet_data.send_amount.clear();
+                        }
+
+                        // Trigger balance update
+                        Task::done(Message::SyncRequested)
+                    }
+                    Err(e) => {
+                        eprintln!("❌ Failed to send transaction: {}", e);
+                        Task::none()
+                    }
+                }
+            }
+
+            Message::SnickerScanRequested => {
+                if let AppState::WalletLoaded { manager, .. } = &self.state {
+                    println!("🔍 Scanning for SNICKER candidates...");
+
+                    let manager_clone = manager.clone();
+                    let rt_handle = self.tokio_runtime.handle().clone();
+
+                    return Task::perform(
+                        async move {
+                            rt_handle.spawn(async move {
+                                let manager = manager_clone.lock().await;
+                                // Scan last 100 blocks for taproot UTXOs between 10k-1BTC sats
+                                manager.scan_for_snicker_candidates(100, 10_000, 100_000_000).await
+                            }).await.unwrap()
+                        },
+                        |result| match result {
+                            Ok(count) => Message::SnickerScanCompleted(Ok(count)),
+                            Err(e) => Message::SnickerScanCompleted(Err(e.to_string())),
+                        }
+                    );
+                }
+                Task::none()
+            }
+
+            Message::SnickerScanCompleted(result) => {
+                match result {
+                    Ok(count) => {
+                        println!("✅ SNICKER scan completed: found {} candidates", count);
+
+                        // Update the candidates count in state
+                        if let AppState::WalletLoaded { wallet_data, .. } = &mut self.state {
+                            wallet_data.snicker_candidates = count;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("❌ SNICKER scan failed: {}", e);
+                    }
+                }
+                Task::none()
+            }
+
+            Message::SnickerFindOpportunities => {
+                if let AppState::WalletLoaded { manager, .. } = &self.state {
+                    println!("🔍 Finding SNICKER opportunities...");
+
+                    let manager_clone = manager.clone();
+                    let rt_handle = self.tokio_runtime.handle().clone();
+
+                    return Task::perform(
+                        async move {
+                            rt_handle.spawn(async move {
+                                let manager = manager_clone.lock().await;
+                                // Find opportunities for our UTXOs >= 10k sats
+                                manager.find_snicker_opportunities(10_000).await
+                            }).await.unwrap()
+                        },
+                        |result| match result {
+                            Ok(opportunities) => Message::SnickerOpportunitiesFound(opportunities.len()),
+                            Err(e) => {
+                                eprintln!("❌ Failed to find opportunities: {}", e);
+                                Message::SnickerOpportunitiesFound(0)
+                            }
+                        }
+                    );
+                }
+                Task::none()
+            }
+
+            Message::SnickerOpportunitiesFound(count) => {
+                println!("✅ Found {} SNICKER opportunities", count);
+
+                // Update the opportunities count in state
+                if let AppState::WalletLoaded { wallet_data, .. } = &mut self.state {
+                    wallet_data.snicker_opportunities = count;
+                }
+                Task::none()
             }
 
             Message::Placeholder => {
                 // No-op for now
-                Command::none()
+                Task::none()
             }
 
             _ => {
                 // TODO: Implement other message handlers
                 println!("Unhandled message: {:?}", message);
-                Command::none()
+                Task::none()
             }
         }
     }
 
-    fn view(&self) -> Element<Self::Message> {
-        use iced::widget::{column, container, text};
+    fn render_view(&self) -> Element<Message> {
+        use widget::{column, container, text, button};
+        use iced::Length;
 
-        let content = match &self.state {
-            AppState::WalletSelection { available_wallets } => {
-                column![
-                    text("Ambient Wallet").size(32),
-                    text("Select or create a wallet").size(16),
-                    text(format!("Found {} wallets", available_wallets.len())),
-                ]
-                .spacing(20)
+        // Main content (persistent views based on state)
+        let main_view = match &self.state {
+            AppState::NoWallet { available_wallets } => {
+                crate::gui::views::no_wallet::view(available_wallets)
             }
 
-            AppState::CreatingWallet { wallet_name, .. } => {
-                column![
-                    text("Create New Wallet").size(32),
-                    text(format!("Wallet name: {}", wallet_name)),
-                ]
-                .spacing(20)
-            }
-
-            AppState::WalletLoaded { wallet_data, .. } => {
-                column![
-                    text("Wallet Loaded").size(32),
-                    text(format!("Balance: {}", wallet_data.balance)),
-                ]
-                .spacing(20)
+            AppState::WalletLoaded { manager, wallet_data } => {
+                crate::gui::views::wallet_loaded::view(manager, wallet_data)
             }
 
             AppState::Error { message } => {
-                column![
-                    text("Error").size(32),
-                    text(message),
-                ]
-                .spacing(20)
+                let message = message.clone();
+                container(
+                    column![
+                        text("Error").size(32),
+                        text(message),
+                        button("Close").on_press(Message::CloseModal).padding(10),
+                    ]
+                    .spacing(20)
+                    .padding(40)
+                )
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill)
+                .into()
             }
         };
 
-        container(content)
-            .width(iced::Length::Fill)
-            .height(iced::Length::Fill)
-            .center_x()
-            .center_y()
-            .into()
+        // Overlay modal if active
+        if let Some(ref modal) = self.active_modal {
+            crate::gui::widgets::modal_overlay(main_view, modal.render())
+        } else {
+            main_view
+        }
     }
+}
 
-    fn theme(&self) -> Self::Theme {
-        Theme::Dark
+// Implement the required traits for running the application
+impl Default for AmbientApp {
+    fn default() -> Self {
+        let (app, _) = Self::new();
+        app
     }
 }

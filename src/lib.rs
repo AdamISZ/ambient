@@ -7,6 +7,7 @@ pub mod manager;
 pub mod snicker;
 pub mod wallet_node;
 pub mod cli;
+pub mod config;
 
 // GUI module - only include if iced feature is enabled
 #[cfg(feature = "gui")]

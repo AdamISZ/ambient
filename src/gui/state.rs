@@ -1,26 +1,21 @@
 //! Application state management
 
 use crate::manager::Manager;
-use crate::gui::message::View;
 use bdk_wallet::bitcoin::Amount;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
-/// Root application state
+/// Root application state - simplified to persistent states only
+/// Transient operations (like wallet creation) are handled by modals
 pub enum AppState {
-    /// Selecting or creating a wallet
-    WalletSelection {
+    /// No wallet loaded - showing landing page
+    NoWallet {
         available_wallets: Vec<String>,
     },
 
-    /// Creating a new wallet
-    CreatingWallet {
-        wallet_name: String,
-        mnemonic: Option<String>,
-    },
-
-    /// Main wallet view with loaded wallet
+    /// Wallet loaded and active
     WalletLoaded {
-        manager: Manager,
-        current_view: View,
+        manager: Arc<Mutex<Manager>>,
         wallet_data: WalletData,
     },
 
@@ -30,8 +25,19 @@ pub enum AppState {
     },
 }
 
+/// Tab selection within the wallet view
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalletTab {
+    Overview,
+    Send,
+    Receive,
+    Transactions,
+    Snicker,
+}
+
 /// Data associated with a loaded wallet
 pub struct WalletData {
+    pub current_tab: WalletTab,
     pub balance: Amount,
     pub last_address: Option<String>,
     pub is_syncing: bool,
@@ -49,6 +55,7 @@ pub struct WalletData {
 impl Default for WalletData {
     fn default() -> Self {
         Self {
+            current_tab: WalletTab::Overview,
             balance: Amount::ZERO,
             last_address: None,
             is_syncing: false,
@@ -64,7 +71,7 @@ impl Default for WalletData {
 impl AppState {
     /// Create initial state
     pub fn new() -> Self {
-        AppState::WalletSelection {
+        AppState::NoWallet {
             available_wallets: Vec::new(), // TODO: Load from disk
         }
     }
