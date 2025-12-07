@@ -51,6 +51,9 @@ pub fn view(manager: &Arc<Mutex<Manager>>, data: &WalletData) -> Element<'static
 
                 // Menu buttons
                 row![
+                    button("Close Wallet")
+                        .on_press(Message::MenuCloseWallet)
+                        .padding(8),
                     button("Settings")
                         .on_press(Message::MenuSettings)
                         .padding(8),
@@ -95,6 +98,7 @@ fn view_overview(wallet_name: &str, data: &WalletData) -> Element<'static, Messa
     } else {
         "Synced"
     };
+    let utxos = data.utxos.clone();
 
     column![
         text("Wallet Overview").size(32),
@@ -146,6 +150,29 @@ fn view_overview(wallet_name: &str, data: &WalletData) -> Element<'static, Messa
                 .padding(15)
             } else {
                 container(text(""))
+                    .padding(15)
+            }
+        },
+
+        // UTXOs section
+        {
+            if utxos.is_empty() {
+                container(
+                    text("No unspent outputs").size(14)
+                )
+                .padding(15)
+            } else {
+                let mut utxo_list = column![
+                    text(format!("Unspent Outputs ({})", utxos.len())).size(18),
+                ].spacing(5);
+
+                for utxo in utxos {
+                    utxo_list = utxo_list.push(
+                        text(utxo).size(12)
+                    );
+                }
+
+                container(utxo_list)
                     .padding(15)
             }
         },

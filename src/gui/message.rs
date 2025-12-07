@@ -47,6 +47,10 @@ pub enum Message {
     SyncRequested,
     SyncCompleted,
     BalanceUpdated(Amount),
+    WalletDataUpdated {
+        balance: Option<Amount>,
+        utxos: Vec<String>,
+    },
 
     // Send transaction
     SendAddressChanged(String),
@@ -74,6 +78,7 @@ pub enum Message {
 
     // Menu actions
     MenuOpenWallet,
+    MenuCloseWallet,
     MenuSettings,
     MenuExit,
 

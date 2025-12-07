@@ -50,6 +50,9 @@ pub struct WalletData {
     // SNICKER state
     pub snicker_candidates: usize,
     pub snicker_opportunities: usize,
+
+    // Display cache (updated periodically from wallet)
+    pub utxos: Vec<String>,
 }
 
 impl Default for WalletData {
@@ -64,6 +67,7 @@ impl Default for WalletData {
             send_fee_rate: String::from("1.0"),
             snicker_candidates: 0,
             snicker_opportunities: 0,
+            utxos: Vec::new(),
         }
     }
 }

@@ -5,6 +5,7 @@ use iced::widget;
 
 use crate::gui::message::{Message, ManagerWrapper};
 use crate::gui::state::AppState;
+use crate::gui::modal::Modal;
 use crate::config::Config;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -103,8 +104,52 @@ impl AmbientApp {
             }
 
             Message::MenuOpenWallet => {
-                // TODO: Show file dialog to open wallet
+                // Scan for available wallets and show modal
                 println!("Menu: Open Wallet clicked");
+
+                // Scan wallet directory for existing wallets
+                let wallet_dir = self.config.network_wallet_dir();
+                let available_wallets = std::fs::read_dir(&wallet_dir)
+                    .ok()
+                    .map(|entries| {
+                        entries
+                            .filter_map(|e| e.ok())
+                            .filter(|e| e.file_type().ok().map(|t| t.is_dir()).unwrap_or(false))
+                            .filter_map(|e| e.file_name().into_string().ok())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+
+                self.active_modal = Some(crate::gui::modal::Modal::OpenWallet {
+                    available_wallets,
+                    selected: None,
+                });
+
+                Task::none()
+            }
+
+            Message::MenuCloseWallet => {
+                // Close current wallet and return to wallet list
+                println!("Menu: Close Wallet clicked");
+
+                // Scan for available wallets
+                let wallet_dir = self.config.network_wallet_dir();
+                let available_wallets = std::fs::read_dir(&wallet_dir)
+                    .ok()
+                    .map(|entries| {
+                        entries
+                            .filter_map(|e| e.ok())
+                            .filter(|e| e.file_type().ok().map(|t| t.is_dir()).unwrap_or(false))
+                            .filter_map(|e| e.file_name().into_string().ok())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+
+                // Transition back to NoWallet state
+                self.state = AppState::NoWallet {
+                    available_wallets,
+                };
+
                 Task::none()
             }
 
@@ -124,8 +169,10 @@ impl AmbientApp {
             }
 
             Message::WalletSelected(name) => {
-                // TODO: Load wallet
-                println!("Loading wallet: {}", name);
+                // Update selected wallet in the OpenWallet modal
+                if let Some(Modal::OpenWallet { available_wallets, selected }) = &mut self.active_modal {
+                    *selected = Some(name);
+                }
                 Task::none()
             }
 
@@ -269,6 +316,9 @@ impl AmbientApp {
                             manager,
                             wallet_data: crate::gui::state::WalletData::default(),
                         };
+
+                        // Close the modal
+                        self.active_modal = None;
 
                         // Fetch initial balance
                         return Task::done(Message::SyncRequested);
@@ -457,10 +507,9 @@ impl AmbientApp {
             }
 
             Message::SyncRequested => {
-                // Trigger wallet sync and balance update
+                // Trigger wallet sync - fetch balance and UTXOs
                 // Called both manually (button) and automatically (subscription)
                 if let AppState::WalletLoaded { manager, wallet_data } = &mut self.state {
-                    // Don't spam logs for automatic polls
                     wallet_data.is_syncing = true;
 
                     let manager_clone = manager.clone();
@@ -470,30 +519,43 @@ impl AmbientApp {
                         async move {
                             rt_handle.spawn(async move {
                                 let manager = manager_clone.lock().await;
-                                manager.get_balance().await
+                                let balance = manager.get_balance().await;
+                                let utxos = manager.list_unspent().await;
+                                (balance, utxos)
                             }).await.unwrap()
                         },
-                        |result| match result {
-                            Ok(balance_str) => {
-                                // Parse balance string to Amount
-                                // get_balance returns a formatted string like "12345 sats"
-                                // Parse the satoshi value directly
-                                if let Some(sats_part) = balance_str.split_whitespace().next() {
-                                    if let Ok(sats) = sats_part.parse::<u64>() {
-                                        Message::BalanceUpdated(bdk_wallet::bitcoin::Amount::from_sat(sats))
+                        |(balance_result, utxos_result)| {
+                            // Parse balance
+                            let balance = match balance_result {
+                                Ok(balance_str) => {
+                                    if let Some(sats_part) = balance_str.split_whitespace().next() {
+                                        if let Ok(sats) = sats_part.parse::<u64>() {
+                                            Some(bdk_wallet::bitcoin::Amount::from_sat(sats))
+                                        } else {
+                                            eprintln!("❌ Failed to parse balance: {}", balance_str);
+                                            None
+                                        }
                                     } else {
-                                        eprintln!("❌ Failed to parse balance: {}", balance_str);
-                                        Message::Placeholder
+                                        eprintln!("❌ Invalid balance format: {}", balance_str);
+                                        None
                                     }
-                                } else {
-                                    eprintln!("❌ Invalid balance format: {}", balance_str);
-                                    Message::Placeholder
                                 }
-                            }
-                            Err(e) => {
-                                eprintln!("❌ Failed to fetch balance: {}", e);
-                                Message::Placeholder
-                            }
+                                Err(e) => {
+                                    eprintln!("❌ Failed to fetch balance: {}", e);
+                                    None
+                                }
+                            };
+
+                            // Get UTXOs
+                            let utxos = match utxos_result {
+                                Ok(list) => list,
+                                Err(e) => {
+                                    eprintln!("❌ Failed to fetch UTXOs: {}", e);
+                                    Vec::new()
+                                }
+                            };
+
+                            Message::WalletDataUpdated { balance, utxos }
                         }
                     );
                 }
@@ -501,13 +563,31 @@ impl AmbientApp {
             }
 
             Message::BalanceUpdated(amount) => {
-                // Update the displayed balance
+                // Update the displayed balance (legacy - use WalletDataUpdated instead)
                 if let AppState::WalletLoaded { wallet_data, .. } = &mut self.state {
                     // Only log if balance actually changed
                     if wallet_data.balance != amount {
                         println!("💰 Balance updated: {} → {}", wallet_data.balance, amount);
                     }
                     wallet_data.balance = amount;
+                    wallet_data.is_syncing = false;
+                }
+                Task::none()
+            }
+
+            Message::WalletDataUpdated { balance, utxos } => {
+                // Update balance and UTXOs together
+                if let AppState::WalletLoaded { wallet_data, .. } = &mut self.state {
+                    // Update balance if provided
+                    if let Some(amount) = balance {
+                        if wallet_data.balance != amount {
+                            println!("💰 Balance updated: {} → {}", wallet_data.balance, amount);
+                        }
+                        wallet_data.balance = amount;
+                    }
+
+                    // Update UTXOs
+                    wallet_data.utxos = utxos;
                     wallet_data.is_syncing = false;
                 }
                 Task::none()

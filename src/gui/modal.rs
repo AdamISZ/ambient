@@ -66,14 +66,7 @@ impl Modal {
                 crate::gui::views::modals::settings_dialog::view(edited_config)
             }
             Modal::OpenWallet { available_wallets, selected } => {
-                // TODO: Implement open wallet dialog
-                use iced::widget::{text, container};
-                use iced::Length;
-
-                container(text("Open Wallet Dialog (TODO)"))
-                    .width(Length::Fixed(400.0))
-                    .height(Length::Fixed(300.0))
-                    .into()
+                crate::gui::views::modals::open_wallet_dialog::view(available_wallets, selected)
             }
         }
     }
