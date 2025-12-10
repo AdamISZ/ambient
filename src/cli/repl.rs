@@ -111,7 +111,7 @@ pub async fn repl(
 
                 // Configure RPC if provided
                 if let Some((ref url, ref user, ref password)) = rpc_config {
-                    if let Err(e) = manager.wallet_node.set_rpc_client(url, (user.clone(), password.clone())) {
+                    if let Err(e) = manager.set_rpc_client(url, (user.clone(), password.clone())) {
                         println!("⚠️  Warning: Failed to connect to Bitcoin Core RPC: {}", e);
                         println!("           Proposer mode disabled. Receiver mode still available.");
                     }
@@ -131,7 +131,7 @@ pub async fn repl(
 
                 // Configure RPC if provided
                 if let Some((ref url, ref user, ref password)) = rpc_config {
-                    if let Err(e) = manager.wallet_node.set_rpc_client(url, (user.clone(), password.clone())) {
+                    if let Err(e) = manager.set_rpc_client(url, (user.clone(), password.clone())) {
                         println!("⚠️  Warning: Failed to connect to Bitcoin Core RPC: {}", e);
                         println!("           Proposer mode disabled. Receiver mode still available.");
                     }
@@ -183,7 +183,7 @@ pub async fn repl(
             "sync" => {
                 if let Some(mgr) = current.as_mut() {
                     println!("Syncing (recent blocks)...");
-                    mgr.wallet_node.sync_recent().await?;
+                    mgr.sync_recent().await?;
                     println!("Done.");
                 } else {
                     println!("No wallet loaded.");
@@ -192,7 +192,7 @@ pub async fn repl(
 
             "peek" => {
                 if let Some(mgr) = current.as_mut() {
-                    let addresses = mgr.wallet_node.peek_addresses(10).await?;
+                    let addresses = mgr.peek_addresses(10).await?;
                     for addr in addresses {
                         println!("{}", addr);
                     }
@@ -203,7 +203,7 @@ pub async fn repl(
 
             "reregister" => {
                 if let Some(mgr) = current.as_mut() {
-                    println!("{}", mgr.wallet_node.reregister_revealed().await?);
+                    println!("{}", mgr.reregister_revealed().await?);
                 } else {
                     println!("No wallet loaded.");
                 }
@@ -216,7 +216,7 @@ pub async fn repl(
                 }
                 if let Some(mgr) = current.as_mut() {
                     let index: u32 = args[0].parse().unwrap_or(0);
-                    println!("{}", mgr.wallet_node.reveal_up_to(index).await?);
+                    println!("{}", mgr.reveal_up_to(index).await?);
                 } else {
                     println!("No wallet loaded.");
                 }
@@ -224,7 +224,7 @@ pub async fn repl(
 
             "debug" => {
                 if let Some(mgr) = current.as_mut() {
-                    println!("{}", mgr.wallet_node.debug_transactions().await?);
+                    println!("{}", mgr.debug_transactions().await?);
                 } else {
                     println!("No wallet loaded.");
                 }
@@ -365,24 +365,13 @@ pub async fn repl(
                     match hash_str.parse::<bdk_wallet::bitcoin::BlockHash>() {
                         Ok(block_hash) => {
                             println!("🔍 Fetching block {} via Kyoto P2P...", block_hash);
-                            match mgr.wallet_node.requester.get_block(block_hash).await {
-                                Ok(indexed_block) => {
-                                    let block = &indexed_block.block;
+                            match mgr.get_block_info(block_hash).await {
+                                Ok((version, prev_blockhash, num_txs, p2tr_count)) => {
                                     println!("✅ Successfully fetched block:");
                                     println!("   Hash: {}", block_hash);
-                                    println!("   Transactions: {}", block.txdata.len());
-                                    println!("   Version: {:?}", block.header.version);
-                                    println!("   Prev block: {}", block.header.prev_blockhash);
-
-                                    // Count taproot outputs
-                                    let mut p2tr_count = 0;
-                                    for tx in &block.txdata {
-                                        for output in &tx.output {
-                                            if output.script_pubkey.is_p2tr() {
-                                                p2tr_count += 1;
-                                            }
-                                        }
-                                    }
+                                    println!("   Transactions: {}", num_txs);
+                                    println!("   Version: {:?}", version);
+                                    println!("   Prev block: {}", prev_blockhash);
                                     println!("   P2TR outputs: {}", p2tr_count);
                                 }
                                 Err(e) => println!("❌ Failed to fetch block: {}", e),
@@ -418,7 +407,7 @@ pub async fn repl(
                     };
 
                     println!("🔍 Querying Kyoto headers.db for heights {}-{}...", start_height, end_height);
-                    match mgr.wallet_node.get_block_hashes_from_headers_db(start_height, end_height) {
+                    match mgr.get_block_hashes_from_headers_db(start_height, end_height) {
                         Ok(hashes) => {
                             println!("✅ Retrieved {} block hashes:", hashes.len());
                             for (height, hash) in hashes.iter().take(10) {
@@ -623,29 +612,9 @@ pub async fn repl(
                             } else {
                                 println!("✅ Found {} proposals:", found.len());
                                 for proposal in found.iter().take(10) {
-                                    // Display tag
-                                    let tag_hex = ::hex::encode(&proposal.tag);
-
-                                    // Extract info from PSBT
-                                    let tx = &proposal.psbt.unsigned_tx;
-                                    let proposer_input = tx.input.first()
-                                        .map(|inp| format!("{}:{}", inp.previous_output.txid, inp.previous_output.vout))
-                                        .unwrap_or_else(|| "unknown".to_string());
-
-                                    // Get proposer value from witness_utxo if available
-                                    let proposer_value = proposal.psbt.inputs.first()
-                                        .and_then(|inp| inp.witness_utxo.as_ref())
-                                        .map(|txout| txout.value.to_sat())
-                                        .unwrap_or(0);
-
-                                    // Calculate delta: receiver_input - receiver_output
-                                    let receiver_input = proposal.tweak_info.original_output.value.to_sat();
-                                    let tweaked_script = &proposal.tweak_info.tweaked_output.script_pubkey;
-                                    let receiver_output = tx.output.iter()
-                                        .find(|output| &output.script_pubkey == tweaked_script)
-                                        .map(|output| output.value.to_sat())
-                                        .unwrap_or(receiver_input);
-                                    let delta = receiver_input as i64 - receiver_output as i64;
+                                    // Use Manager's formatting method
+                                    let (tag_hex, proposer_input, proposer_value, receiver_output, delta) =
+                                        mgr.format_proposal_info(proposal);
 
                                     println!("  [{}] Proposer: {} ({} sats) → Our output: {} sats (delta: {})",
                                              tag_hex, proposer_input, proposer_value, receiver_output, delta);
@@ -670,21 +639,15 @@ pub async fn repl(
                     continue;
                 }
                 if let Some(mgr) = current.as_mut() {
-                    // Parse hex tag
+                    // Parse hex tag using Manager method
                     let tag_hex = args[0];
-                    let tag_bytes = match ::hex::decode(tag_hex) {
-                        Ok(bytes) if bytes.len() == 8 => bytes,
-                        Ok(_) => {
-                            println!("❌ Tag must be exactly 8 bytes (16 hex chars)");
-                            continue;
-                        }
-                        Err(_) => {
-                            println!("❌ Invalid hex tag");
+                    let tag = match Manager::parse_hex_tag(tag_hex) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            println!("❌ {}", e);
                             continue;
                         }
                     };
-                    let mut tag = [0u8; 8];
-                    tag.copy_from_slice(&tag_bytes);
 
                     // Use stored delta range or default wide range
                     let acceptable_range = last_scan_delta_range

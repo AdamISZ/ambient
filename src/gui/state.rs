@@ -1,6 +1,6 @@
 //! Application state management
 
-use crate::manager::Manager;
+use crate::manager::{Manager, ProposalScanResult};
 use crate::snicker::ProposalOpportunity;
 use bdk_wallet::bitcoin::Amount;
 use std::sync::Arc;
@@ -54,8 +54,8 @@ pub struct WalletData {
     pub snicker_opportunities_list: Vec<(usize, String)>, // (index, display_string)
     pub snicker_opportunities_data: Vec<ProposalOpportunity>, // Actual opportunities for creating proposals
     pub snicker_last_proposal: Option<String>, // Last created proposal tag (hex)
-    pub snicker_proposal_tag_input: String, // Tag input for loading proposal file
-    pub snicker_incoming_proposals: Vec<String>, // Incoming proposal tags
+    pub snicker_scanned_proposals: Vec<ProposalScanResult>, // Results from directory scan
+    pub snicker_selected_proposal: Option<usize>, // Index into scanned_proposals
     pub snicker_proposal_delta_input: String, // Delta input for creating proposals
     pub snicker_scan_min_delta_input: String, // Min delta for scanning incoming
     pub snicker_scan_max_delta_input: String, // Max delta for scanning incoming
@@ -83,8 +83,8 @@ impl Default for WalletData {
             snicker_opportunities_list: Vec::new(),
             snicker_opportunities_data: Vec::new(),
             snicker_last_proposal: None,
-            snicker_proposal_tag_input: String::new(),
-            snicker_incoming_proposals: Vec::new(),
+            snicker_scanned_proposals: Vec::new(),
+            snicker_selected_proposal: None,
             snicker_proposal_delta_input: String::from("0"),
             snicker_scan_min_delta_input: String::from("-1000"),
             snicker_scan_max_delta_input: String::from("5000"),

@@ -1357,9 +1357,21 @@ impl Snicker {
             let mut matches_for_this_utxo = 0;
 
             // Find all candidates where output value is in range [min_utxo_sats, our_value)
-            for (_height, _txid, target_tx) in &candidates {
+            for (_height, txid, target_tx) in &candidates {
                 for (output_index, output) in target_tx.output.iter().enumerate() {
                     let candidate_sats = output.value.to_sat();
+
+                    // Create outpoint for this candidate
+                    let candidate_outpoint = bdk_wallet::bitcoin::OutPoint {
+                        txid: *txid,
+                        vout: output_index as u32,
+                    };
+
+                    // Skip if this is one of our own UTXOs
+                    if our_utxos.iter().any(|u| u.outpoint == candidate_outpoint) {
+                        continue;
+                    }
+
                     // Only consider P2TR outputs >= min_utxo_sats AND smaller than our UTXO
                     if output.script_pubkey.is_p2tr()
                         && candidate_sats >= min_utxo_sats

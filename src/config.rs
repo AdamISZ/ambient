@@ -70,6 +70,11 @@ pub struct Config {
     /// For regtest, use 0. For signet/mainnet, use a recent block height to avoid long sync times.
     #[serde(default = "default_recovery_height")]
     pub recovery_height: u32,
+
+    /// Directory where SNICKER proposals are stored for auto-discovery
+    /// Default: ~/.local/share/ambient/{network}/proposals/
+    #[serde(default = "default_proposals_dir")]
+    pub proposals_directory: PathBuf,
 }
 
 impl Default for Config {
@@ -79,6 +84,7 @@ impl Default for Config {
             peer: None,
             wallet_dir: default_wallet_dir(),
             recovery_height: default_recovery_height(),
+            proposals_directory: default_proposals_dir(),
         }
     }
 }
@@ -166,6 +172,16 @@ fn default_wallet_dir() -> PathBuf {
 /// Get the default recovery height
 fn default_recovery_height() -> u32 {
     200_000
+}
+
+/// Get the default proposals directory
+fn default_proposals_dir() -> PathBuf {
+    directories::ProjectDirs::from("", "", "ambient")
+        .map(|dirs| dirs.data_local_dir().join("proposals"))
+        .unwrap_or_else(|| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            PathBuf::from(home).join(".local/share/ambient/proposals")
+        })
 }
 
 /// Get the configuration file path

@@ -503,7 +503,7 @@ fn view_snicker(data: &WalletData) -> Element<'static, Message> {
                 column![
                     text("✅ Last Created Proposal:").size(14),
                     text(format!("Tag: {}", tag)).size(12),
-                    text(format!("File: ./{}", tag)).size(11),
+                    text("File: Saved to proposals directory (see Settings)").size(11),
                 ].spacing(3)
             )
             .padding(10)
@@ -551,53 +551,83 @@ fn view_snicker(data: &WalletData) -> Element<'static, Message> {
         .padding(10)
     );
 
-    // Load proposal from file
-    let tag_input = data.snicker_proposal_tag_input.clone();
-    content = content.push(
-        container(
-            column![
-                text("Load Proposal from File:").size(14),
-                row![
-                    text("Tag:").size(12),
-                    text_input("proposal tag (hex)", &tag_input)
-                        .on_input(Message::SnickerProposalTagInputChanged)
-                        .width(Length::Fixed(300.0)),
-                    button("Load")
-                        .on_press(Message::SnickerLoadProposalFromFile(format!("./{}", tag_input)))
-                        .padding(8),
-                ].spacing(10),
-            ].spacing(5)
-        )
-        .padding(10)
-    );
-
-    // Show incoming proposals with accept buttons
-    if !data.snicker_incoming_proposals.is_empty() {
+    // Show scanned proposals list
+    if !data.snicker_scanned_proposals.is_empty() {
         let mut proposals_list = column![
-            text(format!("Found {} incoming proposal(s):", data.snicker_incoming_proposals.len())).size(16),
+            text(format!("Found {} matching proposal(s):", data.snicker_scanned_proposals.len())).size(16),
         ].spacing(10);
 
-        for tag in &data.snicker_incoming_proposals {
+        for (idx, result) in data.snicker_scanned_proposals.iter().enumerate() {
             // Truncate tag for display
-            let display_tag = if tag.len() > 16 {
-                format!("{}...{}", &tag[..8], &tag[tag.len()-8..])
+            let display_tag = if result.tag_hex.len() > 16 {
+                format!("{}...{}", &result.tag_hex[..8], &result.tag_hex[result.tag_hex.len()-8..])
             } else {
-                tag.clone()
+                result.tag_hex.clone()
+            };
+
+            // Color code delta
+            // Positive delta = receiver loses (contributes), negative = receiver gains
+            let (delta_text, delta_color) = if result.delta > 0 {
+                (format!("+{}", result.delta), Color::from_rgb(0.9, 0.2, 0.2)) // RED = loss
+            } else if result.delta < 0 {
+                (format!("{}", result.delta), Color::from_rgb(0.2, 0.8, 0.2)) // GREEN = gain
+            } else {
+                (format!("{}", result.delta), Color::from_rgb(0.7, 0.7, 0.7)) // GRAY = neutral
             };
 
             proposals_list = proposals_list.push(
-                container(
-                    row![
-                        text(format!("Tag: {}", display_tag)).size(12),
-                        button("Accept & Broadcast")
-                            .on_press(Message::SnickerAcceptProposal(tag.clone()))
-                            .padding(8),
-                    ].spacing(10)
+                button(
+                    container(
+                        column![
+                            text(format!("Tag: {}", display_tag)).size(12),
+                            text(format!("Proposer: {} ({} sats)", result.proposer_input, result.proposer_value)).size(11),
+                            text(format!("Your output: {} sats", result.receiver_output_value)).size(11),
+                            text(format!("Δ: {} sats", delta_text)).size(11).color(delta_color),
+                        ].spacing(3)
+                    )
+                    .padding(8)
                 )
-                .padding(5)
+                .on_press(Message::SnickerShowAcceptDialog(idx))
+                .width(Length::Fixed(500.0))
+                .style(|_theme: &Theme, status| {
+                    match status {
+                        button::Status::Hovered => Style {
+                            background: Some(iced::Background::Color(Color::from_rgb(0.25, 0.35, 0.65))),
+                            text_color: Color::WHITE,
+                            border: Border {
+                                color: Color::from_rgb(0.35, 0.45, 0.75),
+                                width: 1.5,
+                                radius: 6.0.into(),
+                            },
+                            shadow: iced::Shadow::default(),
+                        },
+                        _ => Style {
+                            background: Some(iced::Background::Color(Color::from_rgb(0.18, 0.28, 0.55))),
+                            text_color: Color::WHITE,
+                            border: Border {
+                                color: Color::from_rgb(0.28, 0.38, 0.65),
+                                width: 1.5,
+                                radius: 6.0.into(),
+                            },
+                            shadow: iced::Shadow::default(),
+                        },
+                    }
+                })
             );
         }
-        content = content.push(container(proposals_list).padding(10));
+
+        content = content.push(
+            container(
+                scrollable(proposals_list)
+                    .direction(Direction::Vertical(
+                        Scrollbar::new()
+                            .width(0)
+                            .scroller_width(0)
+                    ))
+                    .height(Length::Fixed(300.0))
+            )
+            .padding(10)
+        );
     }
 
     content.into()

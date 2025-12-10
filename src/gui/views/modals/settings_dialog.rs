@@ -57,6 +57,7 @@ pub fn view(edited_config: &Config) -> Element<'static, Message> {
     let peer_value = edited_config.peer.clone().unwrap_or_default();
     let wallet_dir = edited_config.wallet_dir.to_string_lossy().to_string();
     let recovery_height_value = edited_config.recovery_height.to_string();
+    let proposals_dir = edited_config.proposals_directory.to_string_lossy().to_string();
 
     let content = column![
         text("Settings").size(32),
@@ -94,6 +95,15 @@ pub fn view(edited_config: &Config) -> Element<'static, Message> {
             text("Wallet Directory").size(16),
             text_input("Wallet directory path", &wallet_dir)
                 .on_input(Message::SettingsWalletDirChanged)
+                .width(Length::Fixed(400.0))
+        ].spacing(5),
+
+        // Proposals directory input
+        column![
+            text("Proposals Directory").size(16),
+            text("Directory where SNICKER proposal files are stored").size(12),
+            text_input("Proposals directory path", &proposals_dir)
+                .on_input(Message::SettingsProposalsDirChanged)
                 .width(Length::Fixed(400.0))
         ].spacing(5),
 

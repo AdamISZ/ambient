@@ -23,6 +23,16 @@ pub enum Modal {
         available_wallets: Vec<String>,
         selected: Option<String>,
     },
+
+    /// Accept SNICKER proposal confirmation dialog
+    AcceptProposalConfirmation {
+        proposal_index: usize,
+        tag_hex: String,
+        proposer_input: String,
+        proposer_value: u64,
+        receiver_output_value: u64,
+        delta: i64,
+    },
 }
 
 /// Steps in the wallet generation wizard
@@ -67,6 +77,23 @@ impl Modal {
             }
             Modal::OpenWallet { available_wallets, selected } => {
                 crate::gui::views::modals::open_wallet_dialog::view(available_wallets, selected)
+            }
+            Modal::AcceptProposalConfirmation {
+                proposal_index,
+                tag_hex,
+                proposer_input,
+                proposer_value,
+                receiver_output_value,
+                delta,
+            } => {
+                crate::gui::views::modals::accept_proposal_dialog::view(
+                    *proposal_index,
+                    tag_hex,
+                    proposer_input,
+                    *proposer_value,
+                    *receiver_output_value,
+                    *delta,
+                )
             }
         }
     }

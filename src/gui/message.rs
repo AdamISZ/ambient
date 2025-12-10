@@ -81,14 +81,14 @@ pub enum Message {
     SnickerCreateProposal(usize, u64), // (opportunity_index, delta_sats)
     SnickerProposalCreated(Result<String, String>), // proposal hex or error
     SnickerScanIncomingProposals(i64, i64), // (min_delta, max_delta)
-    SnickerIncomingProposalsFound(Vec<String>), // list of proposal tags
-    SnickerProposalTagInputChanged(String), // tag input for loading
+    SnickerProposalsScanned(Vec<crate::manager::ProposalScanResult>), // scanned proposals from directory
     SnickerProposalDeltaInputChanged(String), // delta input for creating proposals
     SnickerScanMinDeltaInputChanged(String), // min delta input for scanning
     SnickerScanMaxDeltaInputChanged(String), // max delta input for scanning
-    SnickerLoadProposalFromFile(String), // filename
-    SnickerProposalLoaded(Result<String, String>), // tag or error
-    SnickerAcceptProposal(String), // proposal tag
+    SnickerProposalSelected(usize), // user selected proposal from list
+    SnickerShowAcceptDialog(usize), // show confirmation dialog for proposal
+    SnickerConfirmAccept(usize), // user confirmed accepting proposal
+    SnickerCancelAccept, // user cancelled accepting proposal
     SnickerProposalAccepted(Result<String, String>), // txid or error
 
     // Navigation
@@ -105,6 +105,7 @@ pub enum Message {
     SettingsPeerChanged(String),
     SettingsWalletDirChanged(String),
     SettingsRecoveryHeightChanged(String),
+    SettingsProposalsDirChanged(String),
     SettingsSave,
     SettingsSaved(Result<(), String>),
 

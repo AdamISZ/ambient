@@ -3,17 +3,30 @@
 //! Coordinates between WalletNode (blockchain/wallet operations) and Snicker (protocol operations).
 //! Provides high-level business logic operations that the UI layer can call.
 
-use anyhow::Result;
+use anyhow::{Result, Context};
 use bdk_wallet::bitcoin::{Transaction, psbt::Psbt};
 use tracing::info;
 
 use crate::wallet_node::WalletNode;
 use crate::snicker::{Snicker, ProposalOpportunity, EncryptedProposal, Proposal};
+use std::path::Path;
 
 /// High-level application manager that coordinates wallet and SNICKER operations
 pub struct Manager {
     pub wallet_node: WalletNode,
     pub snicker: Snicker,
+}
+
+/// Result of scanning a proposals directory
+#[derive(Debug, Clone)]
+pub struct ProposalScanResult {
+    pub tag: [u8; 8],
+    pub tag_hex: String,
+    pub filename: String,
+    pub delta: i64,
+    pub proposer_input: String,
+    pub proposer_value: u64,
+    pub receiver_output_value: u64,
 }
 
 impl Manager {
@@ -650,6 +663,159 @@ impl Manager {
         Ok(results)
     }
 
+    /// Scan proposals directory and find all valid proposals matching criteria
+    ///
+    /// Automatically discovers proposal files, deserializes, decrypts with our UTXOs,
+    /// and filters by delta range. This provides a foundation for automated SNICKER.
+    ///
+    /// # Arguments
+    /// * `proposals_dir` - Directory containing proposal files
+    /// * `delta_range` - (min_delta, max_delta) acceptable range in sats
+    ///
+    /// # Returns
+    /// Vec of ProposalScanResult containing all matching proposals with details
+    pub async fn scan_proposals_directory(
+        &mut self,
+        proposals_dir: &Path,
+        delta_range: (i64, i64),
+    ) -> Result<Vec<ProposalScanResult>> {
+        use std::fs;
+
+        // Create directory if it doesn't exist
+        if !proposals_dir.exists() {
+            fs::create_dir_all(proposals_dir)?;
+            println!("📁 Created proposals directory: {}", proposals_dir.display());
+            return Ok(Vec::new());
+        }
+
+        println!("🔍 Scanning proposals directory: {}", proposals_dir.display());
+
+        // Read all files in directory
+        let entries = fs::read_dir(proposals_dir)
+            .with_context(|| format!("Failed to read proposals directory: {}", proposals_dir.display()))?;
+
+        let mut encrypted_proposals = Vec::new();
+        let mut file_count = 0;
+        let mut skipped_count = 0;
+
+        for entry in entries {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!("⚠️  Failed to read directory entry: {}", e);
+                    continue;
+                }
+            };
+
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+
+            file_count += 1;
+
+            // Limit to prevent scanning too many files
+            if file_count > 1000 {
+                eprintln!("⚠️  Directory has >1000 files, limiting scan to first 1000");
+                break;
+            }
+
+            // Try to read and deserialize file
+            match fs::read_to_string(&path) {
+                Ok(contents) => {
+                    match self.load_proposal_from_serialized(&contents).await {
+                        Ok(tag) => {
+                            // Successfully loaded encrypted proposal
+                            let filename = path.file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("unknown")
+                                .to_string();
+                            encrypted_proposals.push((tag, filename));
+                        }
+                        Err(e) => {
+                            // Skip invalid files silently (might not be proposal files)
+                            skipped_count += 1;
+                            if file_count < 10 { // Only log first few to avoid spam
+                                eprintln!("⚠️  Skipped {}: {}", path.display(), e);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("⚠️  Failed to read {}: {}", path.display(), e);
+                    skipped_count += 1;
+                }
+            }
+        }
+
+        println!("📄 Found {} files, {} valid proposal(s), {} skipped",
+                 file_count, encrypted_proposals.len(), skipped_count);
+
+        if encrypted_proposals.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Get our UTXOs for decryption
+        let wallet = self.wallet_node.wallet.lock().await;
+        let our_utxos: Vec<_> = wallet.list_unspent().collect();
+        drop(wallet);
+
+        println!("🔓 Attempting to decrypt {} proposal(s) with {} UTXO(s)...",
+                 encrypted_proposals.len(), our_utxos.len());
+
+        // Decrypt all proposals
+        let decrypted = self.snicker.scan_proposals(&our_utxos, |keychain, index| {
+            self.wallet_node.derive_utxo_privkey(keychain, index)
+        }).await?;
+
+        println!("✅ Decrypted {} proposal(s)", decrypted.len());
+
+        // Filter by delta range and collect results
+        let mut results = Vec::new();
+
+        for proposal in decrypted {
+            // Calculate delta
+            let delta = match self.snicker.calculate_delta_from_proposal(&proposal) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("⚠️  Failed to calculate delta for proposal {}: {}",
+                             hex::encode(&proposal.tag), e);
+                    continue;
+                }
+            };
+
+            // Check if delta is in acceptable range
+            if delta < delta_range.0 || delta > delta_range.1 {
+                continue;
+            }
+
+            // Get proposal details using existing formatting method
+            let (tag_hex, proposer_input, proposer_value, receiver_output_value, _delta) =
+                self.format_proposal_info(&proposal);
+
+            // Find original filename
+            let filename = encrypted_proposals.iter()
+                .find(|(tag, _)| tag == &proposal.tag)
+                .map(|(_, name)| name.clone())
+                .unwrap_or_else(|| hex::encode(&proposal.tag));
+
+            results.push(ProposalScanResult {
+                tag: proposal.tag,
+                tag_hex,
+                filename,
+                delta,
+                proposer_input,
+                proposer_value,
+                receiver_output_value,
+            });
+        }
+
+        println!("✅ Found {} matching proposal(s) in delta range ({}, {})",
+                 results.len(), delta_range.0, delta_range.1);
+
+        Ok(results)
+    }
+
     /// Accept and sign a SNICKER proposal as receiver
     ///
     /// # Arguments
@@ -881,5 +1047,112 @@ impl Manager {
         ).await?;
 
         Ok(())
+    }
+
+    // ============================================================
+    // ADDITIONAL WALLET OPERATIONS (delegated to WalletNode)
+    // ============================================================
+
+    /// Configure RPC client for Bitcoin Core access
+    pub fn set_rpc_client(&mut self, url: &str, auth: (String, String)) -> Result<()> {
+        self.wallet_node.set_rpc_client(url, auth)
+    }
+
+    /// Sync recent blocks
+    pub async fn sync_recent(&mut self) -> Result<()> {
+        self.wallet_node.sync_recent().await
+    }
+
+    /// Peek at next N addresses without registering them
+    pub async fn peek_addresses(&self, count: u32) -> Result<Vec<String>> {
+        self.wallet_node.peek_addresses(count).await
+    }
+
+    /// Re-register revealed addresses with Kyoto
+    pub async fn reregister_revealed(&mut self) -> Result<String> {
+        self.wallet_node.reregister_revealed().await
+    }
+
+    /// Reveal addresses up to a specific index
+    pub async fn reveal_up_to(&mut self, index: u32) -> Result<String> {
+        self.wallet_node.reveal_up_to(index).await
+    }
+
+    /// Get debug information about transactions
+    pub async fn debug_transactions(&self) -> Result<String> {
+        self.wallet_node.debug_transactions().await
+    }
+
+    /// Get block information by hash (for testing/debugging)
+    /// Returns: (version, prev_blockhash, num_txs, num_p2tr_outputs)
+    pub async fn get_block_info(&self, block_hash: bdk_wallet::bitcoin::BlockHash) -> Result<(bdk_wallet::bitcoin::block::Version, bdk_wallet::bitcoin::BlockHash, usize, usize)> {
+        use bdk_wallet::bitcoin::ScriptBuf;
+
+        let indexed_block = self.wallet_node.requester.get_block(block_hash).await
+            .map_err(|e| anyhow::anyhow!("Failed to fetch block: {:?}", e))?;
+
+        let block = &indexed_block.block;
+
+        // Count P2TR outputs
+        let mut p2tr_count = 0;
+        for tx in &block.txdata {
+            for output in &tx.output {
+                if output.script_pubkey.is_p2tr() {
+                    p2tr_count += 1;
+                }
+            }
+        }
+
+        Ok((block.header.version, block.header.prev_blockhash, block.txdata.len(), p2tr_count))
+    }
+
+    /// Get block hashes from headers database (for testing/debugging)
+    pub fn get_block_hashes_from_headers_db(&self, start_height: u32, end_height: u32) -> Result<Vec<(u32, bdk_wallet::bitcoin::BlockHash)>> {
+        self.wallet_node.get_block_hashes_from_headers_db(start_height, end_height)
+    }
+
+    // ============================================================
+    // PROPOSAL FORMATTING (presentation helpers for UIs)
+    // ============================================================
+
+    /// Format proposal information for display
+    /// Returns: (tag_hex, proposer_input, proposer_value_sats, receiver_output_sats, delta_sats)
+    pub fn format_proposal_info(&self, proposal: &Proposal) -> (String, String, u64, u64, i64) {
+        let tag_hex = hex::encode(&proposal.tag);
+
+        let tx = &proposal.psbt.unsigned_tx;
+        let proposer_input = tx.input.first()
+            .map(|inp| format!("{}:{}", inp.previous_output.txid, inp.previous_output.vout))
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let proposer_value = proposal.psbt.inputs.first()
+            .and_then(|inp| inp.witness_utxo.as_ref())
+            .map(|txout| txout.value.to_sat())
+            .unwrap_or(0);
+
+        let receiver_input = proposal.tweak_info.original_output.value.to_sat();
+        let tweaked_script = &proposal.tweak_info.tweaked_output.script_pubkey;
+        let receiver_output = tx.output.iter()
+            .find(|output| &output.script_pubkey == tweaked_script)
+            .map(|output| output.value.to_sat())
+            .unwrap_or(receiver_input);
+
+        let delta = receiver_input as i64 - receiver_output as i64;
+
+        (tag_hex, proposer_input, proposer_value, receiver_output, delta)
+    }
+
+    /// Parse hex tag to bytes
+    pub fn parse_hex_tag(tag_hex: &str) -> Result<[u8; 8]> {
+        let tag_bytes = hex::decode(tag_hex)
+            .map_err(|_| anyhow::anyhow!("Invalid hex tag"))?;
+
+        if tag_bytes.len() != 8 {
+            anyhow::bail!("Tag must be exactly 8 bytes (16 hex chars)");
+        }
+
+        let mut tag = [0u8; 8];
+        tag.copy_from_slice(&tag_bytes);
+        Ok(tag)
     }
 }

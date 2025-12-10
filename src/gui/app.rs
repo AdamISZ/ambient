@@ -8,6 +8,7 @@ use crate::gui::state::AppState;
 use crate::gui::modal::Modal;
 use crate::config::Config;
 use std::sync::Arc;
+use std::mem::ManuallyDrop;
 use tokio::sync::Mutex;
 
 /// Main application struct
@@ -17,7 +18,8 @@ pub struct AmbientApp {
     // Active modal dialog (if any)
     active_modal: Option<crate::gui::modal::Modal>,
     // Long-lived Tokio runtime for wallet operations
-    tokio_runtime: tokio::runtime::Runtime,
+    // Wrapped in ManuallyDrop to prevent panic on shutdown when dropped from async context
+    tokio_runtime: ManuallyDrop<tokio::runtime::Runtime>,
 }
 
 impl AmbientApp {
@@ -30,8 +32,10 @@ impl AmbientApp {
         });
 
         // Create long-lived Tokio runtime for wallet operations
-        let tokio_runtime = tokio::runtime::Runtime::new()
-            .expect("Failed to create Tokio runtime");
+        let tokio_runtime = ManuallyDrop::new(
+            tokio::runtime::Runtime::new()
+                .expect("Failed to create Tokio runtime")
+        );
 
         (
             Self {
@@ -374,6 +378,13 @@ impl AmbientApp {
                     if let Ok(height) = height_str.parse::<u32>() {
                         edited_config.recovery_height = height;
                     }
+                }
+                Task::none()
+            }
+
+            Message::SettingsProposalsDirChanged(dir) => {
+                if let Some(crate::gui::modal::Modal::Settings { edited_config }) = &mut self.active_modal {
+                    edited_config.proposals_directory = std::path::PathBuf::from(dir);
                 }
                 Task::none()
             }
@@ -887,6 +898,7 @@ impl AmbientApp {
 
                     let opportunity = wallet_data.snicker_opportunities_data[index].clone();
                     let manager_clone = manager.clone();
+                    let proposals_dir = self.config.proposals_directory.clone();
                     let rt_handle = self.tokio_runtime.handle().clone();
 
                     println!("📝 Creating SNICKER proposal (index {}, delta {} sats)...", index, delta_sats);
@@ -902,11 +914,14 @@ impl AmbientApp {
                                 // Serialize the proposal
                                 let serialized = manager.serialize_encrypted_proposal(&encrypted);
 
-                                // Write to file named by tag
-                                let filename = format!("./{}", tag_hex);
+                                // Ensure proposals directory exists
+                                tokio::fs::create_dir_all(&proposals_dir).await?;
+
+                                // Write to file in proposals directory
+                                let filename = proposals_dir.join(&tag_hex);
                                 tokio::fs::write(&filename, serialized).await?;
 
-                                println!("✅ Proposal created and saved to {}", filename);
+                                println!("✅ Proposal created and saved to {}", filename.display());
                                 Ok(tag_hex)
                             }).await.unwrap()
                         },
@@ -940,30 +955,28 @@ impl AmbientApp {
 
             Message::SnickerScanIncomingProposals(min_delta, max_delta) => {
                 if let AppState::WalletLoaded { manager, .. } = &self.state {
-                    println!("🔍 Scanning for incoming SNICKER proposals (delta range: {} to {} sats)...",
+                    println!("🔍 Scanning proposals directory (delta range: {} to {} sats)...",
                              min_delta, max_delta);
 
                     let manager_clone = manager.clone();
+                    let proposals_dir = self.config.proposals_directory.clone();
                     let rt_handle = self.tokio_runtime.handle().clone();
 
                     return Task::perform(
                         async move {
                             rt_handle.spawn(async move {
-                                let manager = manager_clone.lock().await;
-                                manager.scan_for_our_proposals((min_delta, max_delta)).await
+                                let mut manager = manager_clone.lock().await;
+                                manager.scan_proposals_directory(&proposals_dir, (min_delta, max_delta)).await
                             }).await.unwrap()
                         },
                         |result| match result {
                             Ok(proposals) => {
-                                let tags: Vec<String> = proposals.iter()
-                                    .map(|p| ::hex::encode(&p.tag))
-                                    .collect();
-                                println!("✅ Found {} incoming proposals", tags.len());
-                                Message::SnickerIncomingProposalsFound(tags)
+                                println!("✅ Found {} matching proposals", proposals.len());
+                                Message::SnickerProposalsScanned(proposals)
                             }
                             Err(e) => {
                                 eprintln!("❌ Failed to scan proposals: {}", e);
-                                Message::SnickerIncomingProposalsFound(Vec::new())
+                                Message::SnickerProposalsScanned(Vec::new())
                             }
                         }
                     );
@@ -971,17 +984,73 @@ impl AmbientApp {
                 Task::none()
             }
 
-            Message::SnickerIncomingProposalsFound(tags) => {
+            Message::SnickerProposalsScanned(proposals) => {
                 if let AppState::WalletLoaded { wallet_data, .. } = &mut self.state {
-                    wallet_data.snicker_incoming_proposals = tags;
+                    wallet_data.snicker_scanned_proposals = proposals;
+                    wallet_data.snicker_selected_proposal = None;
                 }
                 Task::none()
             }
 
-            Message::SnickerProposalTagInputChanged(value) => {
+            Message::SnickerProposalSelected(index) => {
                 if let AppState::WalletLoaded { wallet_data, .. } = &mut self.state {
-                    wallet_data.snicker_proposal_tag_input = value;
+                    wallet_data.snicker_selected_proposal = Some(index);
                 }
+                Task::none()
+            }
+
+            Message::SnickerShowAcceptDialog(index) => {
+                if let AppState::WalletLoaded { wallet_data, .. } = &self.state {
+                    if let Some(result) = wallet_data.snicker_scanned_proposals.get(index) {
+                        self.active_modal = Some(crate::gui::modal::Modal::AcceptProposalConfirmation {
+                            proposal_index: index,
+                            tag_hex: result.tag_hex.clone(),
+                            proposer_input: result.proposer_input.clone(),
+                            proposer_value: result.proposer_value,
+                            receiver_output_value: result.receiver_output_value,
+                            delta: result.delta,
+                        });
+                    }
+                }
+                Task::none()
+            }
+
+            Message::SnickerConfirmAccept(index) => {
+                self.active_modal = None;
+
+                if let AppState::WalletLoaded { manager, wallet_data, .. } = &self.state {
+                    if let Some(result) = wallet_data.snicker_scanned_proposals.get(index) {
+                        let tag = result.tag;
+                        let manager_clone = manager.clone();
+                        let rt_handle = self.tokio_runtime.handle().clone();
+
+                        println!("✅ Accepting SNICKER proposal: {}", ::hex::encode(&tag));
+
+                        return Task::perform(
+                            async move {
+                                rt_handle.spawn(async move {
+                                    let mut manager = manager_clone.lock().await;
+                                    manager.accept_and_broadcast_snicker_proposal(&tag, (-1_000_000, 1_000_000)).await
+                                }).await.unwrap()
+                            },
+                            |result| match result {
+                                Ok(txid) => {
+                                    println!("✅ SNICKER coinjoin broadcast: {}", txid);
+                                    Message::SnickerProposalAccepted(Ok(txid.to_string()))
+                                }
+                                Err(e) => {
+                                    eprintln!("❌ Failed to accept proposal: {}", e);
+                                    Message::SnickerProposalAccepted(Err(e.to_string()))
+                                }
+                            }
+                        );
+                    }
+                }
+                Task::none()
+            }
+
+            Message::SnickerCancelAccept => {
+                self.active_modal = None;
                 Task::none()
             }
 
@@ -1002,102 +1071,6 @@ impl AmbientApp {
             Message::SnickerScanMaxDeltaInputChanged(value) => {
                 if let AppState::WalletLoaded { wallet_data, .. } = &mut self.state {
                     wallet_data.snicker_scan_max_delta_input = value;
-                }
-                Task::none()
-            }
-
-            Message::SnickerLoadProposalFromFile(filename) => {
-                if let AppState::WalletLoaded { manager, .. } = &self.state {
-                    println!("📂 Loading proposal from file: {}", filename);
-
-                    let manager_clone = manager.clone();
-                    let rt_handle = self.tokio_runtime.handle().clone();
-                    let filename_clone = filename.clone();
-
-                    return Task::perform(
-                        async move {
-                            rt_handle.spawn(async move {
-                                // Read file
-                                let contents = tokio::fs::read_to_string(&filename_clone).await?;
-
-                                // Load and store proposal via manager
-                                let manager = manager_clone.lock().await;
-                                let tag = manager.load_proposal_from_serialized(&contents).await?;
-
-                                Ok(::hex::encode(&tag))
-                            }).await.unwrap()
-                        },
-                        |result: Result<String, anyhow::Error>| match result {
-                            Ok(tag_hex) => {
-                                println!("✅ Proposal loaded! Tag: {}", tag_hex);
-                                Message::SnickerProposalLoaded(Ok(tag_hex))
-                            }
-                            Err(e) => {
-                                eprintln!("❌ Failed to load proposal: {}", e);
-                                Message::SnickerProposalLoaded(Err(e.to_string()))
-                            }
-                        }
-                    );
-                }
-                Task::none()
-            }
-
-            Message::SnickerProposalLoaded(result) => {
-                match result {
-                    Ok(tag_hex) => {
-                        // Add the loaded proposal to the incoming list so it shows up with Accept button
-                        if let AppState::WalletLoaded { wallet_data, .. } = &mut self.state {
-                            if !wallet_data.snicker_incoming_proposals.contains(&tag_hex) {
-                                wallet_data.snicker_incoming_proposals.push(tag_hex);
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        // Error already printed
-                    }
-                }
-                Task::none()
-            }
-
-            Message::SnickerAcceptProposal(tag_hex) => {
-                if let AppState::WalletLoaded { manager, .. } = &self.state {
-                    println!("✅ Accepting SNICKER proposal {}...", tag_hex);
-
-                    let manager_clone = manager.clone();
-                    let rt_handle = self.tokio_runtime.handle().clone();
-
-                    // Parse tag from hex
-                    let tag_bytes = match ::hex::decode(&tag_hex) {
-                        Ok(bytes) if bytes.len() == 8 => {
-                            let mut tag = [0u8; 8];
-                            tag.copy_from_slice(&bytes);
-                            tag
-                        }
-                        _ => {
-                            eprintln!("❌ Invalid proposal tag");
-                            return Task::none();
-                        }
-                    };
-
-                    return Task::perform(
-                        async move {
-                            rt_handle.spawn(async move {
-                                let mut manager = manager_clone.lock().await;
-                                // Use the high-level manager method that handles everything
-                                manager.accept_and_broadcast_snicker_proposal(&tag_bytes, (-1_000_000, 1_000_000)).await
-                            }).await.unwrap()
-                        },
-                        |result| match result {
-                            Ok(txid) => {
-                                println!("✅ SNICKER coinjoin broadcast: {}", txid);
-                                Message::SnickerProposalAccepted(Ok(txid.to_string()))
-                            }
-                            Err(e) => {
-                                eprintln!("❌ Failed to accept proposal: {}", e);
-                                Message::SnickerProposalAccepted(Err(e.to_string()))
-                            }
-                        }
-                    );
                 }
                 Task::none()
             }
