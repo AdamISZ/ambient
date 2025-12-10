@@ -1,7 +1,9 @@
 //! WalletLoaded main view with tabs
 
-use iced::{Element, Length};
-use iced::widget::{column, container, text, button, row, text_input};
+use iced::{Element, Length, Border, Color, Theme};
+use iced::widget::{column, container, text, button, row, text_input, scrollable, Scrollable};
+use iced::widget::scrollable::{Direction, Scrollbar};
+use iced::widget::button::Style;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -11,25 +13,25 @@ use crate::manager::Manager;
 
 /// Render the wallet loaded view
 pub fn view(manager: &Arc<Mutex<Manager>>, data: &WalletData) -> Element<'static, Message> {
-    let wallet_name = manager.try_lock()
+    let wallet_name_owned = manager.try_lock()
         .map(|m| m.wallet_node.name().to_string())
         .unwrap_or_else(|_| "Wallet (locked)".to_string());
     let current_tab = data.current_tab;
 
-    // Tab bar
-    let tab_bar = row![
-        tab_button("Overview", WalletTab::Overview, current_tab),
-        tab_button("Send", WalletTab::Send, current_tab),
-        tab_button("Receive", WalletTab::Receive, current_tab),
-        tab_button("Transactions", WalletTab::Transactions, current_tab),
-        tab_button("SNICKER", WalletTab::Snicker, current_tab),
+    // Left sidebar navigation
+    let sidebar = column![
+        sidebar_button("Overview", WalletTab::Overview, current_tab),
+        sidebar_button("Send", WalletTab::Send, current_tab),
+        sidebar_button("Receive", WalletTab::Receive, current_tab),
+        sidebar_button("Transactions", WalletTab::Transactions, current_tab),
+        sidebar_button("SNICKER", WalletTab::Snicker, current_tab),
     ]
-    .spacing(10)
+    .spacing(5)
     .padding(10);
 
     // Tab content
     let tab_content = match current_tab {
-        WalletTab::Overview => view_overview(&wallet_name, data),
+        WalletTab::Overview => view_overview(&wallet_name_owned, data),
         WalletTab::Send => view_send(data),
         WalletTab::Receive => view_receive(data),
         WalletTab::Transactions => view_transactions(),
@@ -40,10 +42,9 @@ pub fn view(manager: &Arc<Mutex<Manager>>, data: &WalletData) -> Element<'static
         // Header with wallet name and menu
         container(
             row![
-                row![
-                    text("Ambient Wallet").size(24),
-                    text(format!("• {}", wallet_name)).size(20),
-                ].spacing(10),
+                text("Ambient Wallet").size(22),
+                text(" • ").size(22),
+                text(wallet_name_owned).size(22),
 
                 // Spacer
                 container(text(""))
@@ -51,42 +52,146 @@ pub fn view(manager: &Arc<Mutex<Manager>>, data: &WalletData) -> Element<'static
 
                 // Menu buttons
                 row![
-                    button("Close Wallet")
-                        .on_press(Message::MenuCloseWallet)
-                        .padding(8),
-                    button("Settings")
-                        .on_press(Message::MenuSettings)
-                        .padding(8),
-                    button("Exit")
-                        .on_press(Message::MenuExit)
-                        .padding(8),
+                    menu_button("Close Wallet", Message::MenuCloseWallet),
+                    menu_button("Settings", Message::MenuSettings),
+                    menu_button("Exit", Message::MenuExit),
                 ]
                 .spacing(10),
             ]
         )
         .padding(15),
 
-        tab_bar,
+        // Main content area with sidebar + content
+        row![
+            // Left sidebar
+            container(sidebar)
+                .width(Length::Fixed(150.0)),
 
-        container(tab_content)
+            // Content area (scrollable without visible scrollbar)
+            scrollable(
+                container(tab_content)
+                    .width(Length::Fill)
+                    .padding(20)
+            )
+            .direction(Direction::Vertical(
+                Scrollbar::new()
+                    .width(0)
+                    .scroller_width(0)
+            ))
             .width(Length::Fill)
-            .height(Length::Fill)
-            .padding(20),
+            .height(Length::Fill),
+        ]
+        .spacing(0),
     ]
     .into()
 }
 
-/// Create a tab button
-fn tab_button(label: &str, tab: WalletTab, current: WalletTab) -> Element<'static, Message> {
-    let label = label.to_string();
+/// Create a sidebar navigation button
+fn sidebar_button(label: &str, tab: WalletTab, current: WalletTab) -> Element<'static, Message> {
     let is_active = tab == current;
+    let label = label.to_string();
 
-    let btn = button(text(label).size(16))
+    let btn = if is_active {
+        // Active button: prominent styling with colored background
+        button(
+            container(text(label.clone()).size(15))
+                .width(Length::Fill)
+                .padding(12)
+        )
         .on_press(Message::TabChanged(tab))
-        .padding(10);
+        .width(Length::Fill)
+        .style(|_theme: &Theme, _status| {
+            Style {
+                background: Some(iced::Background::Color(Color::from_rgb(0.2, 0.4, 0.8))),
+                text_color: Color::WHITE,
+                border: Border {
+                    color: Color::from_rgb(0.3, 0.5, 0.9),
+                    width: 2.0,
+                    radius: 4.0.into(),
+                },
+                shadow: iced::Shadow::default(),
+            }
+        })
+    } else {
+        // Inactive button: subtle styling
+        button(
+            container(text(label.clone()).size(14))
+                .width(Length::Fill)
+                .padding(12)
+        )
+        .on_press(Message::TabChanged(tab))
+        .width(Length::Fill)
+        .style(|_theme: &Theme, status| {
+            match status {
+                button::Status::Hovered => Style {
+                    background: Some(iced::Background::Color(Color::from_rgb(0.15, 0.15, 0.20))),
+                    text_color: Color::WHITE,
+                    border: Border {
+                        color: Color::from_rgb(0.3, 0.3, 0.4),
+                        width: 1.0,
+                        radius: 4.0.into(),
+                    },
+                    shadow: iced::Shadow::default(),
+                },
+                _ => Style {
+                    background: Some(iced::Background::Color(Color::from_rgb(0.1, 0.1, 0.15))),
+                    text_color: Color::from_rgb(0.8, 0.8, 0.8),
+                    border: Border {
+                        color: Color::from_rgb(0.2, 0.2, 0.25),
+                        width: 1.0,
+                        radius: 4.0.into(),
+                    },
+                    shadow: iced::Shadow::default(),
+                },
+            }
+        })
+    };
 
-    // TODO: Add styling to highlight active tab
     btn.into()
+}
+
+/// Create a styled menu button with rounded corners
+fn menu_button(label: &str, message: Message) -> Element<'static, Message> {
+    let label = label.to_string();
+
+    button(text(label).size(14))
+        .on_press(message)
+        .padding(10)
+        .style(|_theme: &Theme, status| {
+            match status {
+                button::Status::Hovered => Style {
+                    background: Some(iced::Background::Color(Color::from_rgb(0.3, 0.3, 0.35))),
+                    text_color: Color::WHITE,
+                    border: Border {
+                        color: Color::from_rgb(0.4, 0.4, 0.45),
+                        width: 1.0,
+                        radius: 6.0.into(),
+                    },
+                    shadow: iced::Shadow::default(),
+                },
+                button::Status::Pressed => Style {
+                    background: Some(iced::Background::Color(Color::from_rgb(0.2, 0.2, 0.25))),
+                    text_color: Color::WHITE,
+                    border: Border {
+                        color: Color::from_rgb(0.3, 0.3, 0.35),
+                        width: 1.0,
+                        radius: 6.0.into(),
+                    },
+                    shadow: iced::Shadow::default(),
+                },
+                _ => Style {
+                    background: Some(iced::Background::Color(Color::from_rgb(0.15, 0.15, 0.2))),
+                    text_color: Color::from_rgb(0.9, 0.9, 0.9),
+                    border: Border {
+                        color: Color::from_rgb(0.25, 0.25, 0.3),
+                        width: 1.0,
+                        radius: 6.0.into(),
+                    },
+                    shadow: iced::Shadow::default(),
+                },
+            }
+        })
+        .into()
 }
 
 /// Overview tab - balance and status
@@ -101,8 +206,6 @@ fn view_overview(wallet_name: &str, data: &WalletData) -> Element<'static, Messa
     let utxos = data.utxos.clone();
 
     column![
-        text("Wallet Overview").size(32),
-
         container(
             column![
                 row![
@@ -188,8 +291,6 @@ fn view_send(data: &WalletData) -> Element<'static, Message> {
     let send_fee_rate = data.send_fee_rate.clone();
 
     column![
-        text("Send Bitcoin").size(32),
-
         column![
             text("Recipient Address").size(16),
             text_input("bc1q...", &send_address)
@@ -222,8 +323,6 @@ fn view_send(data: &WalletData) -> Element<'static, Message> {
 /// Receive tab - show addresses
 fn view_receive(data: &WalletData) -> Element<'static, Message> {
     column![
-        text("Receive Bitcoin").size(32),
-
         text("Generate a new address to receive Bitcoin").size(16),
 
         button("Generate New Address")
@@ -264,7 +363,6 @@ fn view_receive(data: &WalletData) -> Element<'static, Message> {
 /// Transactions tab - transaction history
 fn view_transactions() -> Element<'static, Message> {
     column![
-        text("Transaction History").size(32),
         text("Transaction list coming soon...").size(16),
         button("Refresh")
             .on_press(Message::TransactionsRequested)
@@ -276,37 +374,231 @@ fn view_transactions() -> Element<'static, Message> {
 
 /// SNICKER tab - privacy features
 fn view_snicker(data: &WalletData) -> Element<'static, Message> {
-    column![
-        text("SNICKER Privacy").size(32),
-
+    let mut content = column![
         container(
             column![
-                text("SNICKER allows you to participate in collaborative transactions").size(16),
-                text("This improves your privacy by breaking on-chain links").size(14),
-            ].spacing(10)
+                text("SNICKER allows you to participate in collaborative transactions.").size(16),
+                text("This improves your privacy by breaking on-chain links.").size(14),
+            ].spacing(5)
         )
-        .padding(15),
+        .padding(10),
+    ].spacing(20);
 
-        row![
-            text("Candidates:").size(16),
-            text(format!("{}", data.snicker_candidates)).size(16),
-        ].spacing(10),
+    // ========== PROPOSER SECTION ==========
+    content = content.push(
+        container(
+            column![
+                text("Proposer: Create Proposals").size(24),
+                text("First scan the blockchain for potential candidates, then find matching opportunities with your UTXOs.").size(12),
+            ].spacing(5)
+        )
+        .padding(10)
+    );
 
-        row![
-            text("Opportunities:").size(16),
-            text(format!("{}", data.snicker_opportunities)).size(16),
-        ].spacing(10),
+    // Scan for candidates section
+    let scan_blocks = data.snicker_scan_blocks_input.clone();
+    let scan_min_utxo = data.snicker_scan_min_utxo_input.clone();
+    let scan_max_utxo = data.snicker_scan_max_utxo_input.clone();
 
-        row![
-            button("Scan for Candidates")
-                .on_press(Message::SnickerScanRequested)
-                .padding(15),
-            button("Find Opportunities")
-                .on_press(Message::SnickerFindOpportunities)
-                .padding(15),
-        ]
-        .spacing(15),
-    ]
-    .spacing(20)
-    .into()
+    content = content.push(
+        container(
+            column![
+                text("Scan for Candidates (stored in database):").size(14),
+                row![
+                    text("Blocks:").size(12),
+                    text_input("100", &scan_blocks)
+                        .on_input(Message::SnickerScanBlocksInputChanged)
+                        .width(Length::Fixed(80.0)),
+                    text("Min:").size(12),
+                    text_input("10000", &scan_min_utxo)
+                        .on_input(Message::SnickerScanMinUtxoInputChanged)
+                        .width(Length::Fixed(100.0)),
+                    text("Max:").size(12),
+                    text_input("100000000", &scan_max_utxo)
+                        .on_input(Message::SnickerScanMaxUtxoInputChanged)
+                        .width(Length::Fixed(120.0)),
+                    button("Scan")
+                        .on_press(Message::SnickerScanRequested)
+                        .padding(8),
+                    button("Clear All")
+                        .on_press(Message::SnickerClearCandidates)
+                        .padding(8),
+                ].spacing(10),
+                text(format!("Found {} candidates (includes all stored)", data.snicker_candidates)).size(12),
+            ].spacing(5)
+        )
+        .padding(10)
+    );
+
+    // Find opportunities section
+    let find_min_utxo = data.snicker_find_min_utxo_input.clone();
+
+    content = content.push(
+        container(
+            column![
+                text("Find Opportunities:").size(14),
+                row![
+                    text("Min UTXO:").size(12),
+                    text_input("10000", &find_min_utxo)
+                        .on_input(Message::SnickerFindMinUtxoInputChanged)
+                        .width(Length::Fixed(100.0)),
+                    button("Find")
+                        .on_press(Message::SnickerFindOpportunities)
+                        .padding(8),
+                ].spacing(10),
+                text(format!("Found {} opportunities", data.snicker_opportunities)).size(12),
+            ].spacing(5)
+        )
+        .padding(10)
+    );
+
+    // Show opportunities list with create proposal section
+    if !data.snicker_opportunities_list.is_empty() {
+        let delta_input = data.snicker_proposal_delta_input.clone();
+
+        let mut opp_list = column![].spacing(10);
+
+        for (index, display) in &data.snicker_opportunities_list {
+            let delta_for_button = delta_input.parse::<i64>().unwrap_or(0) as u64;
+            opp_list = opp_list.push(
+                container(
+                    column![
+                        text(display.clone()).size(12),
+                        row![
+                            text("Delta (sats):").size(12),
+                            text_input("0", &delta_input)
+                                .on_input(Message::SnickerProposalDeltaInputChanged)
+                                .width(Length::Fixed(100.0)),
+                            button(text("Create Proposal"))
+                                .on_press(Message::SnickerCreateProposal(*index, delta_for_button))
+                                .padding(5),
+                        ].spacing(5),
+                    ].spacing(5)
+                )
+                .padding(10)
+            );
+        }
+
+        content = content.push(
+            container(
+                column![
+                    text("Available Opportunities:").size(16),
+                    scrollable(opp_list)
+                        .direction(Direction::Vertical(
+                            Scrollbar::new()
+                                .width(0)
+                                .scroller_width(0)
+                        ))
+                        .height(Length::Fixed(300.0)),
+                ].spacing(10)
+            )
+            .padding(10)
+        );
+    }
+
+    // Show last created proposal
+    if let Some(ref tag) = data.snicker_last_proposal {
+        content = content.push(
+            container(
+                column![
+                    text("✅ Last Created Proposal:").size(14),
+                    text(format!("Tag: {}", tag)).size(12),
+                    text(format!("File: ./{}", tag)).size(11),
+                ].spacing(3)
+            )
+            .padding(10)
+        );
+    }
+
+    content = content.push(text("─".repeat(80)).size(12));
+
+    // ========== RECEIVER SECTION ==========
+    content = content.push(
+        container(
+            column![
+                text("Receiver: Accept Proposals").size(24),
+                text("Scan for incoming proposals or load a specific proposal file by tag.").size(12),
+            ].spacing(5)
+        )
+        .padding(10)
+    );
+
+    // Scan for incoming proposals with delta range inputs
+    let min_delta = data.snicker_scan_min_delta_input.clone();
+    let max_delta = data.snicker_scan_max_delta_input.clone();
+    let min_val = min_delta.parse::<i64>().unwrap_or(-1000);
+    let max_val = max_delta.parse::<i64>().unwrap_or(5000);
+
+    content = content.push(
+        container(
+            column![
+                text("Scan for Incoming Proposals:").size(14),
+                row![
+                    text("Min Δ:").size(12),
+                    text_input("-1000", &min_delta)
+                        .on_input(Message::SnickerScanMinDeltaInputChanged)
+                        .width(Length::Fixed(80.0)),
+                    text("Max Δ:").size(12),
+                    text_input("5000", &max_delta)
+                        .on_input(Message::SnickerScanMaxDeltaInputChanged)
+                        .width(Length::Fixed(80.0)),
+                    button("Scan")
+                        .on_press(Message::SnickerScanIncomingProposals(min_val, max_val))
+                        .padding(8),
+                ].spacing(10),
+            ].spacing(5)
+        )
+        .padding(10)
+    );
+
+    // Load proposal from file
+    let tag_input = data.snicker_proposal_tag_input.clone();
+    content = content.push(
+        container(
+            column![
+                text("Load Proposal from File:").size(14),
+                row![
+                    text("Tag:").size(12),
+                    text_input("proposal tag (hex)", &tag_input)
+                        .on_input(Message::SnickerProposalTagInputChanged)
+                        .width(Length::Fixed(300.0)),
+                    button("Load")
+                        .on_press(Message::SnickerLoadProposalFromFile(format!("./{}", tag_input)))
+                        .padding(8),
+                ].spacing(10),
+            ].spacing(5)
+        )
+        .padding(10)
+    );
+
+    // Show incoming proposals with accept buttons
+    if !data.snicker_incoming_proposals.is_empty() {
+        let mut proposals_list = column![
+            text(format!("Found {} incoming proposal(s):", data.snicker_incoming_proposals.len())).size(16),
+        ].spacing(10);
+
+        for tag in &data.snicker_incoming_proposals {
+            // Truncate tag for display
+            let display_tag = if tag.len() > 16 {
+                format!("{}...{}", &tag[..8], &tag[tag.len()-8..])
+            } else {
+                tag.clone()
+            };
+
+            proposals_list = proposals_list.push(
+                container(
+                    row![
+                        text(format!("Tag: {}", display_tag)).size(12),
+                        button("Accept & Broadcast")
+                            .on_press(Message::SnickerAcceptProposal(tag.clone()))
+                            .padding(8),
+                    ].spacing(10)
+                )
+                .padding(5)
+            );
+        }
+        content = content.push(container(proposals_list).padding(10));
+    }
+
+    content.into()
 }

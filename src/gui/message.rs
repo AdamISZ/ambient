@@ -70,8 +70,26 @@ pub enum Message {
     // SNICKER
     SnickerScanRequested,
     SnickerScanCompleted(Result<usize, String>),
+    SnickerScanBlocksInputChanged(String),
+    SnickerScanMinUtxoInputChanged(String),
+    SnickerScanMaxUtxoInputChanged(String),
+    SnickerClearCandidates,
+    SnickerCandidatesCleared(Result<usize, String>),
     SnickerFindOpportunities,
-    SnickerOpportunitiesFound(usize),
+    SnickerFindMinUtxoInputChanged(String),
+    SnickerOpportunitiesFound(usize, Vec<(usize, String)>, Vec<crate::snicker::ProposalOpportunity>), // (count, list, data)
+    SnickerCreateProposal(usize, u64), // (opportunity_index, delta_sats)
+    SnickerProposalCreated(Result<String, String>), // proposal hex or error
+    SnickerScanIncomingProposals(i64, i64), // (min_delta, max_delta)
+    SnickerIncomingProposalsFound(Vec<String>), // list of proposal tags
+    SnickerProposalTagInputChanged(String), // tag input for loading
+    SnickerProposalDeltaInputChanged(String), // delta input for creating proposals
+    SnickerScanMinDeltaInputChanged(String), // min delta input for scanning
+    SnickerScanMaxDeltaInputChanged(String), // max delta input for scanning
+    SnickerLoadProposalFromFile(String), // filename
+    SnickerProposalLoaded(Result<String, String>), // tag or error
+    SnickerAcceptProposal(String), // proposal tag
+    SnickerProposalAccepted(Result<String, String>), // txid or error
 
     // Navigation
     ViewChanged(View),

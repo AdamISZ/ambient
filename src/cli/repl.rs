@@ -692,51 +692,13 @@ pub async fn repl(
 
                     println!("✍️  Accepting proposal {}...", tag_hex);
 
-                    // Get the proposal first so we can store UTXO info after broadcast
-                    let proposal = match mgr.get_decrypted_proposal_by_tag(&tag).await {
-                        Ok(Some(p)) => p,
-                        Ok(None) => {
-                            println!("❌ Proposal not found");
-                            continue;
+                    // Use the high-level manager method that handles the complete workflow
+                    match mgr.accept_and_broadcast_snicker_proposal(&tag, acceptable_range).await {
+                        Ok(txid) => {
+                            println!("✅ SNICKER coinjoin broadcast: {}", txid);
+                            println!("🎉 SNICKER coinjoin complete!");
                         }
-                        Err(e) => {
-                            println!("❌ Error fetching proposal: {}", e);
-                            continue;
-                        }
-                    };
-
-                    // Get our UTXOs before accepting (needed for UTXO tracking)
-                    let our_utxos: Vec<_> = {
-                        let wallet = mgr.wallet_node.wallet.lock().await;
-                        wallet.list_unspent().collect()
-                    };
-
-                    match mgr.accept_snicker_proposal(&tag, acceptable_range).await {
-                        Ok(psbt) => {
-                            println!("✅ Proposal signed");
-                            match mgr.finalize_psbt(psbt).await {
-                                Ok(tx) => {
-                                    println!("✅ Transaction finalized");
-                                    let tx_clone = tx.clone();
-                                    match mgr.broadcast_transaction(tx).await {
-                                        Ok(txid) => {
-                                            println!("✅ Coinjoin transaction broadcast: {}", txid);
-
-                                            // Track the SNICKER UTXO for future detection during sync
-                                            match mgr.store_accepted_snicker_utxo(&proposal, &tx_clone, &our_utxos).await {
-                                                Ok(()) => println!("📋 SNICKER UTXO tracked (will be detected during sync)"),
-                                                Err(e) => println!("⚠️  Warning: Failed to track SNICKER UTXO: {}", e),
-                                            }
-
-                                            println!("🎉 SNICKER coinjoin complete!");
-                                        }
-                                        Err(e) => println!("❌ Broadcast error: {}", e),
-                                    }
-                                }
-                                Err(e) => println!("❌ Finalization error: {}", e),
-                            }
-                        }
-                        Err(e) => println!("❌ Error accepting proposal: {}", e),
+                        Err(e) => println!("❌ Error: {}", e),
                     }
                 } else {
                     println!("No wallet loaded.");

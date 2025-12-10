@@ -104,7 +104,7 @@ impl AmbientApp {
             }
 
             Message::MenuOpenWallet => {
-                // Scan for available wallets and show modal
+                // Show custom scrollable wallet list modal
                 println!("Menu: Open Wallet clicked");
 
                 // Scan wallet directory for existing wallets
@@ -115,6 +115,7 @@ impl AmbientApp {
                         entries
                             .filter_map(|e| e.ok())
                             .filter(|e| e.file_type().ok().map(|t| t.is_dir()).unwrap_or(false))
+                            .filter(|e| is_wallet_directory(&e.path()))
                             .filter_map(|e| e.file_name().into_string().ok())
                             .collect::<Vec<_>>()
                     })
@@ -708,8 +709,13 @@ impl AmbientApp {
             }
 
             Message::SnickerScanRequested => {
-                if let AppState::WalletLoaded { manager, .. } = &self.state {
-                    println!("🔍 Scanning for SNICKER candidates...");
+                if let AppState::WalletLoaded { manager, wallet_data } = &self.state {
+                    let blocks = wallet_data.snicker_scan_blocks_input.parse::<u32>().unwrap_or(100);
+                    let min_utxo = wallet_data.snicker_scan_min_utxo_input.parse::<u64>().unwrap_or(10_000);
+                    let max_utxo = wallet_data.snicker_scan_max_utxo_input.parse::<u64>().unwrap_or(100_000_000);
+
+                    println!("🔍 Scanning for SNICKER candidates (blocks: {}, min: {}, max: {})...",
+                             blocks, min_utxo, max_utxo);
 
                     let manager_clone = manager.clone();
                     let rt_handle = self.tokio_runtime.handle().clone();
@@ -718,8 +724,7 @@ impl AmbientApp {
                         async move {
                             rt_handle.spawn(async move {
                                 let manager = manager_clone.lock().await;
-                                // Scan last 100 blocks for taproot UTXOs between 10k-1BTC sats
-                                manager.scan_for_snicker_candidates(100, 10_000, 100_000_000).await
+                                manager.scan_for_snicker_candidates(blocks, min_utxo, max_utxo).await
                             }).await.unwrap()
                         },
                         |result| match result {
@@ -727,6 +732,34 @@ impl AmbientApp {
                             Err(e) => Message::SnickerScanCompleted(Err(e.to_string())),
                         }
                     );
+                }
+                Task::none()
+            }
+
+            Message::SnickerScanBlocksInputChanged(value) => {
+                if let AppState::WalletLoaded { wallet_data, .. } = &mut self.state {
+                    wallet_data.snicker_scan_blocks_input = value;
+                }
+                Task::none()
+            }
+
+            Message::SnickerScanMinUtxoInputChanged(value) => {
+                if let AppState::WalletLoaded { wallet_data, .. } = &mut self.state {
+                    wallet_data.snicker_scan_min_utxo_input = value;
+                }
+                Task::none()
+            }
+
+            Message::SnickerScanMaxUtxoInputChanged(value) => {
+                if let AppState::WalletLoaded { wallet_data, .. } = &mut self.state {
+                    wallet_data.snicker_scan_max_utxo_input = value;
+                }
+                Task::none()
+            }
+
+            Message::SnickerFindMinUtxoInputChanged(value) => {
+                if let AppState::WalletLoaded { wallet_data, .. } = &mut self.state {
+                    wallet_data.snicker_find_min_utxo_input = value;
                 }
                 Task::none()
             }
@@ -748,9 +781,9 @@ impl AmbientApp {
                 Task::none()
             }
 
-            Message::SnickerFindOpportunities => {
+            Message::SnickerClearCandidates => {
                 if let AppState::WalletLoaded { manager, .. } = &self.state {
-                    println!("🔍 Finding SNICKER opportunities...");
+                    println!("🗑️  Clearing SNICKER candidates...");
 
                     let manager_clone = manager.clone();
                     let rt_handle = self.tokio_runtime.handle().clone();
@@ -759,15 +792,72 @@ impl AmbientApp {
                         async move {
                             rt_handle.spawn(async move {
                                 let manager = manager_clone.lock().await;
-                                // Find opportunities for our UTXOs >= 10k sats
-                                manager.find_snicker_opportunities(10_000).await
+                                manager.clear_snicker_candidates().await
                             }).await.unwrap()
                         },
                         |result| match result {
-                            Ok(opportunities) => Message::SnickerOpportunitiesFound(opportunities.len()),
+                            Ok(count) => Message::SnickerCandidatesCleared(Ok(count)),
+                            Err(e) => Message::SnickerCandidatesCleared(Err(e.to_string())),
+                        }
+                    );
+                }
+                Task::none()
+            }
+
+            Message::SnickerCandidatesCleared(result) => {
+                match result {
+                    Ok(count) => {
+                        println!("✅ Cleared {} SNICKER candidates", count);
+
+                        // Reset the candidates count and clear opportunities
+                        if let AppState::WalletLoaded { wallet_data, .. } = &mut self.state {
+                            wallet_data.snicker_candidates = 0;
+                            wallet_data.snicker_opportunities = 0;
+                            wallet_data.snicker_opportunities_list.clear();
+                            wallet_data.snicker_opportunities_data.clear();
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("❌ Failed to clear candidates: {}", e);
+                    }
+                }
+                Task::none()
+            }
+
+            Message::SnickerFindOpportunities => {
+                if let AppState::WalletLoaded { manager, wallet_data } = &self.state {
+                    let min_utxo = wallet_data.snicker_find_min_utxo_input.parse::<u64>().unwrap_or(10_000);
+
+                    println!("🔍 Finding SNICKER opportunities (min UTXO: {})...", min_utxo);
+
+                    let manager_clone = manager.clone();
+                    let rt_handle = self.tokio_runtime.handle().clone();
+
+                    return Task::perform(
+                        async move {
+                            rt_handle.spawn(async move {
+                                let manager = manager_clone.lock().await;
+                                manager.find_snicker_opportunities(min_utxo).await
+                            }).await.unwrap()
+                        },
+                        |result| match result {
+                            Ok(opportunities) => {
+                                // Format opportunities for display
+                                let list: Vec<(usize, String)> = opportunities.iter().enumerate()
+                                    .map(|(i, opp)| {
+                                        let our_sats = opp.our_value.to_sat();
+                                        let target_sats = opp.target_value.to_sat();
+                                        let target_txid = opp.target_tx.compute_txid();
+                                        let target_vout = opp.target_output_index;
+                                        (i, format!("{}. Our: {} sats → Target: {}:{} ({} sats)",
+                                                   i, our_sats, target_txid, target_vout, target_sats))
+                                    })
+                                    .collect();
+                                Message::SnickerOpportunitiesFound(opportunities.len(), list, opportunities)
+                            }
                             Err(e) => {
                                 eprintln!("❌ Failed to find opportunities: {}", e);
-                                Message::SnickerOpportunitiesFound(0)
+                                Message::SnickerOpportunitiesFound(0, Vec::new(), Vec::new())
                             }
                         }
                     );
@@ -775,12 +865,253 @@ impl AmbientApp {
                 Task::none()
             }
 
-            Message::SnickerOpportunitiesFound(count) => {
+            Message::SnickerOpportunitiesFound(count, list, data) => {
                 println!("✅ Found {} SNICKER opportunities", count);
 
-                // Update the opportunities count in state
+                // Update the opportunities count, list, and data in state
                 if let AppState::WalletLoaded { wallet_data, .. } = &mut self.state {
                     wallet_data.snicker_opportunities = count;
+                    wallet_data.snicker_opportunities_list = list;
+                    wallet_data.snicker_opportunities_data = data;
+                }
+                Task::none()
+            }
+
+            Message::SnickerCreateProposal(index, delta_sats) => {
+                if let AppState::WalletLoaded { manager, wallet_data, .. } = &mut self.state {
+                    // Get the opportunity from stored data
+                    if index >= wallet_data.snicker_opportunities_data.len() {
+                        eprintln!("❌ Invalid opportunity index");
+                        return Task::none();
+                    }
+
+                    let opportunity = wallet_data.snicker_opportunities_data[index].clone();
+                    let manager_clone = manager.clone();
+                    let rt_handle = self.tokio_runtime.handle().clone();
+
+                    println!("📝 Creating SNICKER proposal (index {}, delta {} sats)...", index, delta_sats);
+
+                    return Task::perform(
+                        async move {
+                            rt_handle.spawn(async move {
+                                let mut manager = manager_clone.lock().await;
+                                let (proposal, encrypted) = manager.create_snicker_proposal(&opportunity, delta_sats as i64).await?;
+
+                                let tag_hex = ::hex::encode(&proposal.tag);
+
+                                // Serialize the proposal
+                                let serialized = manager.serialize_encrypted_proposal(&encrypted);
+
+                                // Write to file named by tag
+                                let filename = format!("./{}", tag_hex);
+                                tokio::fs::write(&filename, serialized).await?;
+
+                                println!("✅ Proposal created and saved to {}", filename);
+                                Ok(tag_hex)
+                            }).await.unwrap()
+                        },
+                        |result: Result<String, anyhow::Error>| match result {
+                            Ok(tag_hex) => {
+                                Message::SnickerProposalCreated(Ok(tag_hex))
+                            }
+                            Err(e) => {
+                                eprintln!("❌ Failed to create proposal: {}", e);
+                                Message::SnickerProposalCreated(Err(e.to_string()))
+                            }
+                        }
+                    );
+                }
+                Task::none()
+            }
+
+            Message::SnickerProposalCreated(result) => {
+                if let AppState::WalletLoaded { wallet_data, .. } = &mut self.state {
+                    match result {
+                        Ok(tag) => {
+                            wallet_data.snicker_last_proposal = Some(tag);
+                        }
+                        Err(_) => {
+                            // Error already printed
+                        }
+                    }
+                }
+                Task::none()
+            }
+
+            Message::SnickerScanIncomingProposals(min_delta, max_delta) => {
+                if let AppState::WalletLoaded { manager, .. } = &self.state {
+                    println!("🔍 Scanning for incoming SNICKER proposals (delta range: {} to {} sats)...",
+                             min_delta, max_delta);
+
+                    let manager_clone = manager.clone();
+                    let rt_handle = self.tokio_runtime.handle().clone();
+
+                    return Task::perform(
+                        async move {
+                            rt_handle.spawn(async move {
+                                let manager = manager_clone.lock().await;
+                                manager.scan_for_our_proposals((min_delta, max_delta)).await
+                            }).await.unwrap()
+                        },
+                        |result| match result {
+                            Ok(proposals) => {
+                                let tags: Vec<String> = proposals.iter()
+                                    .map(|p| ::hex::encode(&p.tag))
+                                    .collect();
+                                println!("✅ Found {} incoming proposals", tags.len());
+                                Message::SnickerIncomingProposalsFound(tags)
+                            }
+                            Err(e) => {
+                                eprintln!("❌ Failed to scan proposals: {}", e);
+                                Message::SnickerIncomingProposalsFound(Vec::new())
+                            }
+                        }
+                    );
+                }
+                Task::none()
+            }
+
+            Message::SnickerIncomingProposalsFound(tags) => {
+                if let AppState::WalletLoaded { wallet_data, .. } = &mut self.state {
+                    wallet_data.snicker_incoming_proposals = tags;
+                }
+                Task::none()
+            }
+
+            Message::SnickerProposalTagInputChanged(value) => {
+                if let AppState::WalletLoaded { wallet_data, .. } = &mut self.state {
+                    wallet_data.snicker_proposal_tag_input = value;
+                }
+                Task::none()
+            }
+
+            Message::SnickerProposalDeltaInputChanged(value) => {
+                if let AppState::WalletLoaded { wallet_data, .. } = &mut self.state {
+                    wallet_data.snicker_proposal_delta_input = value;
+                }
+                Task::none()
+            }
+
+            Message::SnickerScanMinDeltaInputChanged(value) => {
+                if let AppState::WalletLoaded { wallet_data, .. } = &mut self.state {
+                    wallet_data.snicker_scan_min_delta_input = value;
+                }
+                Task::none()
+            }
+
+            Message::SnickerScanMaxDeltaInputChanged(value) => {
+                if let AppState::WalletLoaded { wallet_data, .. } = &mut self.state {
+                    wallet_data.snicker_scan_max_delta_input = value;
+                }
+                Task::none()
+            }
+
+            Message::SnickerLoadProposalFromFile(filename) => {
+                if let AppState::WalletLoaded { manager, .. } = &self.state {
+                    println!("📂 Loading proposal from file: {}", filename);
+
+                    let manager_clone = manager.clone();
+                    let rt_handle = self.tokio_runtime.handle().clone();
+                    let filename_clone = filename.clone();
+
+                    return Task::perform(
+                        async move {
+                            rt_handle.spawn(async move {
+                                // Read file
+                                let contents = tokio::fs::read_to_string(&filename_clone).await?;
+
+                                // Load and store proposal via manager
+                                let manager = manager_clone.lock().await;
+                                let tag = manager.load_proposal_from_serialized(&contents).await?;
+
+                                Ok(::hex::encode(&tag))
+                            }).await.unwrap()
+                        },
+                        |result: Result<String, anyhow::Error>| match result {
+                            Ok(tag_hex) => {
+                                println!("✅ Proposal loaded! Tag: {}", tag_hex);
+                                Message::SnickerProposalLoaded(Ok(tag_hex))
+                            }
+                            Err(e) => {
+                                eprintln!("❌ Failed to load proposal: {}", e);
+                                Message::SnickerProposalLoaded(Err(e.to_string()))
+                            }
+                        }
+                    );
+                }
+                Task::none()
+            }
+
+            Message::SnickerProposalLoaded(result) => {
+                match result {
+                    Ok(tag_hex) => {
+                        // Add the loaded proposal to the incoming list so it shows up with Accept button
+                        if let AppState::WalletLoaded { wallet_data, .. } = &mut self.state {
+                            if !wallet_data.snicker_incoming_proposals.contains(&tag_hex) {
+                                wallet_data.snicker_incoming_proposals.push(tag_hex);
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        // Error already printed
+                    }
+                }
+                Task::none()
+            }
+
+            Message::SnickerAcceptProposal(tag_hex) => {
+                if let AppState::WalletLoaded { manager, .. } = &self.state {
+                    println!("✅ Accepting SNICKER proposal {}...", tag_hex);
+
+                    let manager_clone = manager.clone();
+                    let rt_handle = self.tokio_runtime.handle().clone();
+
+                    // Parse tag from hex
+                    let tag_bytes = match ::hex::decode(&tag_hex) {
+                        Ok(bytes) if bytes.len() == 8 => {
+                            let mut tag = [0u8; 8];
+                            tag.copy_from_slice(&bytes);
+                            tag
+                        }
+                        _ => {
+                            eprintln!("❌ Invalid proposal tag");
+                            return Task::none();
+                        }
+                    };
+
+                    return Task::perform(
+                        async move {
+                            rt_handle.spawn(async move {
+                                let mut manager = manager_clone.lock().await;
+                                // Use the high-level manager method that handles everything
+                                manager.accept_and_broadcast_snicker_proposal(&tag_bytes, (-1_000_000, 1_000_000)).await
+                            }).await.unwrap()
+                        },
+                        |result| match result {
+                            Ok(txid) => {
+                                println!("✅ SNICKER coinjoin broadcast: {}", txid);
+                                Message::SnickerProposalAccepted(Ok(txid.to_string()))
+                            }
+                            Err(e) => {
+                                eprintln!("❌ Failed to accept proposal: {}", e);
+                                Message::SnickerProposalAccepted(Err(e.to_string()))
+                            }
+                        }
+                    );
+                }
+                Task::none()
+            }
+
+            Message::SnickerProposalAccepted(result) => {
+                match result {
+                    Ok(txid) => {
+                        println!("🎉 SNICKER coinjoin complete! Txid: {}", txid);
+                        // Trigger balance update
+                        return Task::done(Message::SyncRequested);
+                    }
+                    Err(_) => {
+                        // Error already printed
+                    }
                 }
                 Task::none()
             }
@@ -846,4 +1177,19 @@ impl Default for AmbientApp {
         let (app, _) = Self::new();
         app
     }
+}
+
+/// Check if a directory is a valid wallet directory
+///
+/// A wallet directory should contain at least one of the core wallet files.
+/// This can be updated if the wallet structure changes.
+fn is_wallet_directory(path: &std::path::Path) -> bool {
+    // Check for presence of core wallet files
+    let has_wallet_db = path.join("wallet.sqlite").exists();
+    let has_mnemonic = path.join("mnemonic.txt").exists();
+    let has_snicker_db = path.join("snicker.sqlite").exists();
+
+    // Directory is a wallet if it has the wallet database or mnemonic
+    // (snicker.sqlite alone isn't sufficient as it might be orphaned)
+    has_wallet_db || has_mnemonic
 }

@@ -23,6 +23,11 @@ impl Manager {
     /// * `wallet_name` - Name of the wallet to load
     /// * `network_str` - Network ("regtest", "signet", "mainnet")
     /// * `recovery_height` - Height to start blockchain recovery from
+    ///
+    /// # TODO
+    /// Add wallet file locking to prevent multiple instances from opening the same wallet.
+    /// This would avoid SQLite "database is locked" errors and potential double-spending issues.
+    /// Consider using a lockfile (e.g., .wallet.lock) or flock() on the wallet database.
     pub async fn load(
         wallet_name: &str,
         network_str: &str,
@@ -483,6 +488,62 @@ impl Manager {
         self.snicker.store_snicker_proposal(proposal).await
     }
 
+    /// Serialize an encrypted proposal to a string format (for file storage/network sharing)
+    pub fn serialize_encrypted_proposal(&self, proposal: &EncryptedProposal) -> String {
+        format!(
+            "{{\n  \"ephemeral_pubkey\": \"{}\",\n  \"tag\": \"{}\",\n  \"encrypted_data\": \"{}\"\n}}",
+            proposal.ephemeral_pubkey,
+            ::hex::encode(&proposal.tag),
+            ::hex::encode(&proposal.encrypted_data)
+        )
+    }
+
+    /// Deserialize and store a proposal from its serialized form
+    /// Returns the proposal tag
+    pub async fn load_proposal_from_serialized(&self, serialized: &str) -> Result<[u8; 8]> {
+        // Parse the JSON-like format
+        let ephemeral_pubkey = serialized
+            .lines()
+            .find(|l| l.contains("ephemeral_pubkey"))
+            .and_then(|l| l.split('"').nth(3))
+            .ok_or_else(|| anyhow::anyhow!("Missing ephemeral_pubkey"))?;
+
+        let tag_hex = serialized
+            .lines()
+            .find(|l| l.contains("\"tag\""))
+            .and_then(|l| l.split('"').nth(3))
+            .ok_or_else(|| anyhow::anyhow!("Missing tag"))?;
+
+        let encrypted_data_hex = serialized
+            .lines()
+            .find(|l| l.contains("encrypted_data"))
+            .and_then(|l| l.split('"').nth(3))
+            .ok_or_else(|| anyhow::anyhow!("Missing encrypted_data"))?;
+
+        // Decode from hex
+        let pubkey = ephemeral_pubkey.parse::<bdk_wallet::bitcoin::secp256k1::PublicKey>()?;
+        let tag_bytes = ::hex::decode(tag_hex)?;
+        let encrypted_data = ::hex::decode(encrypted_data_hex)?;
+
+        if tag_bytes.len() != 8 {
+            return Err(anyhow::anyhow!("Invalid tag length"));
+        }
+
+        let mut tag = [0u8; 8];
+        tag.copy_from_slice(&tag_bytes);
+
+        let proposal = EncryptedProposal {
+            ephemeral_pubkey: pubkey,
+            tag,
+            encrypted_data,
+        };
+
+        // Store it
+        self.store_snicker_proposal(&proposal).await?;
+
+        Ok(tag)
+    }
+
     /// Scan for SNICKER proposals meant for our wallet
     ///
     /// Checks all stored proposals and attempts to decrypt those meant for our UTXOs.
@@ -629,6 +690,97 @@ impl Manager {
         Ok(psbt)
     }
 
+    /// Accept a SNICKER proposal and broadcast the transaction (complete workflow)
+    ///
+    /// This is the high-level method that interfaces should call. It handles:
+    /// - Decrypting the proposal if needed (e.g., loaded from file)
+    /// - Accepting and signing the proposal
+    /// - Finalizing the PSBT
+    /// - Storing the resulting SNICKER UTXO
+    /// - Broadcasting the transaction
+    pub async fn accept_and_broadcast_snicker_proposal(
+        &mut self,
+        tag: &[u8; 8],
+        acceptable_delta_range: (i64, i64),
+    ) -> Result<bdk_wallet::bitcoin::Txid> {
+        println!("🔍 Step 1: Looking for decrypted proposal...");
+
+        // Try to get decrypted proposal first
+        let proposal = match self.snicker.get_decrypted_proposal_by_tag(tag).await? {
+            Some(p) => {
+                println!("✅ Found cached decrypted proposal");
+                p
+            },
+            None => {
+                // Not decrypted yet (e.g., just loaded from file)
+                // Try to decrypt it now with our UTXOs
+                println!("🔓 Proposal not decrypted yet, attempting to decrypt...");
+
+                let wallet = self.wallet_node.wallet.lock().await;
+                let our_utxos: Vec<_> = wallet.list_unspent().collect();
+                drop(wallet);
+
+                println!("🔍 Scanning {} UTXOs to decrypt proposal...", our_utxos.len());
+
+                // Try to decrypt this specific proposal
+                let proposals = self.snicker.scan_proposals(&our_utxos, |keychain, index| {
+                    self.wallet_node.derive_utxo_privkey(keychain, index)
+                }).await?;
+
+                println!("🔍 Decrypted {} proposal(s), looking for matching tag...", proposals.len());
+
+                // Find the one with matching tag
+                let proposal = proposals.into_iter()
+                    .find(|p| &p.tag == tag)
+                    .ok_or_else(|| anyhow::anyhow!("Could not decrypt proposal with tag: {} (not meant for our UTXOs)", hex::encode(tag)))?;
+
+                println!("✅ Successfully decrypted proposal");
+
+                // Cache it for future use
+                if let Ok(delta) = self.snicker.calculate_delta_from_proposal(&proposal) {
+                    let wallet = self.wallet_node.wallet.lock().await;
+                    let our_utxos: Vec<_> = wallet.list_unspent().collect();
+                    drop(wallet);
+
+                    let our_utxo_str = proposal.psbt.unsigned_tx.input.get(1)
+                        .map(|i| format!("{}:{}", i.previous_output.txid, i.previous_output.vout))
+                        .unwrap_or_else(|| "unknown".to_string());
+                    let proposer_utxo_str = proposal.psbt.unsigned_tx.input.get(0)
+                        .map(|i| format!("{}:{}", i.previous_output.txid, i.previous_output.vout))
+                        .unwrap_or_else(|| "unknown".to_string());
+
+                    let _ = self.snicker.store_decrypted_proposal(&proposal, "receiver", &our_utxo_str, &proposer_utxo_str, delta).await;
+                }
+
+                proposal
+            }
+        };
+
+        println!("🔍 Step 2: Getting UTXOs...");
+        let wallet = self.wallet_node.wallet.lock().await;
+        let our_utxos: Vec<_> = wallet.list_unspent().collect();
+        drop(wallet);
+
+        println!("🔍 Step 3: Accepting and signing proposal...");
+        // Accept and sign the proposal
+        let psbt = self.accept_snicker_proposal(tag, acceptable_delta_range).await?;
+
+        println!("🔍 Step 4: Finalizing PSBT...");
+        // Finalize the PSBT
+        let tx = self.finalize_psbt(psbt).await?;
+
+        println!("🔍 Step 5: Storing SNICKER UTXO...");
+        // Store the SNICKER UTXO for future spending
+        self.store_accepted_snicker_utxo(&proposal, &tx, &our_utxos).await?;
+        println!("📋 SNICKER UTXO tracked (will be detected during sync)");
+
+        println!("🔍 Step 6: Broadcasting transaction...");
+        // Broadcast the transaction
+        let txid = self.broadcast_transaction(tx).await?;
+
+        Ok(txid)
+    }
+
     /// Broadcast a transaction to the network
     pub async fn broadcast_transaction(&mut self, tx: Transaction) -> Result<bdk_wallet::bitcoin::Txid> {
         self.wallet_node.broadcast_transaction(tx).await
@@ -704,9 +856,17 @@ impl Manager {
 
         // Add the tweaked scriptPubKey to Kyoto's watch list so it gets detected during sync
         {
-            let mut update_subscriber = self.wallet_node.update_subscriber.lock().await;
-            update_subscriber.add_script(tweaked_output.script_pubkey.clone());
-            info!("✅ Added SNICKER tweaked script to Kyoto watch list: {:?}", tweaked_output.script_pubkey);
+            match self.wallet_node.update_subscriber.try_lock() {
+                Ok(mut update_subscriber) => {
+                    update_subscriber.add_script(tweaked_output.script_pubkey.clone());
+                    println!("✅ Added SNICKER tweaked script to Kyoto watch list");
+                }
+                Err(_) => {
+                    // Update subscriber is busy, but the UTXO will still be in the database
+                    // and will be detected on next sync
+                    println!("⚠️  Update subscriber busy, SNICKER UTXO will be detected on next sync");
+                }
+            }
         }
 
         // Store in database
