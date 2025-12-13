@@ -1,9 +1,13 @@
 use anyhow::Result;
 use std::io::{self, Write};
 use std::fs;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 use crate::manager::Manager;
 use crate::snicker::{ProposalOpportunity, EncryptedProposal};
+use crate::automation::{AutomationTask, AutomationConfig};
+use crate::config::Config;
 use std::str::FromStr;
 
 /// Format an EncryptedProposal for display with hex-encoded data
@@ -73,10 +77,11 @@ pub async fn repl(
     println!("RustSnicker Wallet 🥷");
     println!("Type 'help' for commands.\n");
 
-    let mut current: Option<Manager> = None;
+    let mut manager_arc: Option<Arc<RwLock<Manager>>> = None;
     let mut opportunities: Vec<ProposalOpportunity> = Vec::new();
     let mut last_scan_delta_range: Option<(i64, i64)> = None;
     let mut last_created_proposal: Option<EncryptedProposal> = None;
+    let mut automation_task: Option<AutomationTask> = None;
 
     loop {
         print!("wallet> ");
@@ -117,7 +122,7 @@ pub async fn repl(
                     }
                 }
 
-                current = Some(manager);
+                manager_arc = Some(Arc::new(RwLock::new(manager)));
             }
 
             "load" => {
@@ -137,11 +142,12 @@ pub async fn repl(
                     }
                 }
 
-                current = Some(manager);
+                manager_arc = Some(Arc::new(RwLock::new(manager)));
             }
 
             "balance" => {
-                if let Some(mgr) = current.as_mut() {
+                if let Some(arc) = manager_arc.as_ref() {
+                    let mgr = arc.read().await;
                     println!("Balance: {}", mgr.get_balance().await?);
                 } else {
                     println!("No wallet loaded.");
@@ -149,7 +155,8 @@ pub async fn repl(
             }
 
             "address" => {
-                if let Some(mgr) = current.as_mut() {
+                if let Some(arc) = manager_arc.as_ref() {
+                    let mut mgr = arc.write().await;
                     let addr = mgr.get_next_address().await?;
                     println!("Next address: {addr}");
                 } else {
@@ -158,7 +165,8 @@ pub async fn repl(
             }
 
             "listunspent" => {
-                if let Some(mgr) = current.as_mut() {
+                if let Some(arc) = manager_arc.as_ref() {
+                    let mgr = arc.read().await;
                     let utxos = mgr.list_unspent().await?;
                     if utxos.is_empty() {
                         println!("No UTXOs.");
@@ -173,7 +181,8 @@ pub async fn repl(
             }
 
             "summary" => {
-                if let Some(mgr) = current.as_mut() {
+                if let Some(arc) = manager_arc.as_ref() {
+                    let mgr = arc.read().await;
                     mgr.print_summary().await;
                 } else {
                     println!("No wallet loaded.");
@@ -181,8 +190,9 @@ pub async fn repl(
             }
 
             "sync" => {
-                if let Some(mgr) = current.as_mut() {
+                if let Some(arc) = manager_arc.as_ref() {
                     println!("Syncing (recent blocks)...");
+                    let mut mgr = arc.write().await;
                     mgr.sync_recent().await?;
                     println!("Done.");
                 } else {
@@ -191,7 +201,8 @@ pub async fn repl(
             }
 
             "peek" => {
-                if let Some(mgr) = current.as_mut() {
+                if let Some(arc) = manager_arc.as_ref() {
+                    let mut mgr = arc.write().await;
                     let addresses = mgr.peek_addresses(10).await?;
                     for addr in addresses {
                         println!("{}", addr);
@@ -202,7 +213,8 @@ pub async fn repl(
             }
 
             "reregister" => {
-                if let Some(mgr) = current.as_mut() {
+                if let Some(arc) = manager_arc.as_ref() {
+                    let mut mgr = arc.write().await;
                     println!("{}", mgr.reregister_revealed().await?);
                 } else {
                     println!("No wallet loaded.");
@@ -214,7 +226,8 @@ pub async fn repl(
                     println!("Usage: reveal <index>");
                     continue;
                 }
-                if let Some(mgr) = current.as_mut() {
+                if let Some(arc) = manager_arc.as_ref() {
+                    let mut mgr = arc.write().await;
                     let index: u32 = args[0].parse().unwrap_or(0);
                     println!("{}", mgr.reveal_up_to(index).await?);
                 } else {
@@ -223,7 +236,8 @@ pub async fn repl(
             }
 
             "debug" => {
-                if let Some(mgr) = current.as_mut() {
+                if let Some(arc) = manager_arc.as_ref() {
+                    let mgr = arc.read().await;
                     println!("{}", mgr.debug_transactions().await?);
                 } else {
                     println!("No wallet loaded.");
@@ -236,7 +250,7 @@ pub async fn repl(
                     println!("Example: send tb1q... 10000 1.5");
                     continue;
                 }
-                if let Some(mgr) = current.as_mut() {
+                if let Some(arc) = manager_arc.as_ref() {
                     let address = args[0];
                     let amount: u64 = match args[1].parse() {
                         Ok(a) => a,
@@ -254,6 +268,7 @@ pub async fn repl(
                     };
 
                     println!("Sending {} sats to {} (fee rate: {} sat/vB)...", amount, address, fee_rate);
+                    let mut mgr = arc.write().await;
                     match mgr.send_to_address(address, amount, fee_rate).await {
                         Ok(txid) => println!("✅ Transaction broadcast: {}", txid),
                         Err(e) => println!("❌ Error: {}", e),
@@ -274,7 +289,7 @@ pub async fn repl(
                     println!("  bitcoin-cli sendrawtransaction \"<hex>\"");
                     continue;
                 }
-                if let Some(mgr) = current.as_mut() {
+                if let Some(arc) = manager_arc.as_ref() {
                     let address = args[0];
                     let amount: u64 = match args[1].parse() {
                         Ok(a) => a,
@@ -293,6 +308,7 @@ pub async fn repl(
 
                     println!("Building SNICKER transaction: {} sats to {} (fee rate: {} sat/vB)...",
                              amount, address, fee_rate);
+                    let mut mgr = arc.write().await;
                     match mgr.build_snicker_tx(address, amount, fee_rate).await {
                         Ok(tx_hex) => {
                             println!("✅ Transaction built successfully!");
@@ -320,7 +336,7 @@ pub async fn repl(
                     println!("Example: scan_candidates 10 10000 1000000");
                     continue;
                 }
-                if let Some(mgr) = current.as_mut() {
+                if let Some(arc) = manager_arc.as_ref() {
                     let num_blocks: u32 = match args[0].parse() {
                         Ok(n) => n,
                         Err(_) => {
@@ -345,6 +361,7 @@ pub async fn repl(
 
                     println!("🔍 Scanning {} blocks for SNICKER candidates ({}-{} sats)...",
                              num_blocks, min_sats, max_sats);
+                    let mut mgr = arc.write().await;
                     match mgr.scan_for_snicker_candidates(num_blocks, min_sats, max_sats).await {
                         Ok(count) => println!("✅ Found and stored {} candidates", count),
                         Err(e) => println!("❌ Error: {}", e),
@@ -360,11 +377,12 @@ pub async fn repl(
                     println!("Example: test_get_block 0000000000000000000000000000000000000000000000000000000000000000");
                     continue;
                 }
-                if let Some(mgr) = current.as_mut() {
+                if let Some(arc) = manager_arc.as_ref() {
                     let hash_str = args[0];
                     match hash_str.parse::<bdk_wallet::bitcoin::BlockHash>() {
                         Ok(block_hash) => {
                             println!("🔍 Fetching block {} via Kyoto P2P...", block_hash);
+                            let mut mgr = arc.write().await;
                             match mgr.get_block_info(block_hash).await {
                                 Ok((version, prev_blockhash, num_txs, p2tr_count)) => {
                                     println!("✅ Successfully fetched block:");
@@ -390,7 +408,7 @@ pub async fn repl(
                     println!("Example: test_headers_db 100 110");
                     continue;
                 }
-                if let Some(mgr) = current.as_mut() {
+                if let Some(arc) = manager_arc.as_ref() {
                     let start_height: u32 = match args[0].parse() {
                         Ok(h) => h,
                         Err(_) => {
@@ -407,6 +425,7 @@ pub async fn repl(
                     };
 
                     println!("🔍 Querying Kyoto headers.db for heights {}-{}...", start_height, end_height);
+                    let mgr = arc.read().await;
                     match mgr.get_block_hashes_from_headers_db(start_height, end_height) {
                         Ok(hashes) => {
                             println!("✅ Retrieved {} block hashes:", hashes.len());
@@ -430,7 +449,7 @@ pub async fn repl(
                     println!("Example: find_opportunities 75000");
                     continue;
                 }
-                if let Some(mgr) = current.as_mut() {
+                if let Some(arc) = manager_arc.as_ref() {
                     let min_utxo_sats: u64 = match args[0].parse() {
                         Ok(m) => m,
                         Err(_) => {
@@ -440,6 +459,7 @@ pub async fn repl(
                     };
 
                     println!("🔍 Finding SNICKER opportunities...");
+                    let mut mgr = arc.write().await;
                     match mgr.find_snicker_opportunities(min_utxo_sats).await {
                         Ok(found) => {
                             if found.is_empty() {
@@ -472,7 +492,8 @@ pub async fn repl(
             }
 
             "list_candidates" => {
-                if let Some(mgr) = current.as_mut() {
+                if let Some(arc) = manager_arc.as_ref() {
+                    let mgr = arc.read().await;
                     match mgr.get_snicker_candidates().await {
                         Ok(candidates) => {
                             if candidates.is_empty() {
@@ -500,7 +521,8 @@ pub async fn repl(
             }
 
             "clear_candidates" => {
-                if let Some(mgr) = current.as_mut() {
+                if let Some(arc) = manager_arc.as_ref() {
+                    let mut mgr = arc.write().await;
                     match mgr.clear_snicker_candidates().await {
                         Ok(count) => println!("✅ Cleared {} candidates", count),
                         Err(e) => println!("❌ Error: {}", e),
@@ -511,7 +533,8 @@ pub async fn repl(
             }
 
             "clear_proposals" => {
-                if let Some(mgr) = current.as_mut() {
+                if let Some(arc) = manager_arc.as_ref() {
+                    let mut mgr = arc.write().await;
                     match mgr.clear_snicker_proposals().await {
                         Ok(count) => println!("✅ Cleared {} proposals", count),
                         Err(e) => println!("❌ Error: {}", e),
@@ -521,13 +544,51 @@ pub async fn repl(
                 }
             }
 
+            "snicker_pattern_check" => {
+                if let Some(arc) = manager_arc.as_ref() {
+                    let mgr = arc.read().await;
+                    match mgr.get_snicker_candidates().await {
+                        Ok(all_candidates) => {
+                            let mut pattern_matches = 0;
+
+                            println!("🔍 Analyzing {} candidates for SNICKER pattern...\n", all_candidates.len());
+
+                            for (height, txid, tx) in &all_candidates {
+                                let is_match = crate::snicker::is_likely_snicker_transaction(tx);
+
+                                if is_match {
+                                    pattern_matches += 1;
+                                    println!("✅ Block {}: {}", height, txid);
+                                    println!("   Inputs: {}, Outputs: {}", tx.input.len(), tx.output.len());
+                                    let mut values: Vec<u64> = tx.output.iter().map(|o| o.value.to_sat()).collect();
+                                    values.sort();
+                                    println!("   Output values: {} / {} / {} sats\n",
+                                        values[0], values[1], values[2]);
+                                }
+                            }
+
+                            println!("\n📊 Summary:");
+                            println!("   Total candidates: {}", all_candidates.len());
+                            println!("   SNICKER pattern matches: {}", pattern_matches);
+                            if all_candidates.len() > 0 {
+                                println!("   Match rate: {:.1}%",
+                                    (pattern_matches as f64 / all_candidates.len() as f64) * 100.0);
+                            }
+                        }
+                        Err(e) => println!("❌ Error: {}", e),
+                    }
+                } else {
+                    println!("❌ No wallet loaded");
+                }
+            }
+
             "create_proposal" => {
                 if args.len() != 2 {
                     println!("Usage: create_proposal <index> <delta_sats>");
                     println!("Example: create_proposal 0 5000");
                     continue;
                 }
-                if let Some(mgr) = current.as_mut() {
+                if let Some(arc) = manager_arc.as_ref() {
                     // Parse index
                     let index: usize = match args[0].parse() {
                         Ok(i) => i,
@@ -561,6 +622,7 @@ pub async fn repl(
                              opp.our_value.to_sat());
                     println!("   Target: {} sats, Delta: {} sats", opp.target_value.to_sat(), delta_sats);
 
+                    let mut mgr = arc.write().await;
                     match mgr.create_snicker_proposal(opp, delta_sats).await {
                         Ok((proposal, encrypted_proposal)) => {
                             println!("✅ Proposal created!");
@@ -583,7 +645,7 @@ pub async fn repl(
                     println!("Example: scan_proposals -10000 10000");
                     continue;
                 }
-                if let Some(mgr) = current.as_mut() {
+                if let Some(arc) = manager_arc.as_ref() {
                     let min_delta: i64 = match args[0].parse() {
                         Ok(m) => m,
                         Err(_) => {
@@ -605,6 +667,7 @@ pub async fn repl(
                     // Store delta range for later use in accept_proposal
                     last_scan_delta_range = Some((min_delta, max_delta));
 
+                    let mut mgr = arc.write().await;
                     match mgr.scan_for_our_proposals((min_delta, max_delta)).await {
                         Ok(found) => {
                             if found.is_empty() {
@@ -638,7 +701,7 @@ pub async fn repl(
                     println!("Example: accept_proposal a1b2c3d4e5f6a7b8");
                     continue;
                 }
-                if let Some(mgr) = current.as_mut() {
+                if let Some(arc) = manager_arc.as_ref() {
                     // Parse hex tag using Manager method
                     let tag_hex = args[0];
                     let tag = match Manager::parse_hex_tag(tag_hex) {
@@ -656,6 +719,7 @@ pub async fn repl(
                     println!("✍️  Accepting proposal {}...", tag_hex);
 
                     // Use the high-level manager method that handles the complete workflow
+                    let mut mgr = arc.write().await;
                     match mgr.accept_and_broadcast_snicker_proposal(&tag, acceptable_range).await {
                         Ok(txid) => {
                             println!("✅ SNICKER coinjoin broadcast: {}", txid);
@@ -695,13 +759,14 @@ pub async fn repl(
                     println!("Example: load_proposal proposal.json");
                     continue;
                 }
-                if let Some(mgr) = current.as_mut() {
+                if let Some(arc) = manager_arc.as_ref() {
                     let filename = args[0];
                     match fs::read_to_string(filename) {
                         Ok(contents) => {
                             // Parse the hex-encoded format back to EncryptedProposal
                             match parse_encrypted_proposal(&contents) {
                                 Ok(proposal) => {
+                                    let mut mgr = arc.write().await;
                                     match mgr.store_snicker_proposal(&proposal).await {
                                         Ok(_) => {
                                             println!("✅ Proposal loaded and stored");
@@ -720,7 +785,100 @@ pub async fn repl(
                 }
             }
 
+            // Automation commands
+            "automation_start" => {
+                if let Some(ref arc) = manager_arc {
+                    // Stop existing task if running
+                    if let Some(mut task) = automation_task.take() {
+                        if task.is_running() {
+                            println!("⏸️  Stopping existing automation task...");
+                            task.stop().await;
+                        }
+                    }
+
+                    // Load configuration
+                    let config = match Config::load() {
+                        Ok(c) => c,
+                        Err(e) => {
+                            println!("❌ Failed to load config: {}", e);
+                            continue;
+                        }
+                    };
+
+                    // Check if automation is enabled
+                    if config.snicker_automation.mode == crate::config::AutomationMode::Disabled {
+                        println!("⚠️  Automation is disabled in config.");
+                        println!("   Edit config file to enable: {:?}", crate::config::get_config_path());
+                        continue;
+                    }
+
+                    let mut task = AutomationTask::new();
+                    let task_config = AutomationConfig::default();
+
+                    println!("🤖 Starting SNICKER automation...");
+                    println!("   Mode: {:?}", config.snicker_automation.mode);
+                    println!("   Max delta: {} sats", config.snicker_automation.max_delta);
+                    println!("   Max proposals/day: {}", config.snicker_automation.max_proposals_per_day);
+                    println!("   Interval: {} seconds", task_config.interval_secs);
+
+                    task.start(
+                        arc.clone(),
+                        config.snicker_automation.clone(),
+                        task_config,
+                        config.proposals_directory.clone(),
+                    ).await;
+
+                    automation_task = Some(task);
+                    println!("✅ Automation started");
+                } else {
+                    println!("❌ No wallet loaded");
+                }
+            }
+
+            "automation_stop" => {
+                if let Some(mut task) = automation_task.take() {
+                    if task.is_running() {
+                        println!("⏸️  Stopping automation task...");
+                        task.stop().await;
+                        println!("✅ Automation stopped");
+                    } else {
+                        println!("⚠️  Automation task not running");
+                    }
+                } else {
+                    println!("⚠️  No automation task to stop");
+                }
+            }
+
+            "automation_status" => {
+                match &automation_task {
+                    Some(task) => {
+                        println!("🤖 Automation Status: {}", task.status());
+
+                        // Load config to show current settings
+                        if let Ok(config) = Config::load() {
+                            println!("   Mode: {:?}", config.snicker_automation.mode);
+                            println!("   Max delta: {} sats", config.snicker_automation.max_delta);
+                            println!("   Max proposals/day: {}", config.snicker_automation.max_proposals_per_day);
+                            println!("   SNICKER pattern only: {}", config.snicker_automation.snicker_pattern_only);
+                            println!("   Prefer SNICKER outputs: {}", config.snicker_automation.prefer_snicker_outputs);
+                        }
+                    }
+                    None => {
+                        println!("🤖 Automation Status: Not started");
+                        println!("   Use 'automation_start' to begin");
+                    }
+                }
+            }
+
             "quit" | "exit" => {
+                // Stop automation task if running
+                if let Some(mut task) = automation_task.take() {
+                    if task.is_running() {
+                        println!("⏸️  Stopping automation task...");
+                        task.stop().await;
+                    }
+                }
+
                 println!("👋 Goodbye.");
                 break;
             }
@@ -760,9 +918,15 @@ fn print_help() {
     println!("  scan_proposals <min> <max>         - scan for proposals (min-max delta in sats)");
     println!("  accept_proposal <tag>              - accept and broadcast coinjoin (16 hex chars)");
     println!();
+    println!("SNICKER Automation:");
+    println!("  automation_start                   - start background automation task");
+    println!("  automation_stop                    - stop background automation task");
+    println!("  automation_status                  - show automation status and settings");
+    println!();
     println!("SNICKER Maintenance:");
     println!("  clear_candidates                   - clear candidate database");
     println!("  clear_proposals                    - clear proposals database");
+    println!("  snicker_pattern_check              - analyze candidates for SNICKER pattern");
     println!();
     println!("Other:");
     println!("  help                               - show this help message");

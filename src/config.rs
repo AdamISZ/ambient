@@ -53,6 +53,64 @@ impl std::str::FromStr for Network {
     }
 }
 
+/// SNICKER automation mode
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AutomationMode {
+    /// Disabled - no automation
+    Disabled,
+    /// Basic mode - automatically accept receiver proposals only
+    Basic,
+    /// Advanced mode - accept receiver proposals AND create proposer proposals
+    Advanced,
+}
+
+impl Default for AutomationMode {
+    fn default() -> Self {
+        AutomationMode::Disabled
+    }
+}
+
+/// SNICKER automation configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnickerAutomation {
+    /// Automation mode
+    #[serde(default)]
+    pub mode: AutomationMode,
+
+    /// Maximum delta (in sats) to auto-accept as receiver
+    /// Positive delta = receiver loses money (contributes to fees)
+    /// Negative delta = receiver gains money
+    /// Example: max_delta = 10000 means auto-accept proposals where we lose up to 10k sats
+    #[serde(default = "default_max_delta")]
+    pub max_delta: i64,
+
+    /// Maximum proposals to accept per day (rate limiting)
+    #[serde(default = "default_max_proposals_per_day")]
+    pub max_proposals_per_day: u32,
+
+    /// Prefer proposals that consume SNICKER outputs (creating chains)
+    #[serde(default = "default_prefer_snicker_outputs")]
+    pub prefer_snicker_outputs: bool,
+
+    /// For proposer mode: only create proposals to SNICKER-pattern transactions
+    /// (vs all taproot UTXOs in range)
+    #[serde(default = "default_snicker_pattern_only")]
+    pub snicker_pattern_only: bool,
+}
+
+impl Default for SnickerAutomation {
+    fn default() -> Self {
+        Self {
+            mode: AutomationMode::Disabled,
+            max_delta: default_max_delta(),
+            max_proposals_per_day: default_max_proposals_per_day(),
+            prefer_snicker_outputs: default_prefer_snicker_outputs(),
+            snicker_pattern_only: default_snicker_pattern_only(),
+        }
+    }
+}
+
 /// Application configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -75,6 +133,10 @@ pub struct Config {
     /// Default: ~/.local/share/ambient/{network}/proposals/
     #[serde(default = "default_proposals_dir")]
     pub proposals_directory: PathBuf,
+
+    /// SNICKER automation settings
+    #[serde(default)]
+    pub snicker_automation: SnickerAutomation,
 }
 
 impl Default for Config {
@@ -85,6 +147,7 @@ impl Default for Config {
             wallet_dir: default_wallet_dir(),
             recovery_height: default_recovery_height(),
             proposals_directory: default_proposals_dir(),
+            snicker_automation: SnickerAutomation::default(),
         }
     }
 }
@@ -184,6 +247,26 @@ fn default_proposals_dir() -> PathBuf {
         })
 }
 
+/// Get the default max delta for automation (10,000 sats)
+fn default_max_delta() -> i64 {
+    10_000
+}
+
+/// Get the default max proposals per day
+fn default_max_proposals_per_day() -> u32 {
+    5
+}
+
+/// Get the default for prefer_snicker_outputs
+fn default_prefer_snicker_outputs() -> bool {
+    true
+}
+
+/// Get the default for snicker_pattern_only
+fn default_snicker_pattern_only() -> bool {
+    true
+}
+
 /// Get the configuration file path
 fn config_file_path() -> Result<PathBuf> {
     let config_dir = directories::ProjectDirs::from("", "", "ambient")
@@ -226,6 +309,9 @@ mod tests {
             network: Network::Regtest,
             peer: Some("localhost:18444".to_string()),
             wallet_dir: PathBuf::from("/tmp/wallets"),
+            recovery_height: 0,
+            proposals_directory: PathBuf::from("/tmp/proposals"),
+            snicker_automation: SnickerAutomation::default(),
         };
 
         let toml = toml::to_string(&config).unwrap();

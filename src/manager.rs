@@ -463,8 +463,9 @@ impl Manager {
             sign_callback,
         )?;
 
-        // Store encrypted proposal for sharing
-        self.snicker.store_snicker_proposal(&encrypted_proposal).await?;
+        // Note: We don't store created proposals anymore (proposer side)
+        // The encrypted blob is returned directly for sharing
+        self.snicker.store_created_proposal(&encrypted_proposal).await?;
 
         // Store decrypted proposal in our database (proposer side)
         let our_utxo_str = format!("{}:{}", opportunity.our_outpoint.txid, opportunity.our_outpoint.vout);
@@ -497,8 +498,65 @@ impl Manager {
     }
 
     /// Store an encrypted SNICKER proposal (for publishing/sharing)
-    pub async fn store_snicker_proposal(&self, proposal: &EncryptedProposal) -> Result<()> {
-        self.snicker.store_snicker_proposal(proposal).await
+    /// Store an encrypted SNICKER proposal by attempting to decrypt it
+    /// If decryption succeeds (proposal is for one of our UTXOs), stores in decrypted_proposals table
+    /// If decryption fails (not for us), silently ignores
+    pub async fn store_snicker_proposal(&mut self, proposal: &EncryptedProposal) -> Result<()> {
+        // Get our UTXOs
+        let wallet = self.wallet_node.wallet.lock().await;
+        let our_utxos: Vec<_> = wallet.list_unspent().collect();
+        drop(wallet);
+
+        // Try to decrypt with each UTXO
+        for utxo in &our_utxos {
+            let decrypt_result = self.snicker.try_decrypt_for_utxo(
+                proposal,
+                utxo,
+                |kc, idx| self.wallet_node.derive_utxo_privkey(kc, idx),
+            );
+
+            if let Ok(decrypted) = decrypt_result {
+                // Successfully decrypted! This proposal is for us
+                tracing::info!("✅ Decrypted proposal tag {} for UTXO {}:{}",
+                    ::hex::encode(&proposal.tag),
+                    utxo.outpoint.txid,
+                    utxo.outpoint.vout
+                );
+
+                // Calculate delta
+                let delta = self.snicker.calculate_delta_from_proposal(&decrypted)?;
+
+                // Identify UTXOs in the proposal
+                let our_utxo_str = format!("{}:{}", utxo.outpoint.txid, utxo.outpoint.vout);
+
+                // Find proposer's UTXO (the input that's not ours)
+                let mut proposer_utxo_str = String::from("unknown");
+                for input in &decrypted.psbt.unsigned_tx.input {
+                    let input_str = format!("{}:{}", input.previous_output.txid, input.previous_output.vout);
+                    if input_str != our_utxo_str {
+                        proposer_utxo_str = input_str;
+                        break;
+                    }
+                }
+
+                // Store in decrypted_proposals table (INSERT OR IGNORE handles duplicates)
+                self.snicker.store_decrypted_proposal(
+                    &decrypted,
+                    "receiver",
+                    &our_utxo_str,
+                    &proposer_utxo_str,
+                    delta,
+                ).await?;
+
+                tracing::info!("💾 Stored decrypted proposal with delta {} sats", delta);
+                return Ok(());
+            }
+        }
+
+        // If we get here, proposal wasn't meant for us - that's okay
+        tracing::debug!("Proposal tag {} not meant for our wallet (couldn't decrypt)",
+            ::hex::encode(&proposal.tag));
+        Ok(())
     }
 
     /// Serialize an encrypted proposal to a string format (for file storage/network sharing)
@@ -513,7 +571,7 @@ impl Manager {
 
     /// Deserialize and store a proposal from its serialized form
     /// Returns the proposal tag
-    pub async fn load_proposal_from_serialized(&self, serialized: &str) -> Result<[u8; 8]> {
+    pub async fn load_proposal_from_serialized(&mut self, serialized: &str) -> Result<[u8; 8]> {
         // Parse the JSON-like format
         let ephemeral_pubkey = serialized
             .lines()
@@ -567,101 +625,28 @@ impl Manager {
     ///
     /// # Returns
     /// List of valid proposals we can participate in
+    /// Scan for proposals within acceptable delta range
+    ///
+    /// Note: Proposals are decrypted and stored when received via store_snicker_proposal().
+    /// This method simply queries the decrypted_proposals table.
     pub async fn scan_for_our_proposals(
         &self,
         acceptable_delta_range: (i64, i64),
     ) -> Result<Vec<Proposal>> {
-        // Get our UTXOs from wallet
-        let wallet = self.wallet_node.wallet.lock().await;
-        let our_utxos: Vec<_> = wallet.list_unspent().collect();
-        drop(wallet);
-
-        // Create callback for deriving private keys
-        let derive_privkey = |keychain, index| {
-            self.wallet_node.derive_utxo_privkey(keychain, index)
-        };
-
-        // Scan proposals using Snicker (decrypts all proposals meant for our UTXOs)
-        let all_proposals = self.snicker.scan_proposals(&our_utxos, derive_privkey).await?;
-
-        tracing::info!("💾 Storing {} decrypted proposals in cache...", all_proposals.len());
-
-        // Store each successfully decrypted proposal in the database
-        for proposal in &all_proposals {
-            tracing::info!("Processing proposal with tag {}", hex::encode(&proposal.tag));
-
-            // Calculate delta using a wide range to get the actual value
-            match self.snicker.calculate_delta_from_proposal(proposal) {
-                Ok(delta) => {
-                    tracing::info!("  Calculated delta: {} sats", delta);
-
-                    // Identify which input is ours by checking against our UTXOs
-                    let mut our_utxo_str = None;
-                    let mut proposer_utxo_str = None;
-
-                    for (idx, input) in proposal.psbt.unsigned_tx.input.iter().enumerate() {
-                        let outpoint_str = format!("{}:{}", input.previous_output.txid, input.previous_output.vout);
-
-                        // Check if this input matches any of our UTXOs
-                        let is_ours = our_utxos.iter().any(|utxo| {
-                            utxo.outpoint.txid == input.previous_output.txid
-                                && utxo.outpoint.vout == input.previous_output.vout
-                        });
-
-                        if is_ours {
-                            our_utxo_str = Some(outpoint_str);
-                            tracing::info!("  Our UTXO (input {}): {}", idx, our_utxo_str.as_ref().unwrap());
-                        } else {
-                            proposer_utxo_str = Some(outpoint_str);
-                            tracing::info!("  Proposer UTXO (input {}): {}", idx, proposer_utxo_str.as_ref().unwrap());
-                        }
-                    }
-
-                    let our_utxo = match our_utxo_str {
-                        Some(u) => u,
-                        None => {
-                            tracing::warn!("Could not identify our UTXO in proposal inputs");
-                            continue;
-                        }
-                    };
-
-                    let proposer_utxo = match proposer_utxo_str {
-                        Some(u) => u,
-                        None => {
-                            tracing::warn!("Could not identify proposer UTXO in proposal inputs");
-                            continue;
-                        }
-                    };
-
-                    // Store in database with role="receiver" and status="pending"
-                    match self.snicker.store_decrypted_proposal(
-                        proposal,
-                        "receiver",
-                        &our_utxo,
-                        &proposer_utxo,
-                        delta,
-                    ).await {
-                        Ok(_) => tracing::info!("  ✅ Stored in decrypted_proposals table"),
-                        Err(e) => tracing::warn!("  ❌ Failed to cache proposal {}: {}", hex::encode(&proposal.tag), e),
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Could not calculate delta for proposal: {}", e);
-                }
-            }
-        }
-
-        // Now query from database with delta filter
         tracing::info!("🔍 Querying decrypted_proposals table with delta range {} to {} and status='pending'",
-                      acceptable_delta_range.0, acceptable_delta_range.1);
-        let results = self.snicker.get_decrypted_proposals_by_delta_range(
+            acceptable_delta_range.0, acceptable_delta_range.1);
+
+        // Simply query the decrypted_proposals table
+        let proposals = self.snicker.get_decrypted_proposals_by_delta_range(
             acceptable_delta_range.0,
             acceptable_delta_range.1,
-            "pending"
+            "pending",
         ).await?;
-        tracing::info!("📊 Query returned {} proposals", results.len());
-        Ok(results)
+
+        tracing::info!("📊 Query returned {} proposals", proposals.len());
+        Ok(proposals)
     }
+
 
     /// Scan proposals directory and find all valid proposals matching criteria
     ///
@@ -684,11 +669,11 @@ impl Manager {
         // Create directory if it doesn't exist
         if !proposals_dir.exists() {
             fs::create_dir_all(proposals_dir)?;
-            println!("📁 Created proposals directory: {}", proposals_dir.display());
+            tracing::debug!("📁 Created proposals directory: {}", proposals_dir.display());
             return Ok(Vec::new());
         }
 
-        println!("🔍 Scanning proposals directory: {}", proposals_dir.display());
+        tracing::debug!("🔍 Scanning proposals directory: {}", proposals_dir.display());
 
         // Read all files in directory
         let entries = fs::read_dir(proposals_dir)
@@ -702,7 +687,7 @@ impl Manager {
             let entry = match entry {
                 Ok(e) => e,
                 Err(e) => {
-                    eprintln!("⚠️  Failed to read directory entry: {}", e);
+                    tracing::warn!("Failed to read directory entry: {}", e);
                     continue;
                 }
             };
@@ -716,7 +701,7 @@ impl Manager {
 
             // Limit to prevent scanning too many files
             if file_count > 1000 {
-                eprintln!("⚠️  Directory has >1000 files, limiting scan to first 1000");
+                tracing::warn!("Directory has >1000 files, limiting scan to first 1000");
                 break;
             }
 
@@ -736,39 +721,36 @@ impl Manager {
                             // Skip invalid files silently (might not be proposal files)
                             skipped_count += 1;
                             if file_count < 10 { // Only log first few to avoid spam
-                                eprintln!("⚠️  Skipped {}: {}", path.display(), e);
+                                tracing::debug!("Skipped {}: {}", path.display(), e);
                             }
                         }
                     }
                 }
                 Err(e) => {
-                    eprintln!("⚠️  Failed to read {}: {}", path.display(), e);
+                    tracing::warn!("Failed to read {}: {}", path.display(), e);
                     skipped_count += 1;
                 }
             }
         }
 
-        println!("📄 Found {} files, {} valid proposal(s), {} skipped",
+        tracing::debug!("📄 Found {} files, {} valid proposal(s), {} skipped",
                  file_count, encrypted_proposals.len(), skipped_count);
 
         if encrypted_proposals.is_empty() {
             return Ok(Vec::new());
         }
 
-        // Get our UTXOs for decryption
-        let wallet = self.wallet_node.wallet.lock().await;
-        let our_utxos: Vec<_> = wallet.list_unspent().collect();
-        drop(wallet);
+        tracing::debug!("🔓 Loaded {} proposal(s), checking which are decryptable...", encrypted_proposals.len());
 
-        println!("🔓 Attempting to decrypt {} proposal(s) with {} UTXO(s)...",
-                 encrypted_proposals.len(), our_utxos.len());
+        // Proposals are decrypted and stored by load_proposal_from_serialized
+        // Query all decrypted proposals (will only contain those we could decrypt)
+        let decrypted = self.snicker.get_decrypted_proposals_by_delta_range(
+            i64::MIN,
+            i64::MAX,
+            "pending",
+        ).await?;
 
-        // Decrypt all proposals
-        let decrypted = self.snicker.scan_proposals(&our_utxos, |keychain, index| {
-            self.wallet_node.derive_utxo_privkey(keychain, index)
-        }).await?;
-
-        println!("✅ Decrypted {} proposal(s)", decrypted.len());
+        tracing::debug!("✅ Decrypted {} proposal(s) for our wallet", decrypted.len());
 
         // Filter by delta range and collect results
         let mut results = Vec::new();
@@ -778,7 +760,7 @@ impl Manager {
             let delta = match self.snicker.calculate_delta_from_proposal(&proposal) {
                 Ok(d) => d,
                 Err(e) => {
-                    eprintln!("⚠️  Failed to calculate delta for proposal {}: {}",
+                    tracing::warn!("Failed to calculate delta for proposal {}: {}",
                              hex::encode(&proposal.tag), e);
                     continue;
                 }
@@ -810,7 +792,7 @@ impl Manager {
             });
         }
 
-        println!("✅ Found {} matching proposal(s) in delta range ({}, {})",
+        tracing::debug!("✅ Found {} matching proposal(s) in delta range ({}, {})",
                  results.len(), delta_range.0, delta_range.1);
 
         Ok(results)
@@ -869,58 +851,17 @@ impl Manager {
         tag: &[u8; 8],
         acceptable_delta_range: (i64, i64),
     ) -> Result<bdk_wallet::bitcoin::Txid> {
-        println!("🔍 Step 1: Looking for decrypted proposal...");
+        println!("🔍 Step 1: Looking for proposal...");
 
-        // Try to get decrypted proposal first
-        let proposal = match self.snicker.get_decrypted_proposal_by_tag(tag).await? {
-            Some(p) => {
-                println!("✅ Found cached decrypted proposal");
-                p
-            },
-            None => {
-                // Not decrypted yet (e.g., just loaded from file)
-                // Try to decrypt it now with our UTXOs
-                println!("🔓 Proposal not decrypted yet, attempting to decrypt...");
+        // Get decrypted proposal from database
+        // Note: Proposals are decrypted at storage time, so they should already be in the database
+        let proposal = self.snicker.get_decrypted_proposal_by_tag(tag).await?
+            .ok_or_else(|| anyhow::anyhow!(
+                "Proposal with tag {} not found. Load it first with 'load_proposal <file>'",
+                hex::encode(tag)
+            ))?;
 
-                let wallet = self.wallet_node.wallet.lock().await;
-                let our_utxos: Vec<_> = wallet.list_unspent().collect();
-                drop(wallet);
-
-                println!("🔍 Scanning {} UTXOs to decrypt proposal...", our_utxos.len());
-
-                // Try to decrypt this specific proposal
-                let proposals = self.snicker.scan_proposals(&our_utxos, |keychain, index| {
-                    self.wallet_node.derive_utxo_privkey(keychain, index)
-                }).await?;
-
-                println!("🔍 Decrypted {} proposal(s), looking for matching tag...", proposals.len());
-
-                // Find the one with matching tag
-                let proposal = proposals.into_iter()
-                    .find(|p| &p.tag == tag)
-                    .ok_or_else(|| anyhow::anyhow!("Could not decrypt proposal with tag: {} (not meant for our UTXOs)", hex::encode(tag)))?;
-
-                println!("✅ Successfully decrypted proposal");
-
-                // Cache it for future use
-                if let Ok(delta) = self.snicker.calculate_delta_from_proposal(&proposal) {
-                    let wallet = self.wallet_node.wallet.lock().await;
-                    let our_utxos: Vec<_> = wallet.list_unspent().collect();
-                    drop(wallet);
-
-                    let our_utxo_str = proposal.psbt.unsigned_tx.input.get(1)
-                        .map(|i| format!("{}:{}", i.previous_output.txid, i.previous_output.vout))
-                        .unwrap_or_else(|| "unknown".to_string());
-                    let proposer_utxo_str = proposal.psbt.unsigned_tx.input.get(0)
-                        .map(|i| format!("{}:{}", i.previous_output.txid, i.previous_output.vout))
-                        .unwrap_or_else(|| "unknown".to_string());
-
-                    let _ = self.snicker.store_decrypted_proposal(&proposal, "receiver", &our_utxo_str, &proposer_utxo_str, delta).await;
-                }
-
-                proposal
-            }
-        };
+        println!("✅ Found proposal");
 
         println!("🔍 Step 2: Getting UTXOs...");
         let wallet = self.wallet_node.wallet.lock().await;
@@ -955,6 +896,25 @@ impl Manager {
     /// Get all stored SNICKER candidates
     pub async fn get_snicker_candidates(&self) -> Result<Vec<(u32, bdk_wallet::bitcoin::Txid, Transaction)>> {
         self.snicker.get_snicker_candidates().await
+    }
+
+    /// Filter candidates to only those with SNICKER pattern
+    ///
+    /// Returns only transactions that match SNICKER heuristics:
+    /// - At least 2 inputs (all P2TR)
+    /// - Exactly 3 outputs (all P2TR)
+    /// - Exactly 2 outputs equal (privacy), 1 different (change)
+    pub async fn filter_snicker_pattern_candidates(
+        &self
+    ) -> Result<Vec<(u32, bdk_wallet::bitcoin::Txid, bdk_wallet::bitcoin::Transaction)>> {
+        let all_candidates = self.get_snicker_candidates().await?;
+
+        let filtered: Vec<_> = all_candidates.into_iter()
+            .filter(|(_, _, tx)| crate::snicker::is_likely_snicker_transaction(tx))
+            .collect();
+
+        tracing::info!("🔍 Filtered to {} candidates with SNICKER pattern", filtered.len());
+        Ok(filtered)
     }
 
     /// Get a decrypted proposal by tag
@@ -1154,5 +1114,269 @@ impl Manager {
         let mut tag = [0u8; 8];
         tag.copy_from_slice(&tag_bytes);
         Ok(tag)
+    }
+
+    // ============================================================
+    // AUTOMATION METHODS
+    // ============================================================
+
+    /// Automatically accept proposals based on configuration
+    ///
+    /// Scans proposals directory, filters by delta, checks rate limits,
+    /// and auto-accepts proposals that meet criteria.
+    ///
+    /// **Important**: Only accepts ONE proposal per UTXO per cycle to avoid
+    /// double-spend attempts. Other proposals for the same UTXO remain pending
+    /// and can be tried in future cycles if the first one fails to confirm.
+    ///
+    /// Returns number of proposals accepted.
+    pub async fn auto_accept_proposals(&mut self, config: &crate::config::SnickerAutomation) -> Result<u32> {
+        use crate::config::AutomationMode;
+        use std::collections::HashMap;
+
+        // Check if automation is enabled
+        if config.mode == AutomationMode::Disabled {
+            return Ok(0);
+        }
+
+        // Check rate limit
+        if !self.snicker.check_rate_limit("auto_accept", config.max_proposals_per_day).await? {
+            tracing::info!("⏸️  Rate limit reached for auto-accept (max {} per day)", config.max_proposals_per_day);
+            return Ok(0);
+        }
+
+        // Scan for proposals in range
+        let delta_range = (-config.max_delta, config.max_delta);
+        let proposals = self.scan_for_our_proposals(delta_range).await?;
+
+        if proposals.is_empty() {
+            tracing::debug!("No proposals found within delta range");
+            return Ok(0);
+        }
+
+        tracing::info!("🔍 Found {} proposals in database within delta range", proposals.len());
+
+        // Group proposals by the UTXO they consume
+        // Key: our UTXO outpoint string, Value: Vec of proposals using that UTXO
+        let mut proposals_by_utxo: HashMap<String, Vec<crate::snicker::Proposal>> = HashMap::new();
+        let mut stale_proposals = 0;
+
+        for proposal in proposals {
+            // Identify which of our UTXOs this proposal consumes
+            // by checking which input in the PSBT matches our wallet
+            let wallet = self.wallet_node.wallet.lock().await;
+            let our_utxos: Vec<_> = wallet.list_unspent().collect();
+            drop(wallet);
+
+            let mut our_utxo_str = None;
+            for input in &proposal.psbt.unsigned_tx.input {
+                let outpoint_str = format!("{}:{}", input.previous_output.txid, input.previous_output.vout);
+
+                // Check if this input is one of our UTXOs
+                if our_utxos.iter().any(|u| {
+                    u.outpoint.txid == input.previous_output.txid &&
+                    u.outpoint.vout == input.previous_output.vout
+                }) {
+                    our_utxo_str = Some(outpoint_str);
+                    break;
+                }
+            }
+
+            if let Some(utxo_str) = our_utxo_str {
+                proposals_by_utxo.entry(utxo_str).or_insert_with(Vec::new).push(proposal);
+            } else {
+                stale_proposals += 1;
+            }
+        }
+
+        if stale_proposals > 0 {
+            tracing::info!("⚠️  Filtered out {} stale proposals (UTXOs no longer in wallet)", stale_proposals);
+        }
+
+        tracing::info!("📊 Proposals grouped by UTXO: {} unique UTXOs have proposals", proposals_by_utxo.len());
+
+        if proposals_by_utxo.is_empty() {
+            tracing::info!("💤 No actionable proposals (all proposals are stale)");
+            return Ok(0);
+        }
+
+        // For each UTXO, select ONE proposal to try this cycle
+        // Strategy: Pick the first one (by order returned from DB)
+        // Future enhancement: Could pick by best delta, random, or other criteria
+        let mut selected_proposals = Vec::new();
+        for (utxo_str, mut utxo_proposals) in proposals_by_utxo {
+            let count = utxo_proposals.len();
+            if let Some(selected) = utxo_proposals.pop() {
+                tracing::info!("  UTXO {}: Selected 1 of {} proposals", utxo_str, count);
+                selected_proposals.push(selected);
+            }
+        }
+
+        let mut accepted_count = 0;
+
+        for proposal in selected_proposals {
+            // Check rate limit before each acceptance
+            if !self.snicker.check_rate_limit("auto_accept", config.max_proposals_per_day).await? {
+                tracing::info!("⏸️  Rate limit reached during auto-accept, stopping");
+                break;
+            }
+
+            // Calculate delta for logging
+            let delta = self.snicker.calculate_delta_from_proposal(&proposal).ok();
+
+            // Accept and broadcast the proposal
+            match self.accept_and_broadcast_snicker_proposal(&proposal.tag, delta_range).await {
+                Ok(txid) => {
+                    accepted_count += 1;
+                    tracing::info!("✅ Auto-accepted proposal {} → txid: {}", hex::encode(proposal.tag), txid);
+
+                    // Mark proposal as broadcast to avoid re-processing
+                    self.snicker.update_proposal_status(&proposal.tag, "broadcast").await?;
+
+                    // Log success
+                    self.snicker.log_automation_action(
+                        "auto_accept",
+                        Some(&proposal.tag),
+                        Some(&txid),
+                        delta,
+                        true,
+                    ).await?;
+                }
+                Err(e) => {
+                    tracing::warn!("❌ Failed to auto-accept proposal {}: {}", hex::encode(proposal.tag), e);
+
+                    // Log failure
+                    self.snicker.log_automation_action(
+                        "auto_accept",
+                        Some(&proposal.tag),
+                        None,
+                        delta,
+                        false,
+                    ).await?;
+                }
+            }
+        }
+
+        Ok(accepted_count)
+    }
+
+    /// Automatically create proposals based on configuration
+    ///
+    /// Scans for candidates, finds opportunities, checks rate limits,
+    /// and auto-creates proposals.
+    ///
+    /// Returns number of proposals created.
+    pub async fn auto_create_proposals(
+        &mut self,
+        config: &crate::config::SnickerAutomation,
+        min_utxo_sats: u64,
+        delta_sats: i64,
+    ) -> Result<u32> {
+        use crate::config::AutomationMode;
+
+        // Check if proposer mode is enabled
+        if config.mode != AutomationMode::Advanced {
+            return Ok(0);
+        }
+
+        // Check rate limit
+        if !self.snicker.check_rate_limit("auto_create", config.max_proposals_per_day).await? {
+            tracing::info!("⏸️  Rate limit reached for auto-create (max {} per day)", config.max_proposals_per_day);
+            return Ok(0);
+        }
+
+        // Get candidates - filter by SNICKER pattern if configured
+        let candidates = if config.snicker_pattern_only {
+            tracing::info!("🔍 Filtering candidates to SNICKER patterns only");
+            self.filter_snicker_pattern_candidates().await?
+        } else {
+            self.get_snicker_candidates().await?
+        };
+
+        if candidates.is_empty() {
+            tracing::debug!("No candidates found for proposal creation");
+            return Ok(0);
+        }
+
+        tracing::info!("📊 Found {} candidates for proposal creation", candidates.len());
+
+        // Find opportunities
+        let opportunities = self.find_snicker_opportunities(min_utxo_sats).await?;
+
+        if opportunities.is_empty() {
+            tracing::debug!("No opportunities found");
+            return Ok(0);
+        }
+
+        tracing::info!("💡 Found {} opportunities", opportunities.len());
+
+        let mut created_count = 0;
+
+        for opportunity in opportunities {
+            // Check rate limit before each creation
+            if !self.snicker.check_rate_limit("auto_create", config.max_proposals_per_day).await? {
+                tracing::info!("⏸️  Rate limit reached during auto-create, stopping");
+                break;
+            }
+
+            // Check if we already created a proposal for this UTXO pair
+            let our_utxo_str = format!("{}:{}", opportunity.our_outpoint.txid, opportunity.our_outpoint.vout);
+            let target_utxo_str = format!("{}:{}", opportunity.target_tx.compute_txid(), opportunity.target_output_index);
+
+            if let Some(existing) = self.snicker.get_proposal_for_utxo_pair(
+                &our_utxo_str,
+                &target_utxo_str,
+                "proposer",
+            ).await? {
+                tracing::debug!("Already created proposal {} for UTXO pair ({} -> {}), skipping",
+                    hex::encode(&existing.tag), our_utxo_str, target_utxo_str);
+                continue;
+            }
+
+            // Create proposal
+            match self.create_snicker_proposal(&opportunity, delta_sats).await {
+                Ok((proposal, encrypted_proposal)) => {
+                    created_count += 1;
+                    let tag_hex = hex::encode(proposal.tag);
+                    tracing::info!("✅ Auto-created proposal {}", tag_hex);
+
+                    // Save to proposals directory
+                    let proposals_dir = std::path::Path::new("./proposals");  // TODO: Use config path
+                    if let Err(e) = tokio::fs::create_dir_all(proposals_dir).await {
+                        tracing::warn!("Failed to create proposals directory: {}", e);
+                        continue;
+                    }
+
+                    let filename = proposals_dir.join(&tag_hex);
+                    let serialized = self.serialize_encrypted_proposal(&encrypted_proposal);
+                    if let Err(e) = tokio::fs::write(&filename, serialized).await {
+                        tracing::warn!("Failed to save proposal file: {}", e);
+                    }
+
+                    // Log success
+                    self.snicker.log_automation_action(
+                        "auto_create",
+                        Some(&proposal.tag),
+                        None,
+                        Some(delta_sats),
+                        true,
+                    ).await?;
+                }
+                Err(e) => {
+                    tracing::warn!("❌ Failed to auto-create proposal: {}", e);
+
+                    // Log failure
+                    self.snicker.log_automation_action(
+                        "auto_create",
+                        None,
+                        None,
+                        Some(delta_sats),
+                        false,
+                    ).await?;
+                }
+            }
+        }
+
+        Ok(created_count)
     }
 }

@@ -15,7 +15,7 @@ use bdk_wallet::{
     miniscript::Tap,
     KeychainKind, Wallet, PersistedWallet,
 };
-use bdk_kyoto::builder::{NodeBuilder, NodeBuilderExt};
+use bdk_kyoto::builder::{Builder, BuilderExt};
 use bdk_kyoto::{LightClient, ScanType};
 use once_cell::sync::Lazy;
 use tokio::sync::Mutex;
@@ -454,16 +454,15 @@ impl TestWallet {
 
         let LightClient {
             requester,
-            log_subscriber: _,
             info_subscriber: _,
             warning_subscriber: _,
             update_subscriber,
             node,
-        } = NodeBuilder::new(network)
+        } = Builder::new(network)
             .add_peer(peer)
             .required_peers(1)
             .data_dir(kyoto_db_path)
-            .build_with_wallet(&wallet, ScanType::Recovery { from_height: 0 })
+            .build_with_wallet(&wallet, ScanType::Sync)
             .unwrap();
 
         // Spawn node in background

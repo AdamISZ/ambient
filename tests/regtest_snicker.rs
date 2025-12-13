@@ -199,8 +199,8 @@ async fn test_snicker_end_to_end() -> Result<()> {
     ).await?;
 
     println!("   ✅ Proposal created and signed by Bob");
-    println!("   PSBT inputs: {}", signed_psbt.unsigned_tx.input.len());
-    println!("   PSBT outputs: {}", signed_psbt.unsigned_tx.output.len());
+    println!("   PSBT inputs: {}", signed_psbt.psbt.unsigned_tx.input.len());
+    println!("   PSBT outputs: {}", signed_psbt.psbt.unsigned_tx.output.len());
     println!("   Encrypted proposal size: {} bytes", encrypted_proposal.encrypted_data.len());
 
     // Store the encrypted proposal (simulating publication)
@@ -237,7 +237,7 @@ async fn test_snicker_end_to_end() -> Result<()> {
 
     println!("\n✍️  Alice validating and signing proposal...");
     let fully_signed_psbt = alice_mgr.accept_snicker_proposal(
-        proposal.clone(),
+        &proposal.tag,
         acceptable_delta_range,
     ).await?;
 

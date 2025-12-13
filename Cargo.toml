@@ -14,7 +14,7 @@ bdk_wallet = { version = "2.2.0", features = ["rusqlite", "keys-bip39"] }
 bdk_bitcoind_rpc = "0.15"
 tokio = { version = "1", features = ["full"], default-features = false }
 tracing = { version = "0.1" }
-tracing-subscriber = { version = "0.3" }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1.0"
 clap = { version = "4", features = ["derive"] }
 directories = "5"

@@ -3,6 +3,7 @@ mod snicker;
 mod cli;
 mod wallet_node;
 mod config;
+mod automation;
 
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
@@ -86,10 +87,17 @@ async fn main() -> Result<()> {
         .open(&log_path)?;
 
     // Write logs to file only (not stderr)
-    // Include bdk_wallet logs to see debug output from patched BDK
+    // Set our own logs to INFO, but suppress verbose logs from bdk_kyoto
+    use tracing_subscriber::filter::EnvFilter;
+
+    let filter = EnvFilter::new("info")
+        .add_directive("bdk_kyoto=warn".parse().unwrap());
+
     tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer().with_writer(log_file))
-        .with(tracing_subscriber::filter::LevelFilter::INFO)
+        .with(tracing_subscriber::fmt::layer()
+            .with_writer(log_file)
+            .with_ansi(false))  // Disable color codes in log file
+        .with(filter)
         .init();
 
     // Print log and config location to stderr so user knows where to find them

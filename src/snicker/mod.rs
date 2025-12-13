@@ -24,6 +24,10 @@
 //! ```
 
 pub mod tweak;
+pub mod pattern;
+
+// Re-export pattern detection function for easy access
+pub use pattern::is_likely_snicker_transaction;
 
 #[cfg(test)]
 mod tweak_tests;
@@ -151,9 +155,9 @@ impl Snicker {
         // Initialize database tables
         let mut conn_guard = conn.lock().unwrap();
         Self::init_candidates_table(&mut conn_guard)?;
-        Self::init_proposals_table(&mut conn_guard)?;
         Self::init_decrypted_proposals_table(&mut conn_guard)?;
         Self::init_snicker_utxos_table(&mut conn_guard)?;
+        Self::init_automation_log_table(&mut conn_guard)?;
         drop(conn_guard);
 
         Ok(Self {
@@ -810,19 +814,8 @@ impl Snicker {
         Ok(())
     }
 
-    /// Initialize the encrypted proposals database table
-    fn init_proposals_table(conn: &mut Connection) -> Result<()> {
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS snicker_proposals (
-                tag BLOB PRIMARY KEY,
-                ephemeral_pubkey BLOB NOT NULL,
-                encrypted_data BLOB NOT NULL,
-                created_at INTEGER NOT NULL
-            )",
-            [],
-        )?;
-        Ok(())
-    }
+    /// Removed: encrypted proposals table no longer used
+    /// Proposals are decrypted at storage time and stored directly in decrypted_proposals
 
     /// Initialize the decrypted proposals database table
     fn init_decrypted_proposals_table(conn: &mut Connection) -> Result<()> {
@@ -851,6 +844,11 @@ impl Snicker {
              ON decrypted_proposals(delta_sats)",
             [],
         )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_utxo_pair
+             ON decrypted_proposals(our_utxo, counterparty_utxo, role, status)",
+            [],
+        )?;
         Ok(())
     }
 
@@ -874,6 +872,33 @@ impl Snicker {
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_snicker_utxos_spent
              ON snicker_utxos(spent)",
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// Initialize the automation log database table
+    fn init_automation_log_table(conn: &mut Connection) -> Result<()> {
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS automation_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp INTEGER NOT NULL,
+                action_type TEXT NOT NULL,
+                tag BLOB,
+                txid TEXT,
+                delta INTEGER,
+                success BOOLEAN NOT NULL
+            )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_automation_log_timestamp
+             ON automation_log(timestamp)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_automation_log_action
+             ON automation_log(action_type, timestamp)",
             [],
         )?;
         Ok(())
@@ -933,88 +958,64 @@ impl Snicker {
     }
 
     /// Store a SNICKER proposal in the database
-    pub async fn store_snicker_proposal(&self, proposal: &EncryptedProposal) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-
-        let pubkey_bytes = proposal.ephemeral_pubkey.serialize();
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_secs() as i64;
-
-        conn.execute(
-            "INSERT OR REPLACE INTO snicker_proposals
-             (tag, ephemeral_pubkey, encrypted_data, created_at)
-             VALUES (?1, ?2, ?3, ?4)",
-            (
-                &proposal.tag[..],
-                &pubkey_bytes[..],
-                &proposal.encrypted_data,
-                timestamp,
-            ),
-        )?;
-
+    /// Store an encrypted proposal (proposer side - for later sharing/export)
+    /// This is used when creating proposals, not receiving them
+    /// Does NOT attempt decryption (we created it, we already know what's in it)
+    pub async fn store_created_proposal(&self, proposal: &EncryptedProposal) -> Result<()> {
+        // For now, do nothing - we don't need to store created proposals
+        // They can be exported directly when created
+        // This method exists for API compatibility
+        tracing::debug!("Skipping storage of created proposal tag {} (not needed)",
+            ::hex::encode(&proposal.tag));
         Ok(())
     }
 
-    /// Retrieve all SNICKER proposals from the database
-    pub async fn get_all_snicker_proposals(&self) -> Result<Vec<EncryptedProposal>> {
-        use bdk_wallet::bitcoin::secp256k1::PublicKey;
+    /// Try to decrypt an encrypted proposal for a specific UTXO
+    /// Returns Ok(proposal) if decryption succeeds, Err otherwise
+    pub fn try_decrypt_for_utxo<F>(
+        &self,
+        encrypted: &EncryptedProposal,
+        utxo: &bdk_wallet::LocalOutput,
+        derive_privkey: F,
+    ) -> Result<Proposal>
+    where
+        F: Fn(bdk_wallet::KeychainKind, u32) -> Result<bdk_wallet::bitcoin::secp256k1::SecretKey>,
+    {
+        use crate::snicker::tweak::{
+            calculate_dh_shared_secret, compute_proposal_tag, decrypt_proposal,
+        };
 
-        let conn = self.conn.lock().unwrap();
+        // Get secret key for this UTXO
+        let our_seckey = derive_privkey(utxo.keychain, utxo.derivation_index)?;
 
-        // First check how many rows we have
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM snicker_proposals",
-            [],
-            |row| row.get(0)
-        )?;
-        tracing::info!("📊 Database contains {} encrypted proposals", count);
+        // Calculate shared secret = ECDH(our_seckey, ephemeral_pubkey)
+        let shared_secret = calculate_dh_shared_secret(&our_seckey, &encrypted.ephemeral_pubkey);
 
-        let mut stmt = conn.prepare(
-            "SELECT ephemeral_pubkey, tag, encrypted_data FROM snicker_proposals
-             ORDER BY created_at DESC"
-        )?;
+        // Calculate expected tag
+        let expected_tag = compute_proposal_tag(&shared_secret);
 
-        let proposals = stmt.query_map([], |row| {
-            let pubkey_bytes: Vec<u8> = row.get(0)?;
-            let tag_bytes: Vec<u8> = row.get(1)?;
-            let encrypted_data: Vec<u8> = row.get(2)?;
-            Ok((pubkey_bytes, tag_bytes, encrypted_data))
-        })?;
-
-        let mut result = Vec::new();
-        for proposal in proposals {
-            let (pubkey_bytes, tag_bytes, encrypted_data) = proposal?;
-
-            tracing::debug!("Deserializing proposal: pubkey_len={}, tag_len={}, data_len={}",
-                           pubkey_bytes.len(), tag_bytes.len(), encrypted_data.len());
-
-            let ephemeral_pubkey = PublicKey::from_slice(&pubkey_bytes)
-                .map_err(|e| anyhow::anyhow!("Invalid pubkey in database: {}", e))?;
-
-            let mut tag = [0u8; 8];
-            if tag_bytes.len() != 8 {
-                tracing::warn!("Skipping proposal with invalid tag length: {}", tag_bytes.len());
-                continue; // Skip invalid entries
-            }
-            tag.copy_from_slice(&tag_bytes);
-
-            result.push(EncryptedProposal {
-                ephemeral_pubkey,
-                tag,
-                encrypted_data,
-            });
+        // Check if tags match
+        if expected_tag != encrypted.tag {
+            return Err(anyhow::anyhow!("Tag mismatch - proposal not for this UTXO"));
         }
 
-        tracing::info!("✅ Successfully deserialized {} proposals", result.len());
-        Ok(result)
+        // Try to decrypt
+        let decrypted_bytes = decrypt_proposal(&encrypted.encrypted_data, &shared_secret)?;
+
+        // Deserialize the proposal
+        let proposal = serde_json::from_slice::<Proposal>(&decrypted_bytes)?;
+
+        Ok(proposal)
     }
+
+    /// Removed: get_all_snicker_proposals() no longer needed
+    /// Proposals are decrypted at storage time and queried from decrypted_proposals table
 
     /// Clear all SNICKER proposals from the database
     pub async fn clear_snicker_proposals(&self) -> Result<usize> {
         let conn = self.conn.lock().unwrap();
-        let count = conn.execute("DELETE FROM snicker_proposals", [])?;
-        tracing::info!("🗑️  Cleared {} SNICKER proposals from database", count);
+        let count = conn.execute("DELETE FROM decrypted_proposals", [])?;
+        tracing::info!("🗑️  Cleared {} proposals from database", count);
         Ok(count)
     }
 
@@ -1039,8 +1040,8 @@ impl Snicker {
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs() as i64;
 
-        conn.execute(
-            "INSERT OR REPLACE INTO decrypted_proposals
+        let rows_affected = conn.execute(
+            "INSERT OR IGNORE INTO decrypted_proposals
              (tag, psbt, tweak_info, role, status, our_utxo, counterparty_utxo, delta_sats, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             (
@@ -1056,6 +1057,11 @@ impl Snicker {
                 timestamp,
             ),
         )?;
+
+        if rows_affected == 0 {
+            tracing::debug!("Proposal tag {} already exists in database, skipping",
+                          ::hex::encode(&proposal.tag));
+        }
 
         Ok(())
     }
@@ -1115,6 +1121,49 @@ impl Snicker {
                 .map_err(|e| bdk_wallet::rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
 
             Ok(Proposal { tag: *tag, psbt, tweak_info })
+        });
+
+        match result {
+            Ok(proposal) => Ok(Some(proposal)),
+            Err(bdk_wallet::rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Get a proposal for a specific UTXO pair and role (for deduplication)
+    /// Returns the existing proposal if we already created/received one for this pair
+    pub async fn get_proposal_for_utxo_pair(
+        &self,
+        our_utxo: &str,
+        counterparty_utxo: &str,
+        role: &str,
+    ) -> Result<Option<Proposal>> {
+        let conn = self.conn.lock().unwrap();
+
+        let mut stmt = conn.prepare(
+            "SELECT tag, psbt, tweak_info FROM decrypted_proposals
+             WHERE our_utxo = ?1 AND counterparty_utxo = ?2 AND role = ?3
+             LIMIT 1"
+        )?;
+
+        let result = stmt.query_row((our_utxo, counterparty_utxo, role), |row| {
+            let tag_bytes: Vec<u8> = row.get(0)?;
+            let psbt_bytes: Vec<u8> = row.get(1)?;
+            let tweak_info_bytes: Vec<u8> = row.get(2)?;
+
+            let mut tag = [0u8; 8];
+            if tag_bytes.len() != 8 {
+                return Err(bdk_wallet::rusqlite::Error::InvalidQuery);
+            }
+            tag.copy_from_slice(&tag_bytes);
+
+            let psbt: Psbt = Psbt::deserialize(&psbt_bytes)
+                .map_err(|e| bdk_wallet::rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+
+            let tweak_info: TweakInfo = serde_json::from_slice(&tweak_info_bytes)
+                .map_err(|e| bdk_wallet::rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+
+            Ok(Proposal { tag, psbt, tweak_info })
         });
 
         match result {
@@ -1296,6 +1345,75 @@ impl Snicker {
     }
 
     // ============================================================
+    // AUTOMATION & RATE LIMITING
+    // ============================================================
+
+    /// Log an automation action
+    pub async fn log_automation_action(
+        &self,
+        action_type: &str,
+        tag: Option<&[u8; 8]>,
+        txid: Option<&bdk_wallet::bitcoin::Txid>,
+        delta: Option<i64>,
+        success: bool,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        conn.execute(
+            "INSERT INTO automation_log (timestamp, action_type, tag, txid, delta, success)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            (
+                timestamp,
+                action_type,
+                tag.map(|t| t.to_vec()),
+                txid.map(|t| t.to_string()),
+                delta,
+                success,
+            ),
+        )?;
+
+        tracing::debug!("📝 Logged automation action: {} (success={})", action_type, success);
+        Ok(())
+    }
+
+    /// Get count of successful actions of a specific type in the last N seconds
+    pub async fn get_action_count_since(
+        &self,
+        action_type: &str,
+        seconds_ago: i64,
+    ) -> Result<u32> {
+        let conn = self.conn.lock().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let cutoff = now - seconds_ago;
+
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM automation_log
+             WHERE action_type = ?1 AND timestamp >= ?2 AND success = 1",
+            (action_type, cutoff),
+            |row| row.get(0),
+        )?;
+
+        Ok(count as u32)
+    }
+
+    /// Check if we're within rate limit for a specific action
+    pub async fn check_rate_limit(
+        &self,
+        action_type: &str,
+        max_per_day: u32,
+    ) -> Result<bool> {
+        let count = self.get_action_count_since(action_type, 86400).await?;  // 24 hours
+        Ok(count < max_per_day)
+    }
+
+    // ============================================================
     // OPPORTUNITY FINDING
     // ============================================================
 
@@ -1406,94 +1524,6 @@ impl Snicker {
         Ok(opportunities)
     }
 
-    // ============================================================
-    // PROPOSAL SCANNING
-    // ============================================================
-
-    /// Scan all proposals and attempt to decrypt those meant for our outputs
-    ///
-    /// Iterates through all proposals and our wallet outputs, checking if the
-    /// tag matches. If it does, attempts decryption.
-    ///
-    /// # Arguments
-    /// * `our_utxos` - Our wallet's UTXOs (for matching proposals)
-    /// * `derive_privkey` - Function to derive private key given (keychain, derivation_index)
-    ///
-    /// # Returns
-    /// Vector of successfully decrypted proposals meant for us
-    pub async fn scan_proposals<F>(
-        &self,
-        our_utxos: &[bdk_wallet::LocalOutput],
-        derive_privkey: F,
-    ) -> Result<Vec<Proposal>>
-    where
-        F: Fn(bdk_wallet::KeychainKind, u32) -> Result<bdk_wallet::bitcoin::secp256k1::SecretKey>,
-    {
-        use crate::snicker::tweak::{
-            calculate_dh_shared_secret, compute_proposal_tag, decrypt_proposal,
-        };
-
-        // Get all proposals
-        let proposals = self.get_all_snicker_proposals().await?;
-        if proposals.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        tracing::info!("🔍 Scanning {} proposals for our wallet", proposals.len());
-        tracing::info!("🔍 Checking against {} UTXOs", our_utxos.len());
-
-        let mut decrypted_proposals = Vec::new();
-
-        // For each proposal, try to match with our outputs
-        for encrypted_proposal in &proposals {
-            for utxo in our_utxos {
-                // 1. Get secret key for this UTXO
-                let our_seckey = match derive_privkey(utxo.keychain, utxo.derivation_index) {
-                    Ok(sk) => sk,
-                    Err(e) => {
-                        tracing::warn!("Failed to derive private key for UTXO: {}", e);
-                        continue;
-                    }
-                };
-
-                // 2. Calculate shared secret = ECDH(our_seckey, ephemeral_pubkey)
-                let shared_secret = calculate_dh_shared_secret(
-                    &our_seckey,
-                    &encrypted_proposal.ephemeral_pubkey
-                );
-
-                // 3. Calculate expected tag
-                let expected_tag = compute_proposal_tag(&shared_secret);
-
-                // 4. Check if tags match
-                if expected_tag == encrypted_proposal.tag {
-                    // 5. Try to decrypt
-                    match decrypt_proposal(&encrypted_proposal.encrypted_data, &shared_secret) {
-                        Ok(decrypted_bytes) => {
-                            // Deserialize the proposal
-                            match serde_json::from_slice::<Proposal>(&decrypted_bytes) {
-                                Ok(proposal) => {
-                                    tracing::info!("✅ Successfully decrypted proposal for UTXO {}:{}",
-                                          utxo.outpoint.txid, utxo.outpoint.vout);
-                                    decrypted_proposals.push(proposal);
-                                    break; // Move to next proposal
-                                }
-                                Err(e) => {
-                                    tracing::warn!("Failed to deserialize proposal: {}", e);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("Decryption failed despite tag match: {}", e);
-                        }
-                    }
-                }
-            }
-        }
-
-        tracing::info!("🎯 Found {} proposals meant for our wallet", decrypted_proposals.len());
-        Ok(decrypted_proposals)
-    }
 }
 
 /// Opportunity for creating a SNICKER proposal

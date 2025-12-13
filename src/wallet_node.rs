@@ -266,8 +266,8 @@ impl WalletNode {
                 }
             }
 
-            tracing::debug!("Ensuring SPK index includes lookahead: External up to {}, Internal up to {}",
-                max_external + RECOVERY_LOOKAHEAD, max_internal + RECOVERY_LOOKAHEAD);
+            // tracing::debug!("Ensuring SPK index includes lookahead: External up to {}, Internal up to {}",
+            //     max_external + RECOVERY_LOOKAHEAD, max_internal + RECOVERY_LOOKAHEAD);
 
             // Use peek_address() to ensure scripts are in SPK index WITHOUT advancing derivation index
             // This allows the light client to scan for these addresses while keeping
@@ -283,8 +283,8 @@ impl WalletNode {
             let final_external_index = loaded.derivation_index(KeychainKind::External).unwrap_or(0);
             let final_internal_index = loaded.derivation_index(KeychainKind::Internal).unwrap_or(0);
 
-            tracing::debug!("SPK index populated with {} external and {} internal scripts",
-                max_external + RECOVERY_LOOKAHEAD + 1, max_internal + RECOVERY_LOOKAHEAD + 1);
+            // tracing::debug!("SPK index populated with {} external and {} internal scripts",
+            //     max_external + RECOVERY_LOOKAHEAD + 1, max_internal + RECOVERY_LOOKAHEAD + 1);
             info!("📊 Final derivation indices: External={}, Internal={} (should be unchanged)",
                 final_external_index, final_internal_index);
             loaded
@@ -301,7 +301,7 @@ impl WalletNode {
                 let _ = new_wallet.peek_address(KeychainKind::Internal, index);
             }
             new_wallet.persist(&mut conn)?;
-            tracing::debug!("Derived and persisted {} lookahead scripts", RECOVERY_LOOKAHEAD);
+            // tracing::debug!("Derived and persisted {} lookahead scripts", RECOVERY_LOOKAHEAD);
 
             let external_index = new_wallet.derivation_index(KeychainKind::External).unwrap_or(0);
             let internal_index = new_wallet.derivation_index(KeychainKind::Internal).unwrap_or(0);
@@ -447,8 +447,8 @@ impl WalletNode {
                         }
                     }
                     if max_external > 0 || max_internal > 0 {
-                        tracing::debug!("🔧 Repopulating SPK index after scan: External up to {}, Internal up to {}",
-                            max_external, max_internal);
+                        // tracing::debug!("🔧 Repopulating SPK index after scan: External up to {}, Internal up to {}",
+                        //     max_external, max_internal);
                         // Use peek_address() to add scripts to SPK index WITHOUT advancing derivation index
                         // This allows the light client to scan for these addresses while keeping
                         // the next user-facing address at the first unused one
@@ -1918,7 +1918,8 @@ async fn trace_logs(
     loop {
         select! {
             warn = warn_rx.recv() => if let Some(warn) = warn { tracing::warn!("{warn}") },
-            info = info_rx.recv() => if let Some(info) = info { tracing::info!("{info}") },
+            // Suppress info messages from Kyoto to reduce log spam
+            _info = info_rx.recv() => { /* Silently consume Kyoto info messages */ },
         }
     }
 }
