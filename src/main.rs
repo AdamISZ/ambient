@@ -88,9 +88,11 @@ async fn main() -> Result<()> {
 
     // Write logs to file only (not stderr)
     // Set our own logs to INFO, but suppress verbose logs from bdk_kyoto
+    // Respects RUST_LOG environment variable
     use tracing_subscriber::filter::EnvFilter;
 
-    let filter = EnvFilter::new("info")
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info"))
         .add_directive("bdk_kyoto=warn".parse().unwrap());
 
     tracing_subscriber::registry()

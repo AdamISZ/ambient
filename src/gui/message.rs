@@ -46,6 +46,8 @@ pub enum Message {
     // Balance and sync
     SyncRequested,
     SyncCompleted,
+    /// Event-driven blockchain update from Kyoto (new block, transaction, etc.)
+    BlockchainUpdate(crate::wallet_node::WalletUpdate),
     BalanceUpdated(Amount),
     WalletDataUpdated {
         balance: Option<Amount>,
@@ -108,6 +110,17 @@ pub enum Message {
     SettingsProposalsDirChanged(String),
     SettingsSave,
     SettingsSaved(Result<(), String>),
+
+    // Automation
+    AutomationStart,
+    AutomationStop,
+    AutomationStarted(Result<(), String>),
+    AutomationStopped,
+    AutomationModeChanged(String),
+    AutomationMaxDeltaChanged(String),
+    AutomationMaxPerDayChanged(String),
+    AutomationIntervalChanged(String),
+    AutomationStatusUpdate,
 
     // Placeholder for unimplemented actions
     Placeholder,

@@ -255,7 +255,44 @@ impl TestBitcoind {
             serde_json::json!(addr),
         ], None)?;
 
+        // Wait for block filter index to catch up
+        self.wait_for_filter_index()?;
+
         Ok(())
+    }
+
+    /// Wait for the block filter index to catch up with the chain tip
+    fn wait_for_filter_index(&self) -> Result<()> {
+        let target_height = self.get_block_count()?;
+
+        for i in 0..50 {
+            std::thread::sleep(Duration::from_millis(200));
+
+            let info = self.rpc_call("getblockfilter", &[
+                serde_json::json!(self.get_block_hash(target_height)?),
+            ], None);
+
+            if info.is_ok() {
+                // Filters are indexed, but add extra delay to ensure bitcoind is ready to serve blocks
+                std::thread::sleep(Duration::from_secs(2));
+                return Ok(());
+            }
+
+            if i == 49 {
+                return Err(anyhow!("Block filter index failed to catch up within 10 seconds"));
+            }
+        }
+        Ok(())
+    }
+
+    fn get_block_hash(&self, height: u64) -> Result<String> {
+        let hash = self.rpc_call("getblockhash", &[
+            serde_json::json!(height),
+        ], None)?
+            .as_str()
+            .ok_or_else(|| anyhow!("Failed to get block hash"))?
+            .to_string();
+        Ok(hash)
     }
 
     pub fn get_block_count(&self) -> Result<u64> {

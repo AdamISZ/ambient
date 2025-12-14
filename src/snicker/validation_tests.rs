@@ -313,12 +313,12 @@ fn test_validate_amounts_correct_delta() {
         ).unwrap(),
     };
 
-    let our_utxos = vec![create_mock_local_output(
+    let our_utxos = vec![crate::wallet_node::WalletUtxo::Regular(create_mock_local_output(
         receiver_outpoint,
         50_000,
         bdk_wallet::KeychainKind::External,
         0,
-    )];
+    ))];
 
     // Delta is 1000 sats (within 0-5000 range)
     let result = snicker.validate_amounts(
@@ -370,12 +370,12 @@ fn test_validate_amounts_rejects_high_delta() {
         ).unwrap(),
     };
 
-    let our_utxos = vec![create_mock_local_output(
+    let our_utxos = vec![crate::wallet_node::WalletUtxo::Regular(create_mock_local_output(
         receiver_outpoint,
         50_000,
         bdk_wallet::KeychainKind::External,
         0,
-    )];
+    ))];
 
     // Delta is 10000 sats, should be rejected (max is 5000)
     let result = snicker.validate_amounts(
@@ -428,12 +428,12 @@ fn test_validate_amounts_rejects_low_delta() {
         ).unwrap(),
     };
 
-    let our_utxos = vec![create_mock_local_output(
+    let our_utxos = vec![crate::wallet_node::WalletUtxo::Regular(create_mock_local_output(
         receiver_outpoint,
         50_000,
         bdk_wallet::KeychainKind::External,
         0,
-    )];
+    ))];
 
     // Delta is -3000 sats (proposer pays us), should be rejected if min delta is 0
     let result = snicker.validate_amounts(
@@ -486,12 +486,12 @@ fn test_validate_amounts_rejects_low_fee_rate() {
         ).unwrap(),
     };
 
-    let our_utxos = vec![create_mock_local_output(
+    let our_utxos = vec![crate::wallet_node::WalletUtxo::Regular(create_mock_local_output(
         receiver_outpoint,
         50_000,
         bdk_wallet::KeychainKind::External,
         0,
-    )];
+    ))];
 
     let result = snicker.validate_amounts(
         &psbt,
@@ -623,18 +623,18 @@ fn test_validate_amounts_rejects_multiple_receiver_inputs() {
 
     // Claim BOTH outputs are ours
     let our_utxos = vec![
-        create_mock_local_output(
+        crate::wallet_node::WalletUtxo::Regular(create_mock_local_output(
             receiver_outpoint1,
             30_000,
             bdk_wallet::KeychainKind::External,
             0,
-        ),
-        create_mock_local_output(
+        )),
+        crate::wallet_node::WalletUtxo::Regular(create_mock_local_output(
             receiver_outpoint2,
             20_000,
             bdk_wallet::KeychainKind::External,
             1,
-        ),
+        )),
     ];
 
     let result = snicker.validate_amounts(
@@ -756,12 +756,12 @@ fn test_validate_amounts_rejects_missing_tweaked_output() {
         ).unwrap(),
     };
 
-    let our_utxos = vec![create_mock_local_output(
+    let our_utxos = vec![crate::wallet_node::WalletUtxo::Regular(create_mock_local_output(
         receiver_outpoint,
         50_000,
         bdk_wallet::KeychainKind::External,
         0,
-    )];
+    ))];
 
     let result = snicker.validate_amounts(
         &psbt,
@@ -874,12 +874,12 @@ fn test_validate_amounts_rejects_duplicate_tweaked_output() {
         ).unwrap(),
     };
 
-    let our_utxos = vec![create_mock_local_output(
+    let our_utxos = vec![crate::wallet_node::WalletUtxo::Regular(create_mock_local_output(
         receiver_outpoint,
         50_000,
         bdk_wallet::KeychainKind::External,
         0,
-    )];
+    ))];
 
     let result = snicker.validate_amounts(
         &psbt,
@@ -960,12 +960,12 @@ fn test_validate_inputs_all_p2tr() {
         proposer_pubkey,
     };
 
-    let our_utxos = vec![create_mock_local_output(
+    let our_utxos = vec![crate::wallet_node::WalletUtxo::Regular(create_mock_local_output(
         receiver_outpoint,
         50_000,
         bdk_wallet::KeychainKind::External,
         0,
-    )];
+    ))];
 
     let result = snicker.validate_inputs(&psbt, &tweak_info, &our_utxos);
     assert!(result.is_ok(), "All P2TR inputs with matching proposer key should be accepted");
@@ -1079,12 +1079,12 @@ fn test_validate_inputs_rejects_mixed_types() {
         proposer_pubkey: actual_proposer_pubkey,
     };
 
-    let our_utxos = vec![create_mock_local_output(
+    let our_utxos = vec![crate::wallet_node::WalletUtxo::Regular(create_mock_local_output(
         receiver_outpoint,
         50_000,
         bdk_wallet::KeychainKind::External,
         0,
-    )];
+    ))];
 
     let result = snicker.validate_inputs(&psbt, &tweak_info, &our_utxos);
     assert!(result.is_err(), "Mixed P2WPKH and P2TR inputs should be rejected");
@@ -1157,12 +1157,12 @@ fn test_validate_inputs_verifies_proposer_key() {
         proposer_pubkey, // This matches the actual proposer input key
     };
 
-    let our_utxos = vec![create_mock_local_output(
+    let our_utxos = vec![crate::wallet_node::WalletUtxo::Regular(create_mock_local_output(
         receiver_outpoint,
         50_000,
         bdk_wallet::KeychainKind::External,
         0,
-    )];
+    ))];
 
     let result = snicker.validate_inputs(&psbt, &tweak_info, &our_utxos);
     assert!(result.is_ok(), "Proposer key matching input key should be accepted");
@@ -1228,12 +1228,12 @@ fn test_validate_inputs_rejects_key_mismatch() {
         proposer_pubkey: wrong_proposer_pubkey, // WRONG KEY!
     };
 
-    let our_utxos = vec![create_mock_local_output(
+    let our_utxos = vec![crate::wallet_node::WalletUtxo::Regular(create_mock_local_output(
         receiver_outpoint,
         50_000,
         bdk_wallet::KeychainKind::External,
         0,
-    )];
+    ))];
 
     let result = snicker.validate_inputs(&psbt, &tweak_info, &our_utxos);
     assert!(result.is_err(), "Proposer key mismatch should be rejected");
@@ -1286,7 +1286,7 @@ fn test_validate_tweak_correct() {
         vout: 0,
     };
 
-    let our_utxos = vec![bdk_wallet::LocalOutput {
+    let our_utxos = vec![crate::wallet_node::WalletUtxo::Regular(bdk_wallet::LocalOutput {
         outpoint: receiver_outpoint,
         txout: original_output,
         keychain: bdk_wallet::KeychainKind::External,
@@ -1296,10 +1296,10 @@ fn test_validate_tweak_correct() {
             first_seen: Some(0),
             last_seen: Some(0)
         },
-    }];
+    })];
 
     // Mock derive_privkey function that returns our receiver key
-    let derive_privkey = |_keychain: bdk_wallet::KeychainKind, _index: u32| {
+    let derive_privkey = |_utxo: &crate::wallet_node::WalletUtxo| {
         Ok(receiver_seckey)
     };
 
@@ -1354,7 +1354,7 @@ fn test_validate_tweak_wrong_proposer_key() {
         vout: 0,
     };
 
-    let our_utxos = vec![bdk_wallet::LocalOutput {
+    let our_utxos = vec![crate::wallet_node::WalletUtxo::Regular(bdk_wallet::LocalOutput {
         outpoint: receiver_outpoint,
         txout: original_output,
         keychain: bdk_wallet::KeychainKind::External,
@@ -1364,9 +1364,9 @@ fn test_validate_tweak_wrong_proposer_key() {
             first_seen: Some(0),
             last_seen: Some(0)
         },
-    }];
+    })];
 
-    let derive_privkey = |_keychain: bdk_wallet::KeychainKind, _index: u32| {
+    let derive_privkey = |_utxo: &crate::wallet_node::WalletUtxo| {
         Ok(receiver_seckey)
     };
 
@@ -1417,7 +1417,7 @@ fn test_validate_tweak_wrong_receiver_key() {
         vout: 0,
     };
 
-    let our_utxos = vec![bdk_wallet::LocalOutput {
+    let our_utxos = vec![crate::wallet_node::WalletUtxo::Regular(bdk_wallet::LocalOutput {
         outpoint: receiver_outpoint,
         txout: original_output,
         keychain: bdk_wallet::KeychainKind::External,
@@ -1427,12 +1427,12 @@ fn test_validate_tweak_wrong_receiver_key() {
             first_seen: Some(0),
             last_seen: Some(0)
         },
-    }];
+    })];
 
     // Mock derive_privkey that returns WRONG key
     let wrong_receiver_seckey = SecretKey::from_slice(&[0x04; 32])
         .unwrap();
-    let derive_privkey = |_keychain: bdk_wallet::KeychainKind, _index: u32| {
+    let derive_privkey = |_utxo: &crate::wallet_node::WalletUtxo| {
         Ok(wrong_receiver_seckey)
     };
 
@@ -1488,7 +1488,7 @@ fn test_validate_tweak_non_p2tr_output() {
         vout: 0,
     };
 
-    let our_utxos = vec![bdk_wallet::LocalOutput {
+    let our_utxos = vec![crate::wallet_node::WalletUtxo::Regular(bdk_wallet::LocalOutput {
         outpoint: receiver_outpoint,
         txout: original_output,
         keychain: bdk_wallet::KeychainKind::External,
@@ -1498,9 +1498,9 @@ fn test_validate_tweak_non_p2tr_output() {
             first_seen: Some(0),
             last_seen: Some(0)
         },
-    }];
+    })];
 
-    let derive_privkey = |_keychain: bdk_wallet::KeychainKind, _index: u32| {
+    let derive_privkey = |_utxo: &crate::wallet_node::WalletUtxo| {
         Ok(receiver_seckey)
     };
 
@@ -2131,12 +2131,12 @@ fn test_receive_missing_witness_utxo() {
         proposer_pubkey,
     };
 
-    let our_utxos = vec![create_mock_local_output(
+    let our_utxos = vec![crate::wallet_node::WalletUtxo::Regular(create_mock_local_output(
         receiver_outpoint,
         50_000,
         bdk_wallet::KeychainKind::External,
         0,
-    )];
+    ))];
 
     let result = snicker.validate_inputs(&psbt, &tweak_info, &our_utxos);
     assert!(result.is_err(), "Should reject PSBT with missing witness_utxo");

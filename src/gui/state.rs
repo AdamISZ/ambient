@@ -2,9 +2,11 @@
 
 use crate::manager::{Manager, ProposalScanResult};
 use crate::snicker::ProposalOpportunity;
+use crate::automation::AutomationTask;
+use crate::config::AutomationMode;
 use bdk_wallet::bitcoin::Amount;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 
 /// Root application state - simplified to persistent states only
 /// Transient operations (like wallet creation) are handled by modals
@@ -16,7 +18,7 @@ pub enum AppState {
 
     /// Wallet loaded and active
     WalletLoaded {
-        manager: Arc<Mutex<Manager>>,
+        manager: Arc<RwLock<Manager>>,
         wallet_data: WalletData,
     },
 
@@ -64,6 +66,14 @@ pub struct WalletData {
     pub snicker_scan_max_utxo_input: String, // Max UTXO size in sats
     pub snicker_find_min_utxo_input: String, // Min UTXO size for finding opportunities
 
+    // Automation state
+    pub automation_running: bool,
+    pub automation_mode: AutomationMode,
+    pub automation_max_delta: String,    // Input field for max delta
+    pub automation_max_per_day: String,  // Input field for max proposals per day
+    pub automation_interval_secs: String, // Input field for interval
+    pub automation_task: Option<Arc<tokio::sync::Mutex<AutomationTask>>>, // The actual task runner (shared)
+
     // Display cache (updated periodically from wallet)
     pub utxos: Vec<String>,
 }
@@ -92,6 +102,12 @@ impl Default for WalletData {
             snicker_scan_min_utxo_input: String::from("10000"),
             snicker_scan_max_utxo_input: String::from("100000000"),
             snicker_find_min_utxo_input: String::from("10000"),
+            automation_running: false,
+            automation_mode: AutomationMode::Disabled,
+            automation_max_delta: String::from("10000"),
+            automation_max_per_day: String::from("10"),
+            automation_interval_secs: String::from("10"),
+            automation_task: None,
             utxos: Vec::new(),
         }
     }

@@ -117,6 +117,32 @@ impl Manager {
         self.wallet_node.list_unspent().await
     }
 
+    /// Get all unspent UTXO outpoints (including SNICKER UTXOs)
+    /// Returns Vec of (txid_string, vout, amount, is_snicker)
+    pub async fn get_all_unspent_outpoints(&self) -> Result<Vec<(String, u32, u64, bool)>> {
+        self.wallet_node.get_all_unspent_outpoints().await
+    }
+
+    /// Subscribe to wallet update events (balance changes, new blocks, etc.)
+    ///
+    /// Returns a receiver that will receive events whenever the blockchain state changes.
+    /// This is event-driven - consumers only receive updates when Kyoto detects actual
+    /// blockchain activity (new blocks, transactions, etc.), not on a polling interval.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use ambient::manager::Manager;
+    /// # async fn example(manager: &Manager) {
+    /// let mut updates = manager.subscribe_to_updates();
+    /// while let Ok(update) = updates.recv().await {
+    ///     println!("New block: height={}, balance={}", update.height, update.balance_sats);
+    /// }
+    /// # }
+    /// ```
+    pub fn subscribe_to_updates(&self) -> tokio::sync::broadcast::Receiver<crate::wallet_node::WalletUpdate> {
+        self.wallet_node.subscribe_to_updates()
+    }
+
     /// Send to address (simple interface)
     pub async fn send_to_address(
         &mut self,
@@ -257,10 +283,8 @@ impl Manager {
         &self,
         min_utxo_sats: u64,
     ) -> Result<Vec<ProposalOpportunity>> {
-        // Get our UTXOs from wallet
-        let wallet = self.wallet_node.wallet.lock().await;
-        let our_utxos: Vec<_> = wallet.list_unspent().collect();
-        drop(wallet);
+        // Get all our UTXOs (both regular wallet and SNICKER UTXOs)
+        let our_utxos = self.wallet_node.get_all_wallet_utxos().await?;
 
         // Find opportunities using Snicker
         self.snicker.find_opportunities(&our_utxos, min_utxo_sats).await
@@ -279,19 +303,17 @@ impl Manager {
         opportunity: &ProposalOpportunity,
         delta_sats: i64,
     ) -> Result<(Proposal, EncryptedProposal)> {
-        // Get our UTXO details and addresses from wallet
+        // Get our UTXO from unified UTXO list
+        let all_utxos = self.wallet_node.get_all_wallet_utxos().await?;
+        let our_utxo = all_utxos.iter()
+            .find(|utxo| utxo.outpoint() == opportunity.our_outpoint)
+            .ok_or_else(|| anyhow::anyhow!("UTXO not found in wallet"))?
+            .clone();
+
+        // Get addresses for outputs from wallet
         let mut wallet = self.wallet_node.wallet.lock().await;
         let mut conn = self.wallet_node.conn.lock().await;
 
-        let our_utxo = wallet.list_unspent()
-            .find(|utxo| utxo.outpoint == opportunity.our_outpoint)
-            .ok_or_else(|| anyhow::anyhow!("UTXO not found in wallet"))?;
-
-        // Derive the proposer's input private key (for SNICKER tweak)
-        let our_keychain = our_utxo.keychain;
-        let our_derivation_index = our_utxo.derivation_index;
-
-        // Get addresses for outputs
         let equal_output_addr = wallet.reveal_next_address(bdk_wallet::KeychainKind::External).address;
         let change_output_addr = wallet.reveal_next_address(bdk_wallet::KeychainKind::Internal).address;
 
@@ -302,7 +324,7 @@ impl Manager {
         drop(conn);
 
         // Derive our input private key (the proposer's input key used for SNICKER tweak)
-        let our_input_privkey = self.wallet_node.derive_utxo_privkey(our_keychain, our_derivation_index)?;
+        let our_input_privkey = self.wallet_node.derive_utxo_privkey(&our_utxo)?;
 
         // Get fee rate from wallet
         let fee_rate = self.wallet_node.get_fee_rate();
@@ -453,8 +475,8 @@ impl Manager {
         let (proposal, encrypted_proposal) = self.snicker.propose(
             opportunity.target_tx.clone(),
             opportunity.target_output_index,
-            our_utxo.outpoint,
-            our_utxo.txout.clone(),
+            our_utxo.outpoint(),
+            our_utxo.txout(),
             our_input_privkey,  // Proposer's input key for SNICKER tweak (enables recovery)
             equal_output_addr,
             change_output_addr,
@@ -502,32 +524,36 @@ impl Manager {
     /// If decryption succeeds (proposal is for one of our UTXOs), stores in decrypted_proposals table
     /// If decryption fails (not for us), silently ignores
     pub async fn store_snicker_proposal(&mut self, proposal: &EncryptedProposal) -> Result<()> {
-        // Get our UTXOs
-        let wallet = self.wallet_node.wallet.lock().await;
-        let our_utxos: Vec<_> = wallet.list_unspent().collect();
-        drop(wallet);
+        // Get all our UTXOs (both regular wallet and SNICKER UTXOs)
+        let our_utxos = self.wallet_node.get_all_wallet_utxos().await?;
 
-        // Try to decrypt with each UTXO
+        // Try to decrypt the proposal for each UTXO
         for utxo in &our_utxos {
             let decrypt_result = self.snicker.try_decrypt_for_utxo(
                 proposal,
                 utxo,
-                |kc, idx| self.wallet_node.derive_utxo_privkey(kc, idx),
+                |u| self.wallet_node.derive_utxo_privkey(u),
             );
 
             if let Ok(decrypted) = decrypt_result {
-                // Successfully decrypted! This proposal is for us
-                tracing::info!("✅ Decrypted proposal tag {} for UTXO {}:{}",
+                let outpoint = utxo.outpoint();
+                let utxo_type = match utxo {
+                    crate::wallet_node::WalletUtxo::Regular(_) => "regular",
+                    crate::wallet_node::WalletUtxo::Snicker { .. } => "SNICKER",
+                };
+
+                tracing::info!("✅ Decrypted proposal tag {} for {} UTXO {}:{}",
                     ::hex::encode(&proposal.tag),
-                    utxo.outpoint.txid,
-                    utxo.outpoint.vout
+                    utxo_type,
+                    outpoint.txid,
+                    outpoint.vout
                 );
 
                 // Calculate delta
                 let delta = self.snicker.calculate_delta_from_proposal(&decrypted)?;
 
                 // Identify UTXOs in the proposal
-                let our_utxo_str = format!("{}:{}", utxo.outpoint.txid, utxo.outpoint.vout);
+                let our_utxo_str = format!("{}:{}", outpoint.txid, outpoint.vout);
 
                 // Find proposer's UTXO (the input that's not ours)
                 let mut proposer_utxo_str = String::from("unknown");
@@ -792,8 +818,14 @@ impl Manager {
             });
         }
 
-        tracing::debug!("✅ Found {} matching proposal(s) in delta range ({}, {})",
-                 results.len(), delta_range.0, delta_range.1);
+        // Format delta range for display
+        let range_str = if delta_range.0 == i64::MIN && delta_range.1 == i64::MAX {
+            "all".to_string()
+        } else {
+            format!("{} to {}", delta_range.0, delta_range.1)
+        };
+        tracing::debug!("✅ Found {} matching proposal(s) in delta range: {}",
+                 results.len(), range_str);
 
         Ok(results)
     }
@@ -815,17 +847,15 @@ impl Manager {
         let proposal = self.snicker.get_decrypted_proposal_by_tag(tag).await?
             .ok_or_else(|| anyhow::anyhow!("Proposal not found with tag: {}", hex::encode(tag)))?;
 
-        // Get our UTXOs from wallet
-        let wallet = self.wallet_node.wallet.lock().await;
-        let our_utxos: Vec<_> = wallet.list_unspent().collect();
-        drop(wallet);
+        // Get all our UTXOs (both regular wallet and SNICKER UTXOs)
+        let our_utxos = self.wallet_node.get_all_wallet_utxos().await?;
 
         // Validate and get PSBT from Snicker (already has proposer's signature)
         let mut psbt = self.snicker.receive(
             proposal,
             &our_utxos,
             acceptable_delta_range,
-            |keychain, index| self.wallet_node.derive_utxo_privkey(keychain, index),
+            |utxo| self.wallet_node.derive_utxo_privkey(utxo),
         )?;
 
         // Sign with wallet (adds receiver's signature)
@@ -864,9 +894,7 @@ impl Manager {
         println!("✅ Found proposal");
 
         println!("🔍 Step 2: Getting UTXOs...");
-        let wallet = self.wallet_node.wallet.lock().await;
-        let our_utxos: Vec<_> = wallet.list_unspent().collect();
-        drop(wallet);
+        let our_utxos = self.wallet_node.get_all_wallet_utxos().await?;
 
         println!("🔍 Step 3: Accepting and signing proposal...");
         // Accept and sign the proposal
@@ -883,7 +911,24 @@ impl Manager {
 
         println!("🔍 Step 6: Broadcasting transaction...");
         // Broadcast the transaction
-        let txid = self.broadcast_transaction(tx).await?;
+        let txid = self.broadcast_transaction(tx.clone()).await?;
+
+        println!("🔍 Step 7: Marking spent SNICKER UTXO...");
+        // Mark the input SNICKER UTXO as spent
+        // Find our input in the transaction
+        for input in &tx.input {
+            if let Some(utxo) = our_utxos.iter().find(|u| u.outpoint() == input.previous_output) {
+                if matches!(utxo, crate::wallet_node::WalletUtxo::Snicker { .. }) {
+                    self.wallet_node.mark_snicker_utxo_spent(
+                        &input.previous_output.txid.to_string(),
+                        input.previous_output.vout,
+                        &txid.to_string(),
+                    ).await?;
+                    println!("✅ Marked SNICKER input {}:{} as spent",
+                        input.previous_output.txid, input.previous_output.vout);
+                }
+            }
+        }
 
         Ok(txid)
     }
@@ -950,18 +995,15 @@ impl Manager {
         &self,
         proposal: &crate::snicker::Proposal,
         tx: &Transaction,
-        our_utxos: &[bdk_wallet::LocalOutput],
+        our_utxos: &[crate::wallet_node::WalletUtxo],
     ) -> Result<()> {
-        // Find our UTXO to get keychain and derivation index
+        // Find our UTXO that matches the original output
         let our_utxo = our_utxos.iter()
-            .find(|utxo| utxo.txout.script_pubkey == proposal.tweak_info.original_output.script_pubkey)
+            .find(|utxo| utxo.script_pubkey() == &proposal.tweak_info.original_output.script_pubkey)
             .ok_or_else(|| anyhow::anyhow!("Original output not found in our wallet"))?;
 
-        // Derive our private key
-        let receiver_seckey = self.wallet_node.derive_utxo_privkey(
-            our_utxo.keychain,
-            our_utxo.derivation_index
-        )?;
+        // Derive our private key using unified method
+        let receiver_seckey = self.wallet_node.derive_utxo_privkey(our_utxo)?;
 
         // Calculate the SNICKER shared secret
         let snicker_shared_secret = crate::snicker::tweak::calculate_dh_shared_secret(
@@ -1161,24 +1203,34 @@ impl Manager {
         let mut proposals_by_utxo: HashMap<String, Vec<crate::snicker::Proposal>> = HashMap::new();
         let mut stale_proposals = 0;
 
+        // Get all our UTXOs including SNICKER UTXOs (once, outside the loop)
+        let our_utxos = self.get_all_unspent_outpoints().await?;
+        tracing::debug!("Wallet has {} unspent UTXOs (including SNICKER)", our_utxos.len());
+        for (txid, vout, amount, is_snicker) in &our_utxos {
+            let marker = if *is_snicker { " [SNICKER]" } else { "" };
+            tracing::debug!("  UTXO: {}:{} ({} sats){}", txid, vout, amount, marker);
+        }
+
         for proposal in proposals {
             // Identify which of our UTXOs this proposal consumes
             // by checking which input in the PSBT matches our wallet
-            let wallet = self.wallet_node.wallet.lock().await;
-            let our_utxos: Vec<_> = wallet.list_unspent().collect();
-            drop(wallet);
-
             let mut our_utxo_str = None;
             for input in &proposal.psbt.unsigned_tx.input {
-                let outpoint_str = format!("{}:{}", input.previous_output.txid, input.previous_output.vout);
+                let input_txid = input.previous_output.txid.to_string();
+                let input_vout = input.previous_output.vout;
+                let outpoint_str = format!("{}:{}", input_txid, input_vout);
 
-                // Check if this input is one of our UTXOs
-                if our_utxos.iter().any(|u| {
-                    u.outpoint.txid == input.previous_output.txid &&
-                    u.outpoint.vout == input.previous_output.vout
+                tracing::debug!("Checking if proposal input {} matches our UTXOs", outpoint_str);
+
+                // Check if this input is one of our UTXOs (including SNICKER)
+                if our_utxos.iter().any(|(txid, vout, _, _)| {
+                    txid == &input_txid && *vout == input_vout
                 }) {
-                    our_utxo_str = Some(outpoint_str);
+                    our_utxo_str = Some(outpoint_str.clone());
+                    tracing::debug!("✅ Matched UTXO: {}", outpoint_str);
                     break;
+                } else {
+                    tracing::debug!("❌ No match for input: {}", outpoint_str);
                 }
             }
 

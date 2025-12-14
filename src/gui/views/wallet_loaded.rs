@@ -5,15 +5,15 @@ use iced::widget::{column, container, text, button, row, text_input, scrollable,
 use iced::widget::scrollable::{Direction, Scrollbar};
 use iced::widget::button::Style;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 
 use crate::gui::message::Message;
 use crate::gui::state::{WalletTab, WalletData};
 use crate::manager::Manager;
 
 /// Render the wallet loaded view
-pub fn view(manager: &Arc<Mutex<Manager>>, data: &WalletData) -> Element<'static, Message> {
-    let wallet_name_owned = manager.try_lock()
+pub fn view(manager: &Arc<RwLock<Manager>>, data: &WalletData) -> Element<'static, Message> {
+    let wallet_name_owned = manager.try_read()
         .map(|m| m.wallet_node.name().to_string())
         .unwrap_or_else(|_| "Wallet (locked)".to_string());
     let current_tab = data.current_tab;
@@ -372,6 +372,87 @@ fn view_transactions() -> Element<'static, Message> {
     .into()
 }
 
+/// Automation section for SNICKER tab
+fn view_automation_section(data: &WalletData) -> Element<'static, Message> {
+    use crate::config::AutomationMode;
+    use iced::widget::pick_list;
+
+    // Status indicator
+    let status_text = if data.automation_running {
+        text("● Running").size(14).color(Color::from_rgb(0.0, 0.8, 0.0)) // Green
+    } else {
+        text("○ Stopped").size(14).color(Color::from_rgb(0.5, 0.5, 0.5)) // Gray
+    };
+
+    // Mode dropdown
+    let mode_options = vec![
+        AutomationMode::Disabled,
+        AutomationMode::Basic,
+        AutomationMode::Advanced,
+    ];
+    let mode_label = match data.automation_mode {
+        AutomationMode::Disabled => "Disabled",
+        AutomationMode::Basic => "Basic (Auto-accept)",
+        AutomationMode::Advanced => "Advanced (Auto-accept + Auto-create)",
+    };
+
+    // Start/Stop buttons
+    let start_button = if !data.automation_running && data.automation_mode != AutomationMode::Disabled {
+        button("Start Automation")
+            .on_press(Message::AutomationStart)
+            .padding(8)
+    } else {
+        button("Start Automation")
+            .padding(8)
+    };
+
+    let stop_button = if data.automation_running {
+        button("Stop Automation")
+            .on_press(Message::AutomationStop)
+            .padding(8)
+    } else {
+        button("Stop Automation")
+            .padding(8)
+    };
+
+    container(
+        column![
+            text("⚡ AUTOMATION").size(24),
+            text("Automatically accept and/or create SNICKER proposals").size(12),
+            row![
+                text("Mode:").size(14),
+                pick_list(
+                    mode_options,
+                    Some(data.automation_mode),
+                    |mode| Message::AutomationModeChanged(mode.to_string())
+                )
+                .width(Length::Fixed(300.0)),
+            ].spacing(10),
+            row![
+                text("Max Delta:").size(14),
+                text_input("10000", &data.automation_max_delta)
+                    .on_input(Message::AutomationMaxDeltaChanged)
+                    .width(Length::Fixed(100.0)),
+                text("sats").size(14),
+                text("Max Proposals/Day:").size(14),
+                text_input("10", &data.automation_max_per_day)
+                    .on_input(Message::AutomationMaxPerDayChanged)
+                    .width(Length::Fixed(60.0)),
+            ].spacing(10),
+            row![
+                text("Status:").size(14),
+                status_text,
+            ].spacing(10),
+            row![
+                start_button,
+                stop_button,
+            ].spacing(10),
+        ].spacing(10)
+    )
+    .padding(15)
+    .into()
+}
+
 /// SNICKER tab - privacy features
 fn view_snicker(data: &WalletData) -> Element<'static, Message> {
     let mut content = column![
@@ -383,6 +464,9 @@ fn view_snicker(data: &WalletData) -> Element<'static, Message> {
         )
         .padding(10),
     ].spacing(20);
+
+    // ========== AUTOMATION SECTION ==========
+    content = content.push(view_automation_section(data));
 
     // ========== PROPOSER SECTION ==========
     content = content.push(

@@ -71,6 +71,29 @@ impl Default for AutomationMode {
     }
 }
 
+impl std::fmt::Display for AutomationMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AutomationMode::Disabled => write!(f, "Disabled"),
+            AutomationMode::Basic => write!(f, "Basic (Auto-Accept)"),
+            AutomationMode::Advanced => write!(f, "Advanced (Accept + Create)"),
+        }
+    }
+}
+
+impl std::str::FromStr for AutomationMode {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "Disabled" => Ok(AutomationMode::Disabled),
+            "Basic (Auto-Accept)" => Ok(AutomationMode::Basic),
+            "Advanced (Accept + Create)" => Ok(AutomationMode::Advanced),
+            _ => Err(anyhow::anyhow!("Invalid automation mode: {}", s)),
+        }
+    }
+}
+
 /// SNICKER automation configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnickerAutomation {

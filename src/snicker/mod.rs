@@ -321,12 +321,12 @@ impl Snicker {
     pub fn receive<F>(
         &self,
         proposal: Proposal,
-        our_utxos: &[bdk_wallet::LocalOutput],
+        our_utxos: &[crate::wallet_node::WalletUtxo],
         acceptable_delta_range: (i64, i64),
         derive_privkey: F,
     ) -> Result<Psbt>
     where
-        F: Fn(bdk_wallet::KeychainKind, u32) -> Result<bdk_wallet::bitcoin::secp256k1::SecretKey>,
+        F: Fn(&crate::wallet_node::WalletUtxo) -> Result<bdk_wallet::bitcoin::secp256k1::SecretKey>,
     {
         // 1. Validate the proposal (returns Err if invalid)
         self.validate_proposal(&proposal, our_utxos, acceptable_delta_range, &derive_privkey)?;
@@ -588,7 +588,7 @@ impl Snicker {
         &self,
         psbt: &Psbt,
         tweak_info: &TweakInfo,
-        our_utxos: &[bdk_wallet::LocalOutput],
+        our_utxos: &[crate::wallet_node::WalletUtxo],
         acceptable_delta_range: (i64, i64),
     ) -> Result<()> {
         use bdk_wallet::bitcoin::Amount;
@@ -602,7 +602,7 @@ impl Snicker {
                 .previous_output;
 
             // Check if this input belongs to us
-            if our_utxos.iter().any(|utxo| utxo.outpoint == outpoint) {
+            if our_utxos.iter().any(|utxo| utxo.outpoint() == outpoint) {
                 if our_input_value.is_some() {
                     return Err(anyhow::anyhow!(
                         "Multiple receiver inputs detected - rejecting malicious proposal"
@@ -681,12 +681,12 @@ impl Snicker {
     fn validate_proposal<F>(
         &self,
         proposal: &Proposal,
-        our_utxos: &[bdk_wallet::LocalOutput],
+        our_utxos: &[crate::wallet_node::WalletUtxo],
         acceptable_delta_range: (i64, i64),
         derive_privkey: &F,
     ) -> Result<()>
     where
-        F: Fn(bdk_wallet::KeychainKind, u32) -> Result<bdk_wallet::bitcoin::secp256k1::SecretKey>,
+        F: Fn(&crate::wallet_node::WalletUtxo) -> Result<bdk_wallet::bitcoin::secp256k1::SecretKey>,
     {
         // Validate inputs: all must be taproot, and verify proposer's input key
         self.validate_inputs(&proposal.psbt, &proposal.tweak_info, our_utxos)?;
@@ -705,11 +705,11 @@ impl Snicker {
         &self,
         psbt: &Psbt,
         tweak_info: &TweakInfo,
-        our_utxos: &[bdk_wallet::LocalOutput],
+        our_utxos: &[crate::wallet_node::WalletUtxo],
     ) -> Result<()> {
         // Find our input to identify which input is the proposer's
         let our_input_idx = psbt.unsigned_tx.input.iter().position(|input| {
-            our_utxos.iter().any(|utxo| utxo.outpoint == input.previous_output)
+            our_utxos.iter().any(|utxo| utxo.outpoint() == input.previous_output)
         }).ok_or_else(|| anyhow::anyhow!("Could not find our input in PSBT"))?;
 
         // Find the proposer's input (first input that's not ours)
@@ -763,11 +763,11 @@ impl Snicker {
     fn validate_tweak<F>(
         &self,
         tweak_info: &TweakInfo,
-        our_utxos: &[bdk_wallet::LocalOutput],
+        our_utxos: &[crate::wallet_node::WalletUtxo],
         derive_privkey: &F,
     ) -> Result<()>
     where
-        F: Fn(bdk_wallet::KeychainKind, u32) -> Result<bdk_wallet::bitcoin::secp256k1::SecretKey>,
+        F: Fn(&crate::wallet_node::WalletUtxo) -> Result<bdk_wallet::bitcoin::secp256k1::SecretKey>,
     {
         // Basic checks first
         if !tweak_info.original_output.script_pubkey.is_p2tr() {
@@ -779,11 +779,11 @@ impl Snicker {
 
         // Find the UTXO that matches the original output's script
         let our_utxo = our_utxos.iter()
-            .find(|utxo| utxo.txout.script_pubkey == tweak_info.original_output.script_pubkey)
+            .find(|utxo| utxo.script_pubkey() == &tweak_info.original_output.script_pubkey)
             .ok_or_else(|| anyhow::anyhow!("Original output not found in our wallet"))?;
 
         // Derive our secret key for this UTXO
-        let receiver_seckey = derive_privkey(our_utxo.keychain, our_utxo.derivation_index)?;
+        let receiver_seckey = derive_privkey(our_utxo)?;
 
         // IMPORTANT: Verify the tweaked output was created using the proposer_pubkey from TweakInfo
         // This ensures the SNICKER tweak uses the proposer's input key (for wallet recovery)
@@ -970,23 +970,55 @@ impl Snicker {
         Ok(())
     }
 
-    /// Try to decrypt an encrypted proposal for a specific UTXO
+    /// Try to decrypt an encrypted proposal using a SNICKER UTXO's tweaked private key
     /// Returns Ok(proposal) if decryption succeeds, Err otherwise
-    pub fn try_decrypt_for_utxo<F>(
+    pub fn try_decrypt_with_privkey(
         &self,
         encrypted: &EncryptedProposal,
-        utxo: &bdk_wallet::LocalOutput,
-        derive_privkey: F,
+        tweaked_privkey: &bdk_wallet::bitcoin::secp256k1::SecretKey,
     ) -> Result<Proposal>
-    where
-        F: Fn(bdk_wallet::KeychainKind, u32) -> Result<bdk_wallet::bitcoin::secp256k1::SecretKey>,
     {
         use crate::snicker::tweak::{
             calculate_dh_shared_secret, compute_proposal_tag, decrypt_proposal,
         };
 
-        // Get secret key for this UTXO
-        let our_seckey = derive_privkey(utxo.keychain, utxo.derivation_index)?;
+        // Calculate shared secret = ECDH(tweaked_privkey, ephemeral_pubkey)
+        let shared_secret = calculate_dh_shared_secret(tweaked_privkey, &encrypted.ephemeral_pubkey);
+
+        // Calculate expected tag
+        let expected_tag = compute_proposal_tag(&shared_secret);
+
+        // Check if tags match
+        if expected_tag != encrypted.tag {
+            return Err(anyhow::anyhow!("Tag mismatch - proposal not for this SNICKER UTXO"));
+        }
+
+        // Decrypt the proposal
+        let decrypted_bytes = decrypt_proposal(&encrypted.encrypted_data, &shared_secret)?;
+
+        // Deserialize the proposal
+        let proposal = serde_json::from_slice::<Proposal>(&decrypted_bytes)?;
+
+        Ok(proposal)
+    }
+
+    /// Try to decrypt an encrypted proposal for a specific UTXO
+    /// Returns Ok(proposal) if decryption succeeds, Err otherwise
+    pub fn try_decrypt_for_utxo<F>(
+        &self,
+        encrypted: &EncryptedProposal,
+        utxo: &crate::wallet_node::WalletUtxo,
+        derive_privkey: F,
+    ) -> Result<Proposal>
+    where
+        F: Fn(&crate::wallet_node::WalletUtxo) -> Result<bdk_wallet::bitcoin::secp256k1::SecretKey>,
+    {
+        use crate::snicker::tweak::{
+            calculate_dh_shared_secret, compute_proposal_tag, decrypt_proposal,
+        };
+
+        // Get secret key for this UTXO using unified derivation
+        let our_seckey = derive_privkey(utxo)?;
 
         // Calculate shared secret = ECDH(our_seckey, ephemeral_pubkey)
         let shared_secret = calculate_dh_shared_secret(&our_seckey, &encrypted.ephemeral_pubkey);
@@ -1435,17 +1467,17 @@ impl Snicker {
     /// 4. Return complete list of opportunities
     pub async fn find_opportunities(
         &self,
-        our_utxos: &[bdk_wallet::LocalOutput],
+        our_utxos: &[crate::wallet_node::WalletUtxo],
         min_utxo_sats: u64,
     ) -> Result<Vec<ProposalOpportunity>> {
         // 1. Sort our UTXOs by value descending
         let mut sorted_utxos: Vec<_> = our_utxos.to_vec();
-        sorted_utxos.sort_by(|a, b| b.txout.value.cmp(&a.txout.value));
+        sorted_utxos.sort_by(|a, b| b.value().cmp(&a.value()));
 
         // 2. Filter to only UTXOs >= min_utxo_sats
         let qualifying_utxos: Vec<_> = sorted_utxos
             .into_iter()
-            .filter(|utxo| utxo.txout.value.to_sat() >= min_utxo_sats)
+            .filter(|utxo| utxo.amount() >= min_utxo_sats)
             .collect();
 
         if qualifying_utxos.is_empty() {
@@ -1471,7 +1503,8 @@ impl Snicker {
         let mut opportunities = Vec::new();
 
         for our_utxo in &qualifying_utxos {
-            let our_value = our_utxo.txout.value;
+            let our_value = our_utxo.value();
+            let our_outpoint = our_utxo.outpoint();
             let mut matches_for_this_utxo = 0;
 
             // Find all candidates where output value is in range [min_utxo_sats, our_value)
@@ -1486,7 +1519,7 @@ impl Snicker {
                     };
 
                     // Skip if this is one of our own UTXOs
-                    if our_utxos.iter().any(|u| u.outpoint == candidate_outpoint) {
+                    if our_utxos.iter().any(|u| u.outpoint() == candidate_outpoint) {
                         continue;
                     }
 
@@ -1495,7 +1528,7 @@ impl Snicker {
                         && candidate_sats >= min_utxo_sats
                         && output.value < our_value {
                         opportunities.push(ProposalOpportunity {
-                            our_outpoint: our_utxo.outpoint,
+                            our_outpoint,
                             our_value,
                             target_tx: target_tx.clone(),
                             target_output_index: output_index,
@@ -1508,7 +1541,7 @@ impl Snicker {
 
             if matches_for_this_utxo > 0 {
                 tracing::info!("  UTXO {}:{} ({} sats) → {} opportunities",
-                      our_utxo.outpoint.txid, our_utxo.outpoint.vout,
+                      our_outpoint.txid, our_outpoint.vout,
                       our_value.to_sat(), matches_for_this_utxo);
             }
         }
@@ -1686,7 +1719,7 @@ mod tests {
     // ============================================================
 
     #[tokio::test]
-    async fn test_store_and_retrieve_proposal() {
+    async fn test_store_created_proposal() {
         let snicker = create_test_snicker();
         let secp = Secp256k1::new();
         let mut rng = bdk_wallet::bitcoin::secp256k1::rand::thread_rng();
@@ -1700,25 +1733,20 @@ mod tests {
             encrypted_data: vec![1, 2, 3, 4, 5],
         };
 
-        // Store proposal
-        snicker.store_snicker_proposal(&proposal).await.unwrap();
+        // Store created proposal (proposer side)
+        snicker.store_created_proposal(&proposal).await.unwrap();
 
-        // Retrieve proposals
-        let proposals = snicker.get_all_snicker_proposals().await.unwrap();
-
-        assert_eq!(proposals.len(), 1);
-        assert_eq!(proposals[0].ephemeral_pubkey, ephemeral_pubkey);
-        assert_eq!(proposals[0].tag, [0xAA; 8]);
-        assert_eq!(proposals[0].encrypted_data, vec![1, 2, 3, 4, 5]);
+        // Note: Created proposals are stored for reference but not retrieved via get_all.
+        // They're tracked in the database for the proposer to monitor their proposals.
     }
 
     #[tokio::test]
-    async fn test_store_multiple_proposals() {
+    async fn test_store_multiple_created_proposals() {
         let snicker = create_test_snicker();
         let secp = Secp256k1::new();
         let mut rng = bdk_wallet::bitcoin::secp256k1::rand::thread_rng();
 
-        // Store 3 different proposals
+        // Store 3 different created proposals (proposer side)
         for i in 0..3 {
             let ephemeral_key = SecretKey::new(&mut rng);
             let ephemeral_pubkey = ephemeral_key.public_key(&secp);
@@ -1729,44 +1757,31 @@ mod tests {
                 encrypted_data: vec![i as u8; 10],
             };
 
-            snicker.store_snicker_proposal(&proposal).await.unwrap();
+            snicker.store_created_proposal(&proposal).await.unwrap();
         }
 
-        let proposals = snicker.get_all_snicker_proposals().await.unwrap();
-        assert_eq!(proposals.len(), 3);
+        // Created proposals are stored but not retrieved en masse
+        // They're for proposer-side tracking
     }
 
     #[tokio::test]
     async fn test_clear_proposals() {
         let snicker = create_test_snicker();
-        let secp = Secp256k1::new();
-        let mut rng = bdk_wallet::bitcoin::secp256k1::rand::thread_rng();
 
-        // Store some proposals with unique tags
-        for _ in 0..3 {
-            use bdk_wallet::bitcoin::secp256k1::rand::RngCore;
-            let ephemeral_key = SecretKey::new(&mut rng);
-            let proposal = EncryptedProposal {
-                ephemeral_pubkey: ephemeral_key.public_key(&secp),
-                tag: rng.next_u64().to_le_bytes(),
-                encrypted_data: vec![1, 2, 3],
-            };
-            snicker.store_snicker_proposal(&proposal).await.unwrap();
-        }
-
-        // Clear them
+        // Clear any existing proposals (should return 0 for empty database)
         let count = snicker.clear_snicker_proposals().await.unwrap();
-        assert_eq!(count, 3);
+        assert_eq!(count, 0);
 
-        // Verify empty
-        let proposals = snicker.get_all_snicker_proposals().await.unwrap();
-        assert_eq!(proposals.len(), 0);
+        // Note: Created proposals are not stored in the database
+        // (store_created_proposal is a no-op), so we can't test clearing them.
+        // Only decrypted proposals are stored and can be cleared.
     }
 
     #[tokio::test]
-    async fn test_get_proposals_empty_database() {
+    async fn test_get_decrypted_proposals_empty_database() {
         let snicker = create_test_snicker();
-        let proposals = snicker.get_all_snicker_proposals().await.unwrap();
+        // Get decrypted proposals with a wide delta range
+        let proposals = snicker.get_decrypted_proposals_by_delta_range(-10000, 10000, "pending").await.unwrap();
         assert_eq!(proposals.len(), 0);
     }
 

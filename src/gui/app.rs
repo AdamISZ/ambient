@@ -9,7 +9,7 @@ use crate::gui::modal::Modal;
 use crate::config::Config;
 use std::sync::Arc;
 use std::mem::ManuallyDrop;
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 
 /// Main application struct
 pub struct AmbientApp {
@@ -68,28 +68,70 @@ impl AmbientApp {
         use std::time::{Duration, Instant};
         use iced::futures::StreamExt;
 
-        // Only poll balance when wallet is loaded
+        // Only subscribe to events when wallet is loaded
         match &self.state {
-            AppState::WalletLoaded { .. } => {
-                // Create a stream that emits every 2 seconds
-                // Use futures::stream::unfold with manual timing
-                iced::Subscription::run_with_id(
-                    "balance_poller",
-                    iced::futures::stream::unfold(Instant::now(), |last_tick| async move {
-                        // Calculate time until next tick
-                        let now = Instant::now();
-                        let elapsed = now.duration_since(last_tick);
-                        let interval = Duration::from_secs(2);
+            AppState::WalletLoaded { manager, wallet_data, .. } => {
+                // Event-driven blockchain update subscription
+                // Subscribes to Kyoto's blockchain events (new blocks, transactions)
+                let manager_clone = manager.clone();
+                let balance_sub = iced::Subscription::run_with_id(
+                    "blockchain_updates",
+                    iced::futures::stream::unfold(None, move |mut receiver_opt| {
+                        let manager = manager_clone.clone();
+                        async move {
+                            // Create receiver on first run
+                            if receiver_opt.is_none() {
+                                let mgr = manager.read().await;
+                                let receiver = mgr.subscribe_to_updates();
+                                drop(mgr);
+                                receiver_opt = Some(receiver);
+                            }
 
-                        if elapsed < interval {
-                            // Sleep using async-std which is runtime-agnostic
-                            async_std::task::sleep(interval - elapsed).await;
+                            let receiver = receiver_opt.as_mut().unwrap();
+
+                            // Wait for next blockchain update event
+                            match receiver.recv().await {
+                                Ok(update) => {
+                                    // Convert WalletUpdate to our Message
+                                    Some((Message::BlockchainUpdate(update), receiver_opt))
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                    // We missed some updates - that's OK, just get the next one
+                                    tracing::warn!("Blockchain update subscription lagged by {} events", n);
+                                    Some((Message::SyncRequested, receiver_opt))
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                    // Channel closed - stop subscription
+                                    None
+                                }
+                            }
                         }
-
-                        let next_tick = Instant::now();
-                        Some((Message::SyncRequested, next_tick))
                     })
-                )
+                );
+
+                // Automation status subscription (only when running)
+                let automation_sub = if wallet_data.automation_running {
+                    iced::Subscription::run_with_id(
+                        "automation_status",
+                        iced::futures::stream::unfold(Instant::now(), |last_tick| async move {
+                            let now = Instant::now();
+                            let elapsed = now.duration_since(last_tick);
+                            let interval = Duration::from_secs(1); // Update UI every second
+
+                            if elapsed < interval {
+                                async_std::task::sleep(interval - elapsed).await;
+                            }
+
+                            let next_tick = Instant::now();
+                            Some((Message::AutomationStatusUpdate, next_tick))
+                        })
+                    )
+                } else {
+                    iced::Subscription::none()
+                };
+
+                // Combine subscriptions
+                iced::Subscription::batch([balance_sub, automation_sub])
             }
             _ => iced::Subscription::none()
         }
@@ -313,8 +355,8 @@ impl AmbientApp {
 
                         println!("✅ Wallet '{}' loaded", wallet_name);
 
-                        // Wrap manager in Arc<Mutex<>> for shared mutable access
-                        let manager = Arc::new(Mutex::new(manager));
+                        // Wrap manager in Arc<RwLock<>> for shared mutable access
+                        let manager = Arc::new(RwLock::new(manager));
 
                         // Transition to WalletLoaded state
                         self.state = AppState::WalletLoaded {
@@ -485,7 +527,7 @@ impl AmbientApp {
                     return Task::perform(
                         async move {
                             rt_handle.spawn(async move {
-                                let mut manager = manager_clone.lock().await;
+                                let mut manager = manager_clone.write().await;
                                 manager.get_next_address().await
                             }).await.unwrap()
                         },
@@ -518,10 +560,55 @@ impl AmbientApp {
                 Task::none()
             }
 
+            Message::BlockchainUpdate(update) => {
+                // Event-driven update from Kyoto (new block, transaction, etc.)
+                if let AppState::WalletLoaded { manager, wallet_data } = &mut self.state {
+                    // Update balance with data from event
+                    wallet_data.balance = bdk_wallet::bitcoin::Amount::from_sat(update.balance_sats);
+                    wallet_data.is_syncing = false; // Clear syncing flag
+
+                    tracing::info!("📊 Blockchain update: height={}, balance={} sats",
+                                  update.height, update.balance_sats);
+
+                    // Fetch updated UTXOs list
+                    let manager_clone = manager.clone();
+                    let rt_handle = self.tokio_runtime.handle().clone();
+
+                    return Task::perform(
+                        async move {
+                            rt_handle.spawn(async move {
+                                let manager = manager_clone.read().await;
+                                manager.list_unspent().await
+                            }).await.unwrap()
+                        },
+                        |utxos_result| {
+                            let utxos = match utxos_result {
+                                Ok(list) => list,
+                                Err(e) => {
+                                    tracing::error!("Failed to fetch UTXOs: {}", e);
+                                    Vec::new()
+                                }
+                            };
+                            Message::WalletDataUpdated {
+                                balance: None, // Balance already updated
+                                utxos,
+                            }
+                        }
+                    );
+                }
+                Task::none()
+            }
+
             Message::SyncRequested => {
                 // Trigger wallet sync - fetch balance and UTXOs
                 // Called both manually (button) and automatically (subscription)
                 if let AppState::WalletLoaded { manager, wallet_data } = &mut self.state {
+                    // Guard: Skip if already syncing to prevent task accumulation
+                    if wallet_data.is_syncing {
+                        tracing::debug!("Skipping sync request - already syncing");
+                        return Task::none();
+                    }
+
                     wallet_data.is_syncing = true;
 
                     let manager_clone = manager.clone();
@@ -530,7 +617,7 @@ impl AmbientApp {
                     return Task::perform(
                         async move {
                             rt_handle.spawn(async move {
-                                let manager = manager_clone.lock().await;
+                                let manager = manager_clone.read().await;
                                 let balance = manager.get_balance().await;
                                 let utxos = manager.list_unspent().await;
                                 (balance, utxos)
@@ -684,7 +771,7 @@ impl AmbientApp {
                     return Task::perform(
                         async move {
                             rt_handle.spawn(async move {
-                                let mut manager = manager_clone.lock().await;
+                                let mut manager = manager_clone.write().await;
                                 manager.send_to_address(&address, amount_sats, fee_rate).await
                             }).await.unwrap()
                         },
@@ -734,7 +821,7 @@ impl AmbientApp {
                     return Task::perform(
                         async move {
                             rt_handle.spawn(async move {
-                                let manager = manager_clone.lock().await;
+                                let manager = manager_clone.read().await;
                                 manager.scan_for_snicker_candidates(blocks, min_utxo, max_utxo).await
                             }).await.unwrap()
                         },
@@ -802,7 +889,7 @@ impl AmbientApp {
                     return Task::perform(
                         async move {
                             rt_handle.spawn(async move {
-                                let manager = manager_clone.lock().await;
+                                let manager = manager_clone.read().await;
                                 manager.clear_snicker_candidates().await
                             }).await.unwrap()
                         },
@@ -847,7 +934,7 @@ impl AmbientApp {
                     return Task::perform(
                         async move {
                             rt_handle.spawn(async move {
-                                let manager = manager_clone.lock().await;
+                                let manager = manager_clone.read().await;
                                 manager.find_snicker_opportunities(min_utxo).await
                             }).await.unwrap()
                         },
@@ -906,7 +993,7 @@ impl AmbientApp {
                     return Task::perform(
                         async move {
                             rt_handle.spawn(async move {
-                                let mut manager = manager_clone.lock().await;
+                                let mut manager = manager_clone.write().await;
                                 let (proposal, encrypted) = manager.create_snicker_proposal(&opportunity, delta_sats as i64).await?;
 
                                 let tag_hex = ::hex::encode(&proposal.tag);
@@ -965,7 +1052,7 @@ impl AmbientApp {
                     return Task::perform(
                         async move {
                             rt_handle.spawn(async move {
-                                let mut manager = manager_clone.lock().await;
+                                let mut manager = manager_clone.write().await;
                                 manager.scan_proposals_directory(&proposals_dir, (min_delta, max_delta)).await
                             }).await.unwrap()
                         },
@@ -1029,7 +1116,7 @@ impl AmbientApp {
                         return Task::perform(
                             async move {
                                 rt_handle.spawn(async move {
-                                    let mut manager = manager_clone.lock().await;
+                                    let mut manager = manager_clone.write().await;
                                     manager.accept_and_broadcast_snicker_proposal(&tag, (-1_000_000, 1_000_000)).await
                                 }).await.unwrap()
                             },
@@ -1086,6 +1173,162 @@ impl AmbientApp {
                         // Error already printed
                     }
                 }
+                Task::none()
+            }
+
+            // Automation handlers
+            Message::AutomationStart => {
+                if let AppState::WalletLoaded { manager, wallet_data } = &mut self.state {
+                    use crate::automation::{AutomationTask, AutomationConfig};
+                    use crate::config::SnickerAutomation;
+
+                    // Parse configuration from UI inputs
+                    let interval_secs = wallet_data.automation_interval_secs
+                        .parse::<u64>()
+                        .unwrap_or(10);
+                    let max_delta = wallet_data.automation_max_delta
+                        .parse::<i64>()
+                        .unwrap_or(10_000);
+                    let max_per_day = wallet_data.automation_max_per_day
+                        .parse::<u32>()
+                        .unwrap_or(10);
+
+                    let task_config = AutomationConfig {
+                        interval_secs,
+                        min_utxo_sats: 75_000, // TODO: Make configurable
+                        proposal_delta_sats: 1_000, // TODO: Make configurable
+                    };
+
+                    let snicker_config = SnickerAutomation {
+                        mode: wallet_data.automation_mode,
+                        max_delta,
+                        max_proposals_per_day: max_per_day,
+                        prefer_snicker_outputs: true,  // Default
+                        snicker_pattern_only: true,    // Default
+                    };
+
+                    let mode = wallet_data.automation_mode;
+                    let manager_clone = manager.clone();
+                    let rt_handle = self.tokio_runtime.handle().clone();
+
+                    // Get proposals directory from config
+                    let proposals_dir = match crate::config::Config::load() {
+                        Ok(cfg) => cfg.proposals_directory,
+                        Err(_) => {
+                            eprintln!("❌ Failed to load config, using default proposals directory");
+                            std::path::PathBuf::from(".local/share/ambient/proposals")
+                        }
+                    };
+
+                    println!("🤖 Starting SNICKER automation...");
+                    println!("   Mode: {:?}", mode);
+                    println!("   Max delta: {} sats", max_delta);
+                    println!("   Max proposals/day: {}", max_per_day);
+
+                    // Create the task wrapped in Arc<Mutex<>>
+                    let task = Arc::new(tokio::sync::Mutex::new(AutomationTask::new()));
+                    wallet_data.automation_task = Some(task.clone());
+
+                    // Start the task asynchronously in the tokio runtime context
+                    return Task::perform(
+                        async move {
+                            // Run the start operation in the tokio runtime context
+                            rt_handle.spawn(async move {
+                                let mut task_guard = task.lock().await;
+                                task_guard.start(
+                                    manager_clone,
+                                    snicker_config,
+                                    task_config,
+                                    proposals_dir,
+                                ).await;
+                                println!("✅ Automation started");
+                            }).await.map_err(|e| e.to_string())
+                        },
+                        |result| Message::AutomationStarted(result)
+                    );
+                }
+                Task::none()
+            }
+
+            Message::AutomationStop => {
+                if let AppState::WalletLoaded { wallet_data, .. } = &mut self.state {
+                    if let Some(task) = wallet_data.automation_task.take() {
+                        println!("🛑 Stopping automation...");
+                        wallet_data.automation_running = false;
+
+                        let rt_handle = self.tokio_runtime.handle().clone();
+
+                        // Stop the task asynchronously in the tokio runtime context
+                        return Task::perform(
+                            async move {
+                                rt_handle.spawn(async move {
+                                    let mut task_guard = task.lock().await;
+                                    task_guard.stop().await;
+                                }).await.map_err(|e| e.to_string())
+                            },
+                            |_result| Message::AutomationStopped
+                        );
+                    }
+                }
+                Task::none()
+            }
+
+            Message::AutomationStarted(result) => {
+                if let AppState::WalletLoaded { wallet_data, .. } = &mut self.state {
+                    match result {
+                        Ok(()) => {
+                            println!("✅ Automation running");
+                            wallet_data.automation_running = true;
+                        }
+                        Err(e) => {
+                            eprintln!("❌ Automation start failed: {}", e);
+                            wallet_data.automation_running = false;
+                            wallet_data.automation_task = None;
+                        }
+                    }
+                }
+                Task::none()
+            }
+
+            Message::AutomationStopped => {
+                println!("🛑 Automation stopped");
+                Task::none()
+            }
+
+            Message::AutomationModeChanged(mode_str) => {
+                if let AppState::WalletLoaded { wallet_data, .. } = &mut self.state {
+                    use std::str::FromStr;
+                    if let Ok(mode) = crate::config::AutomationMode::from_str(&mode_str) {
+                        wallet_data.automation_mode = mode;
+                    }
+                }
+                Task::none()
+            }
+
+            Message::AutomationMaxDeltaChanged(value) => {
+                if let AppState::WalletLoaded { wallet_data, .. } = &mut self.state {
+                    wallet_data.automation_max_delta = value;
+                }
+                Task::none()
+            }
+
+            Message::AutomationMaxPerDayChanged(value) => {
+                if let AppState::WalletLoaded { wallet_data, .. } = &mut self.state {
+                    wallet_data.automation_max_per_day = value;
+                }
+                Task::none()
+            }
+
+            Message::AutomationIntervalChanged(value) => {
+                if let AppState::WalletLoaded { wallet_data, .. } = &mut self.state {
+                    wallet_data.automation_interval_secs = value;
+                }
+                Task::none()
+            }
+
+            Message::AutomationStatusUpdate => {
+                // This is triggered by subscription to update status
+                // For now, just refresh the view
                 Task::none()
             }
 
