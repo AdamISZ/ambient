@@ -37,6 +37,14 @@ impl Manager {
     /// * `network_str` - Network ("regtest", "signet", "mainnet")
     /// * `recovery_height` - Height to start blockchain recovery from
     ///
+    /// Load an existing wallet with password
+    ///
+    /// # Arguments
+    /// * `wallet_name` - Name of the wallet to load
+    /// * `network_str` - Network ("mainnet", "signet", "regtest", "testnet")
+    /// * `recovery_height` - Blockchain height to start scanning from
+    /// * `password` - Password for decrypting wallet files
+    ///
     /// # TODO
     /// Add wallet file locking to prevent multiple instances from opening the same wallet.
     /// This would avoid SQLite "database is locked" errors and potential double-spending issues.
@@ -45,9 +53,10 @@ impl Manager {
         wallet_name: &str,
         network_str: &str,
         recovery_height: u32,
+        password: &str,
     ) -> Result<Self> {
         // Load wallet and start node
-        let wallet_node = WalletNode::load(wallet_name, network_str, recovery_height).await?;
+        let wallet_node = WalletNode::load(wallet_name, network_str, recovery_height, password).await?;
 
         // Initialize SNICKER with its own database
         let snicker = Self::init_snicker(wallet_name, network_str, wallet_node.network)?;
@@ -59,13 +68,20 @@ impl Manager {
     }
 
     /// Generate a new wallet and initialize SNICKER
+    ///
+    /// # Arguments
+    /// * `wallet_name` - Name of the wallet
+    /// * `network_str` - Network ("mainnet", "signet", "regtest", "testnet")
+    /// * `recovery_height` - Blockchain height to start scanning from
+    /// * `password` - Password for encrypting wallet files
     pub async fn generate(
         wallet_name: &str,
         network_str: &str,
         recovery_height: u32,
+        password: &str,
     ) -> Result<(Self, bdk_wallet::keys::bip39::Mnemonic)> {
         // Generate new wallet
-        let (wallet_node, mnemonic) = WalletNode::generate(wallet_name, network_str, recovery_height).await?;
+        let (wallet_node, mnemonic) = WalletNode::generate(wallet_name, network_str, recovery_height, password).await?;
 
         // Initialize SNICKER
         let snicker = Self::init_snicker(wallet_name, network_str, wallet_node.network)?;

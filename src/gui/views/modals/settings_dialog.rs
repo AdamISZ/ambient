@@ -1,7 +1,7 @@
 //! Settings dialog modal
 
 use iced::{Element, Length};
-use iced::widget::{column, container, text, button, text_input, pick_list, row};
+use iced::widget::{column, container, text, button, text_input, pick_list, row, scrollable};
 
 use crate::gui::message::Message;
 use crate::config::Config;
@@ -59,9 +59,8 @@ pub fn view(edited_config: &Config) -> Element<'static, Message> {
     let recovery_height_value = edited_config.recovery_height.to_string();
     let proposals_dir = edited_config.proposals_directory.to_string_lossy().to_string();
 
-    let content = column![
-        text("Settings").size(32),
-
+    // Build scrollable content section
+    let scrollable_content = column![
         // Network selection
         column![
             text("Network").size(16),
@@ -106,22 +105,38 @@ pub fn view(edited_config: &Config) -> Element<'static, Message> {
                 .on_input(Message::SettingsProposalsDirChanged)
                 .width(Length::Fixed(400.0))
         ].spacing(5),
+    ]
+    .spacing(20);
 
-        // Buttons
-        row![
-            button("Save")
-                .on_press(Message::SettingsSave)
-                .padding(10),
-            button("Cancel")
-                .on_press(Message::CloseModal)
-                .padding(10),
-        ]
-        .spacing(10)
+    // Fixed button bar at bottom
+    let buttons = row![
+        button("Save")
+            .on_press(Message::SettingsSave)
+            .padding(10),
+        button("Cancel")
+            .on_press(Message::CloseModal)
+            .padding(10),
+    ]
+    .spacing(10);
+
+    // Main layout: header + scrollable content + fixed buttons
+    let layout = column![
+        // Header
+        text("Settings").size(32),
+
+        // Scrollable content area - takes available space
+        scrollable(scrollable_content)
+            .height(Length::Fill),
+
+        // Fixed button bar
+        buttons,
     ]
     .spacing(20)
     .padding(30);
 
-    container(content)
+    // Container with fixed width and max height
+    container(layout)
         .width(Length::Fixed(600.0))
+        .max_height(700.0)
         .into()
 }

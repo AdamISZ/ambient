@@ -11,10 +11,13 @@ pub fn view(step: &GenerateWalletStep, data: &GenerateWalletData) -> Element<'st
     // Clone data for 'static lifetime
     let wallet_name = data.wallet_name.clone();
     let network = data.network.clone();
+    let password = data.password.clone();
+    let password_confirm = data.password_confirm.clone();
     let mnemonic = data.mnemonic.clone();
 
     let content = match step {
         GenerateWalletStep::EnterName => view_enter_name(&wallet_name, &network),
+        GenerateWalletStep::EnterPassword => view_enter_password(&password, &password_confirm),
         GenerateWalletStep::ReviewAndGenerate => view_review_and_generate(&wallet_name, &network),
         GenerateWalletStep::DisplayMnemonic => view_display_mnemonic(&wallet_name, mnemonic.as_deref()),
         GenerateWalletStep::VerifyMnemonic => view_verify_mnemonic(),
@@ -53,7 +56,7 @@ fn view_enter_name(wallet_name: &str, network: &str) -> Element<'static, Message
                 .on_press(Message::CloseModal)
                 .padding(10),
             button("Next")
-                .on_press(Message::WizardStepChanged(GenerateWalletStep::ReviewAndGenerate))
+                .on_press(Message::WizardStepChanged(GenerateWalletStep::EnterPassword))
                 .padding(10),
         ]
         .spacing(10)
@@ -63,7 +66,80 @@ fn view_enter_name(wallet_name: &str, network: &str) -> Element<'static, Message
     .into()
 }
 
-/// Step 2: Review and generate
+/// Step 2: Enter password
+fn view_enter_password(password: &str, password_confirm: &str) -> Element<'static, Message> {
+    use iced::widget::text_input;
+
+    let passwords_match = !password.is_empty() && password == password_confirm;
+    let can_proceed = !password.is_empty() && passwords_match;
+
+    column![
+        text("Create New Wallet").size(32),
+        text("Step 2: Set Password").size(20),
+
+        column![
+            text("Password").size(16),
+            text("Choose a strong password to encrypt your wallet").size(12),
+            text_input("Enter password", password)
+                .on_input(Message::WalletPasswordChanged)
+                .on_submit(Message::FocusPasswordConfirmField)
+                .secure(true)
+                .width(Length::Fixed(500.0))
+                .id(iced::widget::text_input::Id::new("password_field")),
+        ].spacing(5),
+
+        column![
+            text("Confirm Password").size(16),
+            text_input("Confirm password", password_confirm)
+                .on_input(Message::WalletPasswordConfirmChanged)
+                .on_submit(if can_proceed {
+                    Message::WizardStepChanged(GenerateWalletStep::ReviewAndGenerate)
+                } else {
+                    Message::Placeholder
+                })
+                .secure(true)
+                .width(Length::Fixed(500.0))
+                .id(iced::widget::text_input::Id::new("password_confirm_field")),
+            if !password_confirm.is_empty() && !passwords_match {
+                text("❌ Passwords do not match").size(12)
+            } else if passwords_match {
+                text("✅ Passwords match").size(12)
+            } else {
+                text("").size(12)
+            }
+        ].spacing(5),
+
+        container(
+            column![
+                text("⚠️ Password Security").size(16),
+                text("• Use a strong, unique password").size(14),
+                text("• Password cannot be recovered if lost").size(14),
+                text("• Wallet files will be encrypted with this password").size(14),
+            ].spacing(5)
+        )
+        .padding(15),
+
+        row![
+            button("Back")
+                .on_press(Message::WizardStepChanged(GenerateWalletStep::EnterName))
+                .padding(10),
+            if can_proceed {
+                button("Next")
+                    .on_press(Message::WizardStepChanged(GenerateWalletStep::ReviewAndGenerate))
+                    .padding(10)
+            } else {
+                button("Next")
+                    .padding(10)
+            },
+        ]
+        .spacing(10)
+    ]
+    .spacing(20)
+    .padding(30)
+    .into()
+}
+
+/// Step 3: Review and generate
 fn view_review_and_generate(wallet_name: &str, network: &str) -> Element<'static, Message> {
     let wallet_name = wallet_name.to_string();
     let network = network.to_string();
@@ -91,7 +167,7 @@ fn view_review_and_generate(wallet_name: &str, network: &str) -> Element<'static
 
         row![
             button("Back")
-                .on_press(Message::WizardStepChanged(GenerateWalletStep::EnterName))
+                .on_press(Message::WizardStepChanged(GenerateWalletStep::EnterPassword))
                 .padding(10),
             button("Generate Wallet")
                 .on_press(Message::GenerateWalletRequested)
@@ -104,7 +180,7 @@ fn view_review_and_generate(wallet_name: &str, network: &str) -> Element<'static
     .into()
 }
 
-/// Step 3: Display mnemonic
+/// Step 4: Display mnemonic
 fn view_display_mnemonic(wallet_name: &str, mnemonic: Option<&str>) -> Element<'static, Message> {
     let wallet_name = wallet_name.to_string();
 

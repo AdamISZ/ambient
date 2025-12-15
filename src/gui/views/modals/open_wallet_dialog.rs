@@ -1,31 +1,37 @@
 //! Open Wallet dialog modal
 
 use iced::{Element, Length, Border, Color, Theme};
-use iced::widget::{column, container, text, button, row, scrollable, Scrollable};
+use iced::widget::{column, container, text, button, row, scrollable, Scrollable, text_input};
 use iced::widget::scrollable::{Direction, Scrollbar};
 use iced::widget::button::Style;
 
 use crate::gui::message::Message;
 
 /// Render the open wallet dialog
-pub fn view(available_wallets: &[String], selected: &Option<String>) -> Element<'static, Message> {
+pub fn view(
+    available_wallets: &[String],
+    selected: &Option<String>,
+    password: &str,
+    error_message: &Option<String>,
+) -> Element<'static, Message> {
     let available_wallets = available_wallets.to_vec();
     let selected = selected.clone();
+    let password_owned = password.to_string();
+    let error = error_message.clone();
 
-    let mut content = column![
-        text("Open Wallet").size(32),
-    ].spacing(20);
+    // Build scrollable content section
+    let mut scrollable_content = column![].spacing(20);
 
     if available_wallets.is_empty() {
-        content = content.push(
+        scrollable_content = scrollable_content.push(
             text("No wallets found in this directory").size(16)
         );
     } else {
-        content = content.push(
+        scrollable_content = scrollable_content.push(
             text(format!("Found {} wallet(s)", available_wallets.len())).size(16)
         );
 
-        // List of wallets as buttons (scrollable)
+        // List of wallets as buttons (nested scrollable for long lists)
         let mut wallet_list = column![].spacing(10);
         for wallet_name in &available_wallets {
             let name = wallet_name.clone();
@@ -42,8 +48,8 @@ pub fn view(available_wallets: &[String], selected: &Option<String>) -> Element<
             );
         }
 
-        // Wrap in scrollable with max height to prevent overflow
-        content = content.push(
+        // Wrap wallet list in its own scrollable with reasonable max height
+        scrollable_content = scrollable_content.push(
             scrollable(wallet_list)
                 .direction(Direction::Vertical(
                     Scrollbar::new()
@@ -55,22 +61,58 @@ pub fn view(available_wallets: &[String], selected: &Option<String>) -> Element<
         );
     }
 
-    // Buttons
+    // Password input (only show if wallet is selected)
+    if selected.is_some() {
+        scrollable_content = scrollable_content.push(
+            column![
+                text("Password").size(16),
+                text_input("Enter wallet password", &password_owned)
+                    .on_input(Message::OpenWalletPasswordChanged)
+                    .secure(true)
+                    .width(Length::Fixed(400.0)),
+            ].spacing(5)
+        );
+
+        // Show error message if present
+        if let Some(err) = error {
+            scrollable_content = scrollable_content.push(
+                text(format!("❌ {}", err))
+                    .size(14)
+                    .color(Color::from_rgb(1.0, 0.3, 0.3))
+            );
+        }
+    }
+
+    // Fixed button bar at bottom
     let mut buttons = row![
         dialog_button("Cancel", Message::CloseModal),
     ].spacing(10);
 
-    if selected.is_some() {
+    if selected.is_some() && !password_owned.is_empty() {
         buttons = buttons.push(
-            dialog_button("Load Wallet", Message::LoadWalletRequested(selected.unwrap()))
+            dialog_button("Load Wallet", Message::LoadWalletRequested(selected.unwrap(), password_owned))
         );
     }
 
-    content = content.push(buttons);
+    // Main layout: header + scrollable content + fixed buttons
+    let layout = column![
+        // Header
+        text("Open Wallet").size(32),
 
-    container(content.padding(30))
+        // Scrollable content area - takes available space
+        scrollable(scrollable_content)
+            .height(Length::Fill),
+
+        // Fixed button bar
+        buttons,
+    ]
+    .spacing(20)
+    .padding(30);
+
+    // Container with fixed width and max height
+    container(layout)
         .width(Length::Fixed(500.0))
-        .height(Length::Fixed(550.0))
+        .max_height(700.0)
         .into()
 }
 

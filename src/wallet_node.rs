@@ -25,6 +25,8 @@ use bdk_wallet::{
 use bdk_kyoto::builder::{Builder, BuilderExt};
 use bdk_kyoto::{Info, LightClient, Receiver, ScanType, UnboundedReceiver, Warning, TxBroadcast, TxBroadcastPolicy, HeaderCheckpoint};
 
+use crate::encryption::WalletEncryption;
+
 const RECOVERY_LOOKAHEAD: u32 = 50;
 const NUM_CONNECTIONS: u8 = 1;
 const SYNC_LOOKBACK: u32 = 5_000; // blocks to rescan on `sync`
@@ -135,12 +137,25 @@ impl WalletNode {
     }
 
     /// Generate a new wallet (new mnemonic), persist it, and then load it.
+    /// Generate a new wallet with encrypted storage
+    ///
+    /// TODO(v2): Add password strength enforcement
+    ///
+    /// # Arguments
+    /// * `name` - Wallet name
+    /// * `network_str` - Network ("mainnet", "signet", "regtest", "testnet")
+    /// * `recovery_height` - Blockchain height to start scanning from
+    /// * `password` - Password for encrypting wallet files
+    ///
+    /// # Returns
+    /// Tuple of (WalletNode, Mnemonic)
     pub async fn generate(
         name: &str,
         network_str: &str,
         recovery_height: u32,
+        password: &str,
     ) -> Result<(Self, Mnemonic)> {
-        let (wallet_dir, _, mnemonic_path) = Self::wallet_paths(name, network_str)?;
+        let (wallet_dir, _, _, mnemonic_path) = Self::wallet_paths(name, network_str)?;
         fs::create_dir_all(&wallet_dir)?;
 
         let gen: GeneratedKey<_, Tap> =
@@ -148,27 +163,47 @@ impl WalletNode {
                 .map_err(|_| anyhow!("Mnemonic generation failed"))?;
         let mnemonic = Mnemonic::parse_in(Language::English, gen.to_string())?;
 
-        fs::write(&mnemonic_path, mnemonic.to_string())?;
-        info!("🔑 Generated new mnemonic for wallet '{name}'");
+        // Encrypt mnemonic before writing to disk
+        let mnemonic_plaintext = mnemonic.to_string();
+        let encrypted = WalletEncryption::encrypt_file(mnemonic_plaintext.as_bytes(), password)?;
+        fs::write(&mnemonic_path, encrypted)?;
+        info!("🔑 Generated new mnemonic for wallet '{name}' (encrypted)");
 
-        let node = Self::load(name, network_str, recovery_height).await?;
+        let node = Self::load(name, network_str, recovery_height, password).await?;
 
         Ok((node, mnemonic))
     }
 
     /// Load an existing wallet by name and start the Kyoto node for it.
+    ///
+    /// TODO(v2): Add password change functionality
+    /// TODO(v2): Encrypt databases on shutdown, decrypt on load (currently unencrypted)
+    ///
+    /// # Arguments
+    /// * `name` - Wallet name
+    /// * `network_str` - Network ("mainnet", "signet", "regtest", "testnet")
+    /// * `recovery_height` - Blockchain height to start scanning from
+    /// * `password` - Password for decrypting wallet files
+    ///
+    /// # Returns
+    /// WalletNode instance
     pub async fn load(
         name: &str,
         network_str: &str,
         recovery_height: u32,
+        password: &str,
     ) -> Result<Self> {
         let network = Self::parse_network(network_str)?;
-        let (wallet_dir, db_path, mnemonic_path) = Self::wallet_paths(name, network_str)?;
+        let (wallet_dir, wallet_db_enc_path, snicker_db_enc_path, mnemonic_path) =
+            Self::wallet_paths(name, network_str)?;
         fs::create_dir_all(&wallet_dir)?; // okay if already exists
 
+        // Decrypt mnemonic
         let mnemonic: Mnemonic = if mnemonic_path.exists() {
-            let existing = fs::read_to_string(&mnemonic_path)?;
-            Mnemonic::parse(existing.trim())?
+            let encrypted = fs::read(&mnemonic_path)?;
+            let decrypted = WalletEncryption::decrypt_file(&encrypted, password)?;
+            let mnemonic_str = std::str::from_utf8(&decrypted)?;
+            Mnemonic::parse(mnemonic_str.trim())?
         } else {
             return Err(anyhow!(
                 "Mnemonic file not found for wallet '{name}' at {:?}",
@@ -176,7 +211,10 @@ impl WalletNode {
             ));
         };
 
-        let (wallet, conn) = Self::load_or_create_wallet(&mnemonic, network, &db_path)?;
+        // TODO(v2): Decrypt wallet database to temp file
+        // For now, use unencrypted database paths (temp files)
+        let wallet_db_path = wallet_dir.join("wallet.sqlite");
+        let (wallet, conn) = Self::load_or_create_wallet(&mnemonic, network, &wallet_db_path)?;
 
         let (requester, update_subscriber) =
             Self::start_node(&wallet, network, recovery_height, name)?;
@@ -193,19 +231,20 @@ impl WalletNode {
         let update_subscriber = Arc::new(Mutex::new(update_subscriber));
 
         // Construct path to SNICKER database (before spawning background task)
+        // TODO(v2): Use encrypted database paths and decrypt to temp files
         let project_dirs = directories::ProjectDirs::from("org", "code", "ambient")
             .ok_or_else(|| anyhow::anyhow!("Could not determine data directory"))?;
         let snicker_db_path = project_dirs
             .data_local_dir()
             .join(network_str)
             .join(name)
-            .join("snicker.sqlite");
+            .join("snicker.sqlite"); // TODO: .enc and decrypt
 
         let wallet_db_path_for_bg = project_dirs
             .data_local_dir()
             .join(network_str)
             .join(name)
-            .join("wallet.sqlite");
+            .join("wallet.sqlite"); // TODO: .enc and decrypt
 
         // Derive descriptors for SNICKER UTXO detection
         let coin_type = if network == Network::Bitcoin { 0 } else { 1 };
@@ -275,15 +314,52 @@ impl WalletNode {
         })
     }
 
-    fn wallet_paths(name: &str, network_str: &str) -> Result<(PathBuf, PathBuf, PathBuf)> {
+    fn wallet_paths(name: &str, network_str: &str) -> Result<(PathBuf, PathBuf, PathBuf, PathBuf)> {
         let project_dirs = ProjectDirs::from("org", "code", "ambient")
             .ok_or_else(|| anyhow!("Cannot determine project dir"))?;
 
         let wallet_dir = project_dirs.data_local_dir().join(network_str).join(name);
-        let db_path = wallet_dir.join("wallet.sqlite");
-        let mnemonic_path = wallet_dir.join("mnemonic.txt");
+        let wallet_db_path = wallet_dir.join("wallet.sqlite.enc");
+        let snicker_db_path = wallet_dir.join("snicker.sqlite.enc");
+        let mnemonic_path = wallet_dir.join("mnemonic.enc");
 
-        Ok((wallet_dir, db_path, mnemonic_path))
+        Ok((wallet_dir, wallet_db_path, snicker_db_path, mnemonic_path))
+    }
+
+    /// Decrypt an encrypted database file to a temporary file
+    ///
+    /// TODO(v2): Decrypt to in-memory database instead of temp files
+    ///
+    /// # Arguments
+    /// * `encrypted_path` - Path to the .enc file
+    /// * `password` - Decryption password
+    ///
+    /// # Returns
+    /// Temporary file containing decrypted database (auto-deleted on drop)
+    fn decrypt_to_temp(
+        encrypted_path: &Path,
+        password: &str,
+    ) -> Result<tempfile::NamedTempFile> {
+        // Read encrypted file
+        let encrypted_data = fs::read(encrypted_path)?;
+
+        // Decrypt
+        let decrypted = WalletEncryption::decrypt_file(&encrypted_data, password)?;
+
+        // Write to temp file
+        let mut temp = tempfile::NamedTempFile::new()?;
+        use std::io::Write;
+        temp.write_all(&decrypted)?;
+        temp.flush()?;
+
+        tracing::debug!(
+            "Decrypted {} → {} bytes (temp: {:?})",
+            encrypted_path.display(),
+            decrypted.len(),
+            temp.path()
+        );
+
+        Ok(temp)
     }
 
     fn load_or_create_wallet(
@@ -414,20 +490,29 @@ impl WalletNode {
         from_height: u32,
         wallet_name: &str,
     ) -> Result<(bdk_kyoto::Requester, bdk_kyoto::UpdateSubscriber)> {
-        // Use actual genesis block hash for height 0, otherwise all_zeros as placeholder
-        let checkpoint_hash = if from_height == 0 {
+        // Get checkpoint from wallet's local chain if it exists, otherwise use genesis or requested height
+        let wallet_tip = wallet.local_chain().tip();
+        let (checkpoint_height, checkpoint_hash) = if wallet_tip.height() > 0 {
+            // Wallet has synced before, use its current tip
+            (wallet_tip.height(), wallet_tip.hash())
+        } else if from_height == 0 {
+            // New wallet starting from genesis
             use bdk_wallet::bitcoin::blockdata::constants::genesis_block;
-            genesis_block(network).block_hash()
+            (0, genesis_block(network).block_hash())
         } else {
-            BlockHash::all_zeros()
+            // New wallet but requested non-zero height - use genesis anyway to avoid hash mismatch
+            // The wallet will sync from genesis to the current tip
+            use bdk_wallet::bitcoin::blockdata::constants::genesis_block;
+            tracing::warn!("Requested start from height {}, but using genesis to avoid checkpoint hash issues", from_height);
+            (0, genesis_block(network).block_hash())
         };
 
-        let checkpoint = HeaderCheckpoint::new(from_height, checkpoint_hash);
+        let checkpoint = HeaderCheckpoint::new(checkpoint_height, checkpoint_hash);
         let scan_type = ScanType::Recovery {
             used_script_index: RECOVERY_LOOKAHEAD,
             checkpoint,
         };
-        info!("🔍 Recovery starting from height {} with hash {}", from_height, checkpoint_hash);
+        info!("🔍 Recovery starting from height {} with hash {}", checkpoint_height, checkpoint_hash);
 
         // Select peer based on network
         let peer = match network {

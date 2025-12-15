@@ -25,10 +25,13 @@ pub enum Message {
     WalletSelected(String),
     CreateWalletRequested,
     WalletNameChanged(String),
+    WalletPasswordChanged(String),
+    WalletPasswordConfirmChanged(String),
+    OpenWalletPasswordChanged(String),
     GenerateWalletRequested,
     WalletGenerated(Result<(String, String), String>), // (wallet_name, mnemonic) or error
     WalletGenerationConfirmed,
-    LoadWalletRequested(String), // wallet name to load
+    LoadWalletRequested(String, String), // (wallet name, password)
     WalletCreated(String), // wallet name
     WalletLoadComplete(Result<(String, ManagerWrapper), String>), // (wallet_name, manager) or error
 
@@ -36,6 +39,7 @@ pub enum Message {
     WizardNextStep,
     WizardPreviousStep,
     WizardStepChanged(crate::gui::modal::GenerateWalletStep),
+    FocusPasswordConfirmField,
 
     // Wallet tab navigation
     TabChanged(crate::gui::state::WalletTab),

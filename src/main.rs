@@ -4,6 +4,7 @@ mod cli;
 mod wallet_node;
 mod config;
 mod automation;
+mod encryption;
 
 use anyhow::Result;
 use clap::{Parser, ValueEnum};

@@ -87,10 +87,34 @@ fi
     -peerblockfilters=1
 
 echo "⏳ Waiting for bitcoind to start..."
-sleep 3
+
+# Wait for bitcoind to be ready (try for up to 30 seconds)
+for i in {1..30}; do
+    sleep 1
+    if "$BITCOIN_CLI" -regtest -datadir="$DATADIR" getblockchaininfo &>/dev/null; then
+        echo "   ✅ bitcoind is ready"
+        break
+    fi
+    if [ $i -eq 30 ]; then
+        echo "❌ bitcoind failed to start within 30 seconds"
+        exit 1
+    fi
+done
 
 # Create a wallet if it doesn't exist
-"$BITCOIN_CLI" -regtest -datadir="$DATADIR" createwallet "miner" 2>/dev/null || true
+# First check if wallet is already loaded
+WALLET_LOADED=$("$BITCOIN_CLI" -regtest -datadir="$DATADIR" listwallets 2>/dev/null | grep -c '"miner"' || true)
+
+if [ "$WALLET_LOADED" -eq 0 ]; then
+    echo "   Creating 'miner' wallet..."
+    if ! "$BITCOIN_CLI" -regtest -datadir="$DATADIR" createwallet "miner" 2>/dev/null; then
+        # Wallet might already exist but not loaded, try loading it
+        echo "   Wallet exists, loading..."
+        "$BITCOIN_CLI" -regtest -datadir="$DATADIR" loadwallet "miner" 2>/dev/null || true
+    fi
+else
+    echo "   Wallet 'miner' already loaded"
+fi
 
 # Get an address
 MINER_ADDR=$("$BITCOIN_CLI" -regtest -datadir="$DATADIR" -rpcwallet=miner getnewaddress)

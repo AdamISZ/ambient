@@ -18,10 +18,12 @@ pub enum Modal {
         edited_config: Config,
     },
 
-    /// Open existing wallet dialog (future)
+    /// Open existing wallet dialog
     OpenWallet {
         available_wallets: Vec<String>,
         selected: Option<String>,
+        password: String,
+        error_message: Option<String>,
     },
 
     /// Accept SNICKER proposal confirmation dialog
@@ -39,6 +41,7 @@ pub enum Modal {
 #[derive(Debug, Clone, PartialEq)]
 pub enum GenerateWalletStep {
     EnterName,
+    EnterPassword,
     ReviewAndGenerate,
     DisplayMnemonic,
     VerifyMnemonic,
@@ -50,6 +53,8 @@ pub enum GenerateWalletStep {
 pub struct GenerateWalletData {
     pub wallet_name: String,
     pub network: String,
+    pub password: String,
+    pub password_confirm: String,
     pub mnemonic: Option<String>,
     pub confirmed_saved: bool,
 }
@@ -59,6 +64,8 @@ impl GenerateWalletData {
         Self {
             wallet_name: String::new(),
             network,
+            password: String::new(),
+            password_confirm: String::new(),
             mnemonic: None,
             confirmed_saved: false,
         }
@@ -75,8 +82,8 @@ impl Modal {
             Modal::Settings { edited_config } => {
                 crate::gui::views::modals::settings_dialog::view(edited_config)
             }
-            Modal::OpenWallet { available_wallets, selected } => {
-                crate::gui::views::modals::open_wallet_dialog::view(available_wallets, selected)
+            Modal::OpenWallet { available_wallets, selected, password, error_message } => {
+                crate::gui::views::modals::open_wallet_dialog::view(available_wallets, selected, password, error_message)
             }
             Modal::AcceptProposalConfirmation {
                 proposal_index,

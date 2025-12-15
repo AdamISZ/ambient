@@ -170,6 +170,8 @@ impl AmbientApp {
                 self.active_modal = Some(crate::gui::modal::Modal::OpenWallet {
                     available_wallets,
                     selected: None,
+                    password: String::new(),
+                    error_message: None,
                 });
 
                 Task::none()
@@ -216,9 +218,10 @@ impl AmbientApp {
             }
 
             Message::WalletSelected(name) => {
-                // Update selected wallet in the OpenWallet modal
-                if let Some(Modal::OpenWallet { available_wallets, selected }) = &mut self.active_modal {
+                // Update selected wallet in the OpenWallet modal and clear error message
+                if let Some(Modal::OpenWallet { selected, error_message, .. }) = &mut self.active_modal {
                     *selected = Some(name);
+                    *error_message = None; // Clear error when selecting a new wallet
                 }
                 Task::none()
             }
@@ -243,17 +246,48 @@ impl AmbientApp {
                 Task::none()
             }
 
+            Message::WalletPasswordChanged(password) => {
+                // Update password in modal data
+                if let Some(crate::gui::modal::Modal::GenerateWallet { data, .. }) = &mut self.active_modal {
+                    data.password = password;
+                }
+                Task::none()
+            }
+
+            Message::WalletPasswordConfirmChanged(password_confirm) => {
+                // Update password confirmation in modal data
+                if let Some(crate::gui::modal::Modal::GenerateWallet { data, .. }) = &mut self.active_modal {
+                    data.password_confirm = password_confirm;
+                }
+                Task::none()
+            }
+
+            Message::OpenWalletPasswordChanged(password) => {
+                // Update password in OpenWallet modal
+                if let Some(crate::gui::modal::Modal::OpenWallet { password: ref mut pw, .. }) = &mut self.active_modal {
+                    *pw = password;
+                }
+                Task::none()
+            }
+
             Message::GenerateWalletRequested => {
-                // Get the wallet name and network from modal
+                // Get the wallet name, network, and password from modal
                 if let Some(crate::gui::modal::Modal::GenerateWallet { data, .. }) = &self.active_modal {
                     let name = data.wallet_name.clone();
                     let network = data.network.clone();
+                    let password = data.password.clone();
                     let recovery_height = self.config.recovery_height;
                     let rt_handle = self.tokio_runtime.handle().clone();
 
                     // Validate wallet name
                     if name.is_empty() {
                         eprintln!("❌ Wallet name cannot be empty");
+                        return Task::none();
+                    }
+
+                    // Validate password
+                    if password.is_empty() {
+                        eprintln!("❌ Password cannot be empty");
                         return Task::none();
                     }
 
@@ -264,7 +298,7 @@ impl AmbientApp {
                     return Task::perform(
                         async move {
                             rt_handle.spawn(async move {
-                                match crate::manager::Manager::generate(&name, &network, recovery_height).await {
+                                match crate::manager::Manager::generate(&name, &network, recovery_height, &password).await {
                                     Ok((_manager, mnemonic)) => {
                                         // Manager is dropped here, wallet is already saved to disk
                                         Ok((name.clone(), mnemonic.to_string()))
@@ -306,18 +340,19 @@ impl AmbientApp {
                 // Load the wallet we just created
                 if let Some(crate::gui::modal::Modal::GenerateWallet { data, .. }) = &self.active_modal {
                     let name = data.wallet_name.clone();
+                    let password = data.password.clone();
 
                     // Close the modal
                     self.active_modal = None;
 
                     println!("Loading generated wallet '{}'...", name);
-                    return Task::done(Message::LoadWalletRequested(name));
+                    return Task::done(Message::LoadWalletRequested(name, password));
                 }
                 Task::none()
             }
 
-            Message::LoadWalletRequested(wallet_name) => {
-                // Load a wallet from disk
+            Message::LoadWalletRequested(wallet_name, password) => {
+                // Load a wallet from disk using the provided password
                 let network = self.config.network.as_str().to_string();
                 let name = wallet_name.clone();
                 let recovery_height = self.config.recovery_height;
@@ -330,7 +365,7 @@ impl AmbientApp {
                 Task::perform(
                     async move {
                         rt_handle.spawn(async move {
-                            crate::manager::Manager::load(&name, &network, recovery_height).await
+                            crate::manager::Manager::load(&name, &network, recovery_height, &password).await
                         }).await.unwrap()
                     },
                     move |result| match result {
@@ -339,7 +374,7 @@ impl AmbientApp {
                             let wrapper = ManagerWrapper(Arc::new(Some(manager)));
                             Message::WalletLoadComplete(Ok((name, wrapper)))
                         }
-                        Err(e) => Message::WalletLoadComplete(Err(format!("Failed to load wallet: {}", e))),
+                        Err(e) => Message::WalletLoadComplete(Err(format!("{}", e))),
                     }
                 )
             }
@@ -372,9 +407,22 @@ impl AmbientApp {
                     }
                     Err(e) => {
                         eprintln!("❌ Failed to load wallet: {}", e);
-                        self.state = AppState::Error {
-                            message: e,
-                        };
+
+                        // Check if it's a password error - if so, keep modal open for retry
+                        if e.contains("Wrong password") || e.contains("Encryption") {
+                            // Update error message in OpenWallet modal
+                            if let Some(crate::gui::modal::Modal::OpenWallet { error_message, password, .. }) = &mut self.active_modal {
+                                *error_message = Some(e);
+                                // Clear password for retry
+                                *password = String::new();
+                            }
+                        } else {
+                            // Other errors (file not found, etc.) - show error state
+                            self.state = AppState::Error {
+                                message: e,
+                            };
+                            self.active_modal = None;
+                        }
                     }
                 }
                 Task::none()
@@ -467,11 +515,19 @@ impl AmbientApp {
                 Task::none()
             }
 
+            Message::FocusPasswordConfirmField => {
+                // Focus the password confirmation field (for Tab navigation)
+                use iced::widget::text_input;
+                text_input::focus(text_input::Id::new("password_confirm_field"))
+            }
+
             Message::WizardNextStep => {
                 // Move to next wizard step
                 if let Some(crate::gui::modal::Modal::GenerateWallet { step, .. }) = &mut self.active_modal {
                     *step = match step {
                         crate::gui::modal::GenerateWalletStep::EnterName =>
+                            crate::gui::modal::GenerateWalletStep::EnterPassword,
+                        crate::gui::modal::GenerateWalletStep::EnterPassword =>
                             crate::gui::modal::GenerateWalletStep::ReviewAndGenerate,
                         crate::gui::modal::GenerateWalletStep::ReviewAndGenerate =>
                             crate::gui::modal::GenerateWalletStep::DisplayMnemonic,
@@ -492,8 +548,10 @@ impl AmbientApp {
                     *step = match step {
                         crate::gui::modal::GenerateWalletStep::EnterName =>
                             crate::gui::modal::GenerateWalletStep::EnterName, // Stay at first
-                        crate::gui::modal::GenerateWalletStep::ReviewAndGenerate =>
+                        crate::gui::modal::GenerateWalletStep::EnterPassword =>
                             crate::gui::modal::GenerateWalletStep::EnterName,
+                        crate::gui::modal::GenerateWalletStep::ReviewAndGenerate =>
+                            crate::gui::modal::GenerateWalletStep::EnterPassword,
                         crate::gui::modal::GenerateWalletStep::DisplayMnemonic =>
                             crate::gui::modal::GenerateWalletStep::ReviewAndGenerate,
                         crate::gui::modal::GenerateWalletStep::VerifyMnemonic =>

@@ -9,6 +9,7 @@ pub mod wallet_node;
 pub mod cli;
 pub mod config;
 pub mod automation;
+pub mod encryption;
 
 // GUI module - only include if iced feature is enabled
 #[cfg(feature = "gui")]

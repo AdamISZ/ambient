@@ -3,6 +3,7 @@ use std::io::{self, Write};
 use std::fs;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use dialoguer::Password;
 
 use crate::manager::Manager;
 use crate::snicker::{ProposalOpportunity, EncryptedProposal};
@@ -108,10 +109,27 @@ pub async fn repl(
                     continue;
                 }
                 let name = args[0];
+
+                // Prompt for password
+                let password = Password::new()
+                    .with_prompt("Enter password to encrypt wallet")
+                    .interact()?;
+
+                let confirm_password = Password::new()
+                    .with_prompt("Confirm password")
+                    .interact()?;
+
+                if password != confirm_password {
+                    println!("❌ Passwords do not match. Wallet creation cancelled.");
+                    continue;
+                }
+
                 println!("🪄 Creating wallet '{name}' …");
                 let (mut manager, mnemonic) =
-                    Manager::generate(name, network_str, recovery_height).await?;
+                    Manager::generate(name, network_str, recovery_height, &password).await?;
                 println!("🔑 New mnemonic (store this safely!):\n{mnemonic}\n");
+                println!("⚠️  IMPORTANT: Backup the entire wallet directory!");
+                println!("   Location: ~/.local/share/ambient/{}/{}", network_str, name);
                 io::stdout().flush()?;
 
                 // Configure RPC if provided
@@ -131,18 +149,49 @@ pub async fn repl(
                     continue;
                 }
                 let name = args[0];
-                println!("📁 Loading wallet '{name}' …");
-                let mut manager = Manager::load(name, network_str, recovery_height).await?;
 
-                // Configure RPC if provided
-                if let Some((ref url, ref user, ref password)) = rpc_config {
-                    if let Err(e) = manager.set_rpc_client(url, (user.clone(), password.clone())) {
-                        println!("⚠️  Warning: Failed to connect to Bitcoin Core RPC: {}", e);
-                        println!("           Proposer mode disabled. Receiver mode still available.");
+                // Retry loop for password
+                loop {
+                    // Prompt for password
+                    let password = match Password::new()
+                        .with_prompt("Enter wallet password")
+                        .interact()
+                    {
+                        Ok(p) => p,
+                        Err(_) => {
+                            println!("❌ Password input cancelled");
+                            break;
+                        }
+                    };
+
+                    println!("📁 Loading wallet '{name}' …");
+                    match Manager::load(name, network_str, recovery_height, &password).await {
+                        Ok(mut manager) => {
+                            // Configure RPC if provided
+                            if let Some((ref url, ref user, ref password)) = rpc_config {
+                                if let Err(e) = manager.set_rpc_client(url, (user.clone(), password.clone())) {
+                                    println!("⚠️  Warning: Failed to connect to Bitcoin Core RPC: {}", e);
+                                    println!("           Proposer mode disabled. Receiver mode still available.");
+                                }
+                            }
+
+                            manager_arc = Some(Arc::new(RwLock::new(manager)));
+                            break; // Success, exit retry loop
+                        }
+                        Err(e) => {
+                            let err_msg = e.to_string();
+                            if err_msg.contains("Wrong password") || err_msg.contains("Encryption") {
+                                println!("❌ {}", err_msg);
+                                println!("   Please try again...\n");
+                                // Continue loop to retry
+                            } else {
+                                // Other errors (file not found, etc.) - don't retry
+                                println!("❌ Error loading wallet: {}", e);
+                                break;
+                            }
+                        }
                     }
                 }
-
-                manager_arc = Some(Arc::new(RwLock::new(manager)));
             }
 
             "balance" => {

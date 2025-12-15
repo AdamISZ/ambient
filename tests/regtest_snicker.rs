@@ -3,7 +3,6 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use once_cell::sync::Lazy;
-use tokio::time;
 
 mod common;
 use common::{BITCOIND, TestBitcoind};
@@ -35,18 +34,16 @@ async fn test_snicker_end_to_end() -> Result<()> {
     println!("└─────────────────────────────────┘\n");
 
     // Create Alice's wallet (receiver)
-    // Note: Use height 0 in regtest to avoid checkpoint hash mismatches
     println!("👤 Creating Alice's wallet (receiver)...");
     let temp_dir = std::env::temp_dir();
     let alice_name = format!("alice_{}", std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
 
-    let (mut alice_mgr, alice_mnemonic) =
-        Manager::generate(&alice_name, "regtest", 0).await?;
-    println!("   ✅ Alice's mnemonic: {}", alice_mnemonic);
+    let test_password = "test123"; // Test password for encrypted wallets
 
-    // Small delay to avoid peer connection race conditions
-    time::sleep(Duration::from_secs(2)).await;
+    let (mut alice_mgr, alice_mnemonic) =
+        Manager::generate(&alice_name, "regtest", current_height, test_password).await?;
+    println!("   ✅ Alice's mnemonic: {}", alice_mnemonic);
 
     // Create Bob's wallet (proposer)
     println!("\n👤 Creating Bob's wallet (proposer)...");
@@ -54,14 +51,14 @@ async fn test_snicker_end_to_end() -> Result<()> {
         .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
 
     let (mut bob_mgr, bob_mnemonic) =
-        Manager::generate(&bob_name, "regtest", 0).await?;
+        Manager::generate(&bob_name, "regtest", current_height, test_password).await?;
     println!("   ✅ Bob's mnemonic: {}", bob_mnemonic);
 
     // Wait for wallets to do initial sync to current height
-    println!("\n⏳ Waiting for wallets to sync from genesis to height {}...", current_height);
-    alice_mgr.wait_for_height(current_height, 60).await?;
+    println!("\n⏳ Waiting for wallets to do initial sync to height {}...", current_height);
+    alice_mgr.wait_for_height(current_height, 30).await?;
     println!("   ✅ Alice synced to height {}", current_height);
-    bob_mgr.wait_for_height(current_height, 60).await?;
+    bob_mgr.wait_for_height(current_height, 30).await?;
     println!("   ✅ Bob synced to height {}", current_height);
 
     // Get addresses for funding
@@ -132,9 +129,9 @@ async fn test_snicker_end_to_end() -> Result<()> {
 
     // Wait for both wallets to sync to new height
     println!("\n⏳ Waiting for wallets to sync to height {}...", new_height);
-    alice_mgr.wait_for_height(new_height, 60).await?;
+    alice_mgr.wait_for_height(new_height, 30).await?;
     println!("   ✅ Alice synced");
-    bob_mgr.wait_for_height(new_height, 60).await?;
+    bob_mgr.wait_for_height(new_height, 30).await?;
     println!("   ✅ Bob synced");
 
     // Check balances
@@ -303,9 +300,9 @@ async fn test_snicker_end_to_end() -> Result<()> {
 
     // Wait for sync
     println!("\n⏳ Waiting for wallets to sync to height {}...", final_height);
-    alice_mgr.wait_for_height(final_height, 60).await?;
+    alice_mgr.wait_for_height(final_height, 30).await?;
     println!("   ✅ Alice synced");
-    bob_mgr.wait_for_height(final_height, 60).await?;
+    bob_mgr.wait_for_height(final_height, 30).await?;
     println!("   ✅ Bob synced");
 
     let alice_wallet_balance = alice_mgr.get_balance().await?;
