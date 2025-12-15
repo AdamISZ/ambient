@@ -12,7 +12,7 @@ use tracing::info;
 
 use bdk_wallet::{
     PersistedWallet,
-    bitcoin::{Network, Address, Amount, FeeRate, Transaction, Txid, psbt::Psbt, hashes::Hash, BlockHash},
+    bitcoin::{Network, Address, Amount, FeeRate, Transaction, Txid, psbt::Psbt, hashes::Hash},
     keys::{
         bip39::{Language, Mnemonic, WordCount},
         DerivableKey, ExtendedKey, GeneratedKey, GeneratableKey,
@@ -114,10 +114,16 @@ pub struct WalletNode {
     pub(crate) rpc_client: Option<Arc<bdk_bitcoind_rpc::bitcoincore_rpc::Client>>,
     /// Wallet name (for locating correct headers.db)
     wallet_name: String,
-    /// Path to SNICKER database for checking pending UTXOs
+    /// Shared in-memory SNICKER database connection (uses std::sync::Mutex for sync access)
+    snicker_conn: Arc<std::sync::Mutex<Connection>>,
+    /// Path to SNICKER database for checking pending UTXOs (DEPRECATED - using in-memory)
     snicker_db_path: std::path::PathBuf,
     /// Broadcast channel for wallet update events
     update_tx: broadcast::Sender<WalletUpdate>,
+    /// Encrypted in-memory wallet database (for flush on shutdown)
+    wallet_db: crate::encryption::EncryptedMemoryDb,
+    /// Encrypted in-memory SNICKER database (for flush on UTXO changes)
+    snicker_db: crate::encryption::EncryptedMemoryDb,
 }
 
 impl WalletNode {
@@ -155,7 +161,7 @@ impl WalletNode {
         recovery_height: u32,
         password: &str,
     ) -> Result<(Self, Mnemonic)> {
-        let (wallet_dir, _, _, mnemonic_path) = Self::wallet_paths(name, network_str)?;
+        let (wallet_dir, wallet_db_enc_path, snicker_db_enc_path, mnemonic_path) = Self::wallet_paths(name, network_str)?;
         fs::create_dir_all(&wallet_dir)?;
 
         let gen: GeneratedKey<_, Tap> =
@@ -168,6 +174,26 @@ impl WalletNode {
         let encrypted = WalletEncryption::encrypt_file(mnemonic_plaintext.as_bytes(), password)?;
         fs::write(&mnemonic_path, encrypted)?;
         info!("🔑 Generated new mnemonic for wallet '{name}' (encrypted)");
+
+        // Create empty BDK wallet database and encrypt it
+        let temp_wallet_db = tempfile::NamedTempFile::new()?;
+        let temp_wallet_conn = rusqlite::Connection::open(temp_wallet_db.path())?;
+        // BDK will create its tables when we first load the wallet
+        drop(temp_wallet_conn);
+        let wallet_db_plaintext = fs::read(temp_wallet_db.path())?;
+        let wallet_db_encrypted = WalletEncryption::encrypt_file(&wallet_db_plaintext, password)?;
+        fs::write(&wallet_db_enc_path, wallet_db_encrypted)?;
+        info!("💾 Created encrypted wallet database");
+
+        // Create empty SNICKER database with schema and encrypt it
+        let temp_snicker_db = tempfile::NamedTempFile::new()?;
+        let mut temp_snicker_conn = rusqlite::Connection::open(temp_snicker_db.path())?;
+        crate::snicker::Snicker::init_snicker_db(&mut temp_snicker_conn)?;
+        drop(temp_snicker_conn);
+        let snicker_db_plaintext = fs::read(temp_snicker_db.path())?;
+        let snicker_db_encrypted = WalletEncryption::encrypt_file(&snicker_db_plaintext, password)?;
+        fs::write(&snicker_db_enc_path, snicker_db_encrypted)?;
+        info!("💾 Created encrypted SNICKER database");
 
         let node = Self::load(name, network_str, recovery_height, password).await?;
 
@@ -211,10 +237,17 @@ impl WalletNode {
             ));
         };
 
-        // TODO(v2): Decrypt wallet database to temp file
-        // For now, use unencrypted database paths (temp files)
-        let wallet_db_path = wallet_dir.join("wallet.sqlite");
-        let (wallet, conn) = Self::load_or_create_wallet(&mnemonic, network, &wallet_db_path)?;
+        // Load encrypted wallet database into memory
+        let (wallet_db, conn) = if wallet_db_enc_path.exists() {
+            crate::encryption::EncryptedMemoryDb::load(&wallet_db_enc_path, password)?
+        } else {
+            return Err(anyhow!(
+                "Encrypted wallet database not found for wallet '{name}' at {:?}",
+                wallet_db_enc_path
+            ));
+        };
+
+        let (wallet, conn) = Self::load_or_create_wallet(&mnemonic, network, conn)?;
 
         let (requester, update_subscriber) =
             Self::start_node(&wallet, network, recovery_height, name)?;
@@ -230,21 +263,19 @@ impl WalletNode {
         let conn = Arc::new(Mutex::new(conn));
         let update_subscriber = Arc::new(Mutex::new(update_subscriber));
 
-        // Construct path to SNICKER database (before spawning background task)
-        // TODO(v2): Use encrypted database paths and decrypt to temp files
-        let project_dirs = directories::ProjectDirs::from("org", "code", "ambient")
-            .ok_or_else(|| anyhow::anyhow!("Could not determine data directory"))?;
-        let snicker_db_path = project_dirs
-            .data_local_dir()
-            .join(network_str)
-            .join(name)
-            .join("snicker.sqlite"); // TODO: .enc and decrypt
+        // Load encrypted SNICKER database into memory
+        let (snicker_db, snicker_conn_raw) = if snicker_db_enc_path.exists() {
+            crate::encryption::EncryptedMemoryDb::load(&snicker_db_enc_path, password)?
+        } else {
+            return Err(anyhow!(
+                "Encrypted SNICKER database not found for wallet '{name}' at {:?}",
+                snicker_db_enc_path
+            ));
+        };
+        let snicker_conn = Arc::new(std::sync::Mutex::new(snicker_conn_raw));
 
-        let wallet_db_path_for_bg = project_dirs
-            .data_local_dir()
-            .join(network_str)
-            .join(name)
-            .join("wallet.sqlite"); // TODO: .enc and decrypt
+        // Keep path for compatibility (DEPRECATED - now using in-memory)
+        let snicker_db_path = snicker_db_enc_path.clone();
 
         // Derive descriptors for SNICKER UTXO detection
         let coin_type = if network == Network::Bitcoin { 0 } else { 1 };
@@ -259,8 +290,8 @@ impl WalletNode {
         let wallet_clone = wallet.clone();
         let conn_clone = conn.clone();
         let sub_clone = update_subscriber.clone();
-        let snicker_db_clone = snicker_db_path.clone();
-        let wallet_db_clone = wallet_db_path_for_bg.clone();
+        let snicker_conn_clone = snicker_conn.clone();
+        let snicker_db_clone = snicker_db.clone();
         let requester_clone = requester.clone();
         let wallet_name_clone = name.to_string();
         let network_clone = network;
@@ -272,8 +303,8 @@ impl WalletNode {
                 wallet_clone,
                 conn_clone,
                 sub_clone,
+                snicker_conn_clone,
                 snicker_db_clone,
-                wallet_db_clone,
                 requester_clone,
                 wallet_name_clone,
                 network_clone,
@@ -295,8 +326,11 @@ impl WalletNode {
             xprv,
             rpc_client: None,
             wallet_name: name.to_string(),
+            snicker_conn,
             snicker_db_path,
             update_tx,
+            wallet_db,
+            snicker_db,
         })
     }
 
@@ -365,7 +399,7 @@ impl WalletNode {
     fn load_or_create_wallet(
         mnemonic: &Mnemonic,
         network: Network,
-        db_path: &Path,
+        mut conn: Connection,
     ) -> Result<(PersistedWallet<Connection>, Connection)> {
         let xkey: ExtendedKey = mnemonic.clone().into_extended_key()?;
         let xprv = xkey
@@ -382,8 +416,7 @@ impl WalletNode {
 
         tracing::debug!("Descriptor contains private key: {}", external_desc.contains("prv"));
 
-        let mut conn = Connection::open(db_path)?;
-        info!("💾 Wallet database path: {:?}", db_path);
+        info!("💾 Wallet database: in-memory (encrypted)");
 
         // Check if wallet already exists by trying to load it
         // CRITICAL: When loading from DB, we must call .descriptor().extract_keys() to restore signers
@@ -582,8 +615,8 @@ impl WalletNode {
         wallet: Arc<Mutex<PersistedWallet<Connection>>>,
         conn: Arc<Mutex<Connection>>,
         update_subscriber: Arc<Mutex<bdk_kyoto::UpdateSubscriber>>,
-        snicker_db_path: std::path::PathBuf,
-        wallet_db_path: std::path::PathBuf,
+        snicker_conn: Arc<std::sync::Mutex<Connection>>,
+        snicker_db: crate::encryption::EncryptedMemoryDb,
         requester: bdk_kyoto::Requester,
         wallet_name: String,
         network: Network,
@@ -598,11 +631,11 @@ impl WalletNode {
 
             match update_result {
                 Ok(update) => {
-                    let mut wallet = wallet.lock().await;
-                    let mut conn = conn.lock().await;
+                    let mut wallet_guard = wallet.lock().await;
+                    let mut conn_guard = conn.lock().await;
 
                     info!("📦 Auto-sync: received update");
-                    if let Err(e) = wallet.apply_update(update) {
+                    if let Err(e) = wallet_guard.apply_update(update) {
                         tracing::error!("Failed to apply update: {e}");
                         continue;
                     }
@@ -611,7 +644,7 @@ impl WalletNode {
                     // This ensures newly discovered UTXOs can be signed
                     let mut max_external = 0u32;
                     let mut max_internal = 0u32;
-                    for utxo in wallet.list_unspent() {
+                    for utxo in wallet_guard.list_unspent() {
                         match utxo.keychain {
                             KeychainKind::External => max_external = max_external.max(utxo.derivation_index),
                             KeychainKind::Internal => max_internal = max_internal.max(utxo.derivation_index),
@@ -624,28 +657,30 @@ impl WalletNode {
                         // This allows the light client to scan for these addresses while keeping
                         // the next user-facing address at the first unused one
                         for index in 0..=(max_external + RECOVERY_LOOKAHEAD) {
-                            let _ = wallet.peek_address(KeychainKind::External, index);
+                            let _ = wallet_guard.peek_address(KeychainKind::External, index);
                         }
                         for index in 0..=(max_internal + RECOVERY_LOOKAHEAD) {
-                            let _ = wallet.peek_address(KeychainKind::Internal, index);
+                            let _ = wallet_guard.peek_address(KeychainKind::Internal, index);
                         }
                     }
 
-                    if let Err(e) = wallet.persist(&mut conn) {
+                    if let Err(e) = wallet_guard.persist(&mut conn_guard) {
                         tracing::error!("Failed to persist wallet: {e}");
                     }
 
-                    let height = wallet.local_chain().tip().height();
-                    let regular_balance = wallet.balance().total().to_sat();
+                    let height = wallet_guard.local_chain().tip().height();
+                    let regular_balance = wallet_guard.balance().total().to_sat();
                     info!("✅ Auto-sync: updated to height {height}");
 
                     // Release wallet lock before checking SNICKER UTXOs
-                    drop(wallet);
-                    drop(conn);
+                    drop(wallet_guard);
+                    drop(conn_guard);
 
                     // Check for pending SNICKER UTXOs and insert them if confirmed
                     if let Err(e) = Self::check_pending_snicker_utxos(
-                        &snicker_db_path,
+                        snicker_conn.clone(),
+                        Some(&snicker_db),
+                        conn.clone(),
                         &requester,
                         &wallet_name,
                         network,
@@ -659,8 +694,9 @@ impl WalletNode {
 
                     // Check for spent SNICKER UTXOs and mark them as spent
                     if let Err(e) = Self::check_spent_snicker_utxos(
-                        &snicker_db_path,
-                        &wallet_db_path,
+                        snicker_conn.clone(),
+                        Some(&snicker_db),
+                        conn.clone(),
                     )
                     .await
                     {
@@ -669,21 +705,15 @@ impl WalletNode {
 
                     // Calculate total balance and broadcast update event
 
-                    // Get SNICKER balance directly from database
-                    use bdk_wallet::rusqlite::Connection;
-                    let snicker_balance = match Connection::open(&snicker_db_path) {
-                        Ok(conn) => {
-                            let balance: Option<i64> = conn.query_row(
-                                "SELECT SUM(amount) FROM snicker_utxos WHERE block_height IS NOT NULL AND spent = 0",
-                                [],
-                                |row| row.get(0),
-                            ).unwrap_or(None);
-                            balance.unwrap_or(0) as u64
-                        }
-                        Err(e) => {
-                            tracing::error!("Failed to open SNICKER database: {e}");
-                            0
-                        }
+                    // Get SNICKER balance directly from in-memory database
+                    let snicker_balance = {
+                        let snicker_conn_guard = snicker_conn.lock().unwrap();
+                        let balance: Option<i64> = snicker_conn_guard.query_row(
+                            "SELECT SUM(amount) FROM snicker_utxos WHERE block_height IS NOT NULL AND spent = 0",
+                            [],
+                            |row| row.get(0),
+                        ).unwrap_or(None);
+                        balance.unwrap_or(0) as u64
                     };
 
                     let total_balance = regular_balance + snicker_balance;
@@ -1061,7 +1091,6 @@ impl WalletNode {
         };
         use bdk_wallet::bitcoin::secp256k1::{Secp256k1, SecretKey, Message};
         use bdk_wallet::bitcoin::sighash::{SighashCache, TapSighashType, Prevouts};
-        use bdk_wallet::rusqlite::Connection;
         use std::str::FromStr;
 
         // Parse address
@@ -1070,7 +1099,7 @@ impl WalletNode {
 
         // Get available SNICKER UTXOs
         let snicker_utxos: Vec<(String, u32, u64, Vec<u8>, Vec<u8>)> = {
-            let conn = Connection::open(&self.snicker_db_path)?;
+            let conn = self.snicker_conn.lock().unwrap();
             let mut stmt = conn.prepare(
                 "SELECT txid, vout, amount, script_pubkey, tweaked_privkey FROM snicker_utxos WHERE block_height IS NOT NULL AND spent = 0"
             )?;
@@ -1262,7 +1291,6 @@ impl WalletNode {
         };
         use bdk_wallet::bitcoin::secp256k1::{Secp256k1, SecretKey, Message};
         use bdk_wallet::bitcoin::sighash::{SighashCache, TapSighashType, Prevouts};
-        use bdk_wallet::rusqlite::Connection;
         use std::str::FromStr;
 
         // Parse address
@@ -1271,7 +1299,7 @@ impl WalletNode {
 
         // Get available SNICKER UTXOs
         let snicker_utxos: Vec<(String, u32, u64, Vec<u8>, Vec<u8>)> = {
-            let conn = Connection::open(&self.snicker_db_path)?;
+            let conn = self.snicker_conn.lock().unwrap();
             let mut stmt = conn.prepare(
                 "SELECT txid, vout, amount, script_pubkey, tweaked_privkey FROM snicker_utxos WHERE block_height IS NOT NULL AND spent = 0"
             )?;
@@ -1457,13 +1485,17 @@ impl WalletNode {
 
         // Mark SNICKER UTXOs as spent in SNICKER database
         {
-            let conn = Connection::open(&self.snicker_db_path)?;
+            let conn = self.snicker_conn.lock().unwrap();
             for (txid_str, vout, _, _, _) in &selected_utxos {
                 conn.execute(
                     "UPDATE snicker_utxos SET spent = 1 WHERE txid = ? AND vout = ?",
                     (txid_str, vout),
                 )?;
             }
+            drop(conn);
+
+            // Flush to encrypted file after UTXO change
+            self.snicker_db.flush(&*self.snicker_conn.lock().unwrap())?;
         }
 
         // Broadcast
@@ -1541,9 +1573,7 @@ impl WalletNode {
 
     /// Get SNICKER balance in satoshis (helper for coin selection)
     async fn get_snicker_balance_sats(&self) -> Result<u64> {
-        use bdk_wallet::rusqlite::Connection;
-
-        let conn = Connection::open(&self.snicker_db_path)?;
+        let conn = self.snicker_conn.lock().unwrap();
         let balance: Option<i64> = conn.query_row(
             "SELECT SUM(amount) FROM snicker_utxos WHERE block_height IS NOT NULL AND spent = 0",
             [],
@@ -1654,14 +1684,13 @@ impl WalletNode {
     /// Get all SNICKER UTXOs with their tweaked private keys (for decryption)
     /// Returns Vec of (outpoint, amount, tweaked_privkey)
     pub async fn get_snicker_utxos_with_keys(&self) -> Result<Vec<(bdk_wallet::bitcoin::OutPoint, u64, bdk_wallet::bitcoin::secp256k1::SecretKey)>> {
-        use bdk_wallet::rusqlite::Connection;
         use bdk_wallet::bitcoin::OutPoint;
         use bdk_wallet::bitcoin::secp256k1::SecretKey;
         use std::str::FromStr;
 
         let mut result = Vec::new();
 
-        let conn = Connection::open(&self.snicker_db_path)?;
+        let conn = self.snicker_conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT txid, vout, amount, tweaked_privkey FROM snicker_utxos WHERE block_height IS NOT NULL AND spent = 0"
         )?;
@@ -1699,10 +1728,7 @@ impl WalletNode {
         let snicker_utxos = self.get_snicker_utxos_with_keys().await?;
         for (outpoint, amount, tweaked_privkey) in snicker_utxos {
             // Get script_pubkey from database
-            use bdk_wallet::rusqlite::Connection;
-            use std::str::FromStr;
-
-            let conn = Connection::open(&self.snicker_db_path)?;
+            let conn = self.snicker_conn.lock().unwrap();
             let script_bytes: Vec<u8> = conn.query_row(
                 "SELECT script_pubkey FROM snicker_utxos WHERE txid = ? AND vout = ?",
                 [outpoint.txid.to_string(), outpoint.vout.to_string()],
@@ -1734,6 +1760,22 @@ impl WalletNode {
         }
 
         Ok(out)
+    }
+
+    // ============================================================
+    // SNICKER DATABASE ACCESS (for Manager to share with Snicker)
+    // ============================================================
+
+    /// Get shared SNICKER database connection (for Snicker initialization)
+    pub fn get_snicker_conn(&self) -> Arc<std::sync::Mutex<Connection>> {
+        self.snicker_conn.clone()
+    }
+
+    /// Get SNICKER database manager (for Snicker initialization)
+    pub fn get_snicker_db_manager(&self) -> crate::encryption::EncryptedMemoryDb {
+        // Clone the manager so Snicker can flush independently
+        // This is safe because both will flush to the same encrypted file
+        self.snicker_db.clone()
     }
 
     // ============================================================
@@ -1790,7 +1832,6 @@ impl WalletNode {
         end_height: u32,
     ) -> Result<Vec<(u32, bdk_wallet::bitcoin::BlockHash)>> {
         use bdk_wallet::bitcoin::BlockHash;
-        use bdk_wallet::rusqlite::Connection;
         use std::str::FromStr;
 
         // Construct path to wallet database (headers are stored in bdk_blocks table)
@@ -1925,19 +1966,20 @@ impl WalletNode {
 
     /// Check for pending SNICKER UTXOs and insert confirmed ones into the wallet (static helper)
     async fn check_pending_snicker_utxos(
-        snicker_db_path: &std::path::Path,
+        snicker_conn: Arc<std::sync::Mutex<Connection>>,
+        snicker_db: Option<&crate::encryption::EncryptedMemoryDb>,
+        wallet_conn: Arc<Mutex<Connection>>,
         requester: &bdk_kyoto::Requester,
         wallet_name: &str,
         network: Network,
         external_descriptor: &str,
         internal_descriptor: &str,
     ) -> Result<()> {
-        use bdk_wallet::rusqlite::Connection;
         use std::str::FromStr;
 
-        // Open SNICKER database and query for pending UTXOs (all synchronous, before any async)
+        // Query SNICKER database for pending UTXOs
         let pending: Vec<(String, u32)> = {
-            let conn = Connection::open(snicker_db_path)?;
+            let conn = snicker_conn.lock().unwrap();
             let mut stmt = conn.prepare(
                 "SELECT txid, vout FROM snicker_utxos WHERE block_height IS NULL AND spent = 0"
             )?;
@@ -1955,51 +1997,33 @@ impl WalletNode {
 
         tracing::debug!("🔍 Checking {} pending SNICKER UTXOs", pending.len());
 
-        // Get wallet database path
-        let project_dirs = directories::ProjectDirs::from("org", "code", "ambient")
-            .ok_or_else(|| anyhow::anyhow!("Could not determine data directory"))?;
-        let network_str = match network {
-            Network::Bitcoin => "mainnet",
-            Network::Testnet => "testnet",
-            Network::Signet => "signet",
-            Network::Regtest => "regtest",
-            _ => return Err(anyhow::anyhow!("Unsupported network")),
-        };
-        let wallet_db_path = project_dirs
-            .data_local_dir()
-            .join(network_str)
-            .join(wallet_name)
-            .join("wallet.sqlite");
+        // Query in-memory wallet database for tip height and block hashes
+        let (tip_height, block_hashes) = {
+            let wallet_conn_guard = wallet_conn.lock().await;
 
-        // Open wallet database to get tip height and block hashes
-        let wallet_conn_read = Connection::open_with_flags(
-            &wallet_db_path,
-            bdk_wallet::rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )?;
-
-        let tip_height: u32 = wallet_conn_read.query_row(
-            "SELECT MAX(block_height) FROM bdk_blocks",
-            [],
-            |row| row.get(0),
-        )?;
-
-        // Scan recent blocks (last 10) for pending transactions
-        let start_height = tip_height.saturating_sub(10);
-
-        let block_hashes: Vec<(u32, String)> = {
-            let mut stmt = wallet_conn_read.prepare(
-                "SELECT block_height, block_hash FROM bdk_blocks WHERE block_height >= ? AND block_height <= ? ORDER BY block_height"
+            let tip_height: u32 = wallet_conn_guard.query_row(
+                "SELECT MAX(block_height) FROM bdk_blocks",
+                [],
+                |row| row.get(0),
             )?;
-            let mut rows = stmt.query([start_height, tip_height])?;
-            let mut result = Vec::new();
-            while let Some(row) = rows.next()? {
-                result.push((row.get(0)?, row.get(1)?));
-            }
-            result
-        };
 
-        // Close read connection before async operations
-        drop(wallet_conn_read);
+            // Scan recent blocks (last 10) for pending transactions
+            let start_height = tip_height.saturating_sub(10);
+
+            let block_hashes: Vec<(u32, String)> = {
+                let mut stmt = wallet_conn_guard.prepare(
+                    "SELECT block_height, block_hash FROM bdk_blocks WHERE block_height >= ? AND block_height <= ? ORDER BY block_height"
+                )?;
+                let mut rows = stmt.query([start_height, tip_height])?;
+                let mut result = Vec::new();
+                while let Some(row) = rows.next()? {
+                    result.push((row.get(0)?, row.get(1)?));
+                }
+                result
+            };
+
+            (tip_height, block_hashes)
+        };
 
         for (height, block_hash_hex) in block_hashes {
             // Parse block hash
@@ -2020,9 +2044,9 @@ impl WalletNode {
                         use bdk_wallet::chain::{BlockId, ConfirmationBlockTime};
                         use std::sync::Arc;
 
-                        // Open wallet database for writing (scoped to avoid holding across awaits)
+                        // Update in-memory wallet database (scoped to avoid holding lock across awaits)
                         {
-                            let mut wallet_write_conn = Connection::open(&wallet_db_path)?;
+                            let mut wallet_write_conn = wallet_conn.lock().await;
 
                             // Create TxUpdate with the transaction
                             let mut tx_update = bdk_wallet::chain::TxUpdate::default();
@@ -2048,7 +2072,7 @@ impl WalletNode {
                                 .descriptor(bdk_wallet::KeychainKind::Internal, Some(internal_desc_static))
                                 .extract_keys()
                                 .check_network(network)
-                                .load_wallet(&mut wallet_write_conn)?
+                                .load_wallet(&mut *wallet_write_conn)?
                                 .ok_or_else(|| anyhow::anyhow!("Wallet not found"))?;
 
                             let update = bdk_wallet::Update {
@@ -2057,19 +2081,16 @@ impl WalletNode {
                                 last_active_indices: Default::default(),
                             };
                             wallet.apply_update(update)?;
-                            wallet.persist(&mut wallet_write_conn)?;
-                            drop(wallet);
-                            drop(wallet_write_conn);
+                            wallet.persist(&mut *wallet_write_conn)?;
                         }
 
                         // Update block_height in SNICKER database (scoped)
                         {
-                            let snicker_update_conn = Connection::open(snicker_db_path)?;
+                            let snicker_update_conn = snicker_conn.lock().unwrap();
                             snicker_update_conn.execute(
                                 "UPDATE snicker_utxos SET block_height = ? WHERE txid = ?",
                                 (height, &txid_str),
                             )?;
-                            drop(snicker_update_conn);
                         }
 
                         info!("✅ SNICKER UTXO confirmed and inserted into wallet: {} at height {}", txid, height);
@@ -2078,19 +2099,23 @@ impl WalletNode {
             }
         }
 
+        // Flush to encrypted file after any UTXO changes
+        if let Some(db) = snicker_db {
+            db.flush(&*snicker_conn.lock().unwrap())?;
+        }
+
         Ok(())
     }
 
     /// Check for spent SNICKER UTXOs and mark them as spent (static helper)
     async fn check_spent_snicker_utxos(
-        snicker_db_path: &std::path::Path,
-        wallet_db_path: &std::path::Path,
+        snicker_conn: Arc<std::sync::Mutex<Connection>>,
+        snicker_db: Option<&crate::encryption::EncryptedMemoryDb>,
+        wallet_conn: Arc<Mutex<Connection>>,
     ) -> Result<()> {
-        use bdk_wallet::rusqlite::Connection;
-
         // Get all unspent SNICKER UTXOs from database
         let unspent: Vec<(String, u32)> = {
-            let conn = Connection::open(snicker_db_path)?;
+            let conn = snicker_conn.lock().unwrap();
             let mut stmt = conn.prepare(
                 "SELECT txid, vout FROM snicker_utxos WHERE block_height IS NOT NULL AND spent = 0"
             )?;
@@ -2108,16 +2133,13 @@ impl WalletNode {
 
         tracing::debug!("🔍 Checking {} unspent SNICKER UTXOs for spending", unspent.len());
 
-        // Open wallet database to check for spending transactions
-        let wallet_conn = Connection::open_with_flags(
-            wallet_db_path,
-            bdk_wallet::rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )?;
+        // Query in-memory wallet database to check for spending transactions
+        let wallet_conn_guard = wallet_conn.lock().await;
 
         // Check each UTXO to see if it's been spent by scanning wallet transactions
         for (txid_str, vout) in unspent {
             // Query wallet database for any transaction that spends this outpoint
-            let spending_txid: Result<String, _> = wallet_conn.query_row(
+            let spending_txid: Result<String, _> = wallet_conn_guard.query_row(
                 "SELECT DISTINCT tx.txid FROM bdk_tx tx
                  INNER JOIN bdk_txin txin ON tx.id = txin.tx_id
                  WHERE txin.prev_tx = ?1 AND txin.prev_vout = ?2",
@@ -2129,16 +2151,23 @@ impl WalletNode {
                 tracing::info!("🔍 SNICKER UTXO {}:{} has been spent in {}", txid_str, vout, spending_txid_str);
 
                 // Mark as spent in SNICKER database
-                let snicker_conn = Connection::open(snicker_db_path)?;
-                snicker_conn.execute(
+                let snicker_update_conn = snicker_conn.lock().unwrap();
+                snicker_update_conn.execute(
                     "UPDATE snicker_utxos SET spent = 1, spent_in_txid = ? WHERE txid = ? AND vout = ?",
                     (spending_txid_str, &txid_str, vout),
                 )?;
+                drop(snicker_update_conn);
                 tracing::info!("✅ Marked SNICKER UTXO {}:{} as spent", txid_str, vout);
             }
         }
 
-        drop(wallet_conn);
+        drop(wallet_conn_guard);
+
+        // Flush to encrypted file after any UTXO changes
+        if let Some(db) = snicker_db {
+            db.flush(&*snicker_conn.lock().unwrap())?;
+        }
+
         Ok(())
     }
 
@@ -2149,16 +2178,19 @@ impl WalletNode {
         vout: u32,
         spent_in_txid: &str,
     ) -> Result<()> {
-        use bdk_wallet::rusqlite::Connection;
-
-        let conn = Connection::open(&self.snicker_db_path)?;
+        let conn = self.snicker_conn.lock().unwrap();
 
         conn.execute(
             "UPDATE snicker_utxos SET spent = 1, spent_in_txid = ? WHERE txid = ? AND vout = ?",
             (spent_in_txid, txid, vout),
         )?;
+        drop(conn);
 
         tracing::info!("✅ Marked SNICKER UTXO {}:{} as spent in {}", txid, vout, spent_in_txid);
+
+        // Flush to encrypted file after UTXO change
+        self.snicker_db.flush(&*self.snicker_conn.lock().unwrap())?;
+
         Ok(())
     }
 
@@ -2303,6 +2335,40 @@ impl WalletNode {
             WalletUtxo::Snicker { tweaked_privkey, .. } => {
                 // Return the stored tweaked privkey directly for SNICKER UTXOs
                 Ok(*tweaked_privkey)
+            }
+        }
+    }
+}
+
+/// Implement Drop to flush encrypted database on shutdown
+impl Drop for WalletNode {
+    fn drop(&mut self) {
+        // Flush wallet.sqlite to encrypted file
+        // Use try_lock() since Drop can be called from async context
+        match self.conn.try_lock() {
+            Ok(conn_guard) => {
+                if let Err(e) = self.wallet_db.flush(&*conn_guard) {
+                    eprintln!("⚠️  Failed to flush wallet database on shutdown: {}", e);
+                } else {
+                    tracing::info!("💾 Flushed wallet.sqlite.enc on shutdown");
+                }
+            }
+            Err(_) => {
+                eprintln!("⚠️  Could not acquire wallet DB lock for flush on shutdown - data may not be saved");
+            }
+        }
+
+        // Flush snicker.sqlite to encrypted file
+        match self.snicker_conn.lock() {
+            Ok(snicker_conn_guard) => {
+                if let Err(e) = self.snicker_db.flush(&*snicker_conn_guard) {
+                    eprintln!("⚠️  Failed to flush SNICKER database on shutdown: {}", e);
+                } else {
+                    tracing::info!("💾 Flushed snicker.sqlite.enc on shutdown");
+                }
+            }
+            Err(e) => {
+                eprintln!("⚠️  Could not acquire SNICKER DB lock for flush on shutdown: {} - data may not be saved", e);
             }
         }
     }

@@ -58,8 +58,10 @@ impl Manager {
         // Load wallet and start node
         let wallet_node = WalletNode::load(wallet_name, network_str, recovery_height, password).await?;
 
-        // Initialize SNICKER with its own database
-        let snicker = Self::init_snicker(wallet_name, network_str, wallet_node.network)?;
+        // Initialize SNICKER with shared in-memory database
+        let snicker_conn = wallet_node.get_snicker_conn();
+        let snicker_db = wallet_node.get_snicker_db_manager();
+        let snicker = crate::snicker::Snicker::new(snicker_conn, Some(snicker_db), wallet_node.network)?;
 
         Ok(Self {
             wallet_node,
@@ -83,35 +85,15 @@ impl Manager {
         // Generate new wallet
         let (wallet_node, mnemonic) = WalletNode::generate(wallet_name, network_str, recovery_height, password).await?;
 
-        // Initialize SNICKER
-        let snicker = Self::init_snicker(wallet_name, network_str, wallet_node.network)?;
+        // Initialize SNICKER with shared in-memory database
+        let snicker_conn = wallet_node.get_snicker_conn();
+        let snicker_db = wallet_node.get_snicker_db_manager();
+        let snicker = crate::snicker::Snicker::new(snicker_conn, Some(snicker_db), wallet_node.network)?;
 
         Ok((Self {
             wallet_node,
             snicker,
         }, mnemonic))
-    }
-
-    /// Initialize SNICKER database for a given wallet
-    fn init_snicker(
-        wallet_name: &str,
-        network_str: &str,
-        network: bdk_wallet::bitcoin::Network,
-    ) -> Result<Snicker> {
-        use directories::ProjectDirs;
-
-        let project_dirs = ProjectDirs::from("org", "code", "ambient")
-            .ok_or_else(|| anyhow::anyhow!("Cannot determine project dir"))?;
-
-        let snicker_db_path = project_dirs
-            .data_local_dir()
-            .join(network_str)
-            .join(wallet_name)
-            .join("snicker.sqlite");
-
-        std::fs::create_dir_all(snicker_db_path.parent().unwrap())?;
-
-        Snicker::new(&snicker_db_path, network)
     }
 
     // ============================================================

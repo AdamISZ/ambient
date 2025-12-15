@@ -14,6 +14,7 @@ bdk_wallet = { version = "2.2.0", features = ["rusqlite", "keys-bip39"] }
 bdk_bitcoind_rpc = "0.15"
 tokio = { version = "1", features = ["full"], default-features = false }
 tracing = { version = "0.1" }
+rusqlite = { version = "0.31", features = ["backup"] }
 
 # Encryption
 chacha20poly1305 = "0.10"

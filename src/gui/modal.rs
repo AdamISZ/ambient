@@ -43,6 +43,7 @@ pub enum GenerateWalletStep {
     EnterName,
     EnterPassword,
     ReviewAndGenerate,
+    Generating,
     DisplayMnemonic,
     VerifyMnemonic,
     Complete,

@@ -23,7 +23,7 @@ use tempfile::TempDir;
 fn create_test_snicker() -> Snicker {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("test_snicker.db");
-    Snicker::new(&db_path, bdk_wallet::bitcoin::Network::Regtest).unwrap()
+    Snicker::new_from_path(&db_path, bdk_wallet::bitcoin::Network::Regtest).unwrap()
 }
 
 fn create_mock_local_output(
@@ -2151,7 +2151,7 @@ async fn test_db_concurrent_access() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("concurrent_test.db");
     let snicker = Arc::new(
-        Snicker::new(&db_path, bdk_wallet::bitcoin::Network::Regtest).unwrap()
+        Snicker::new_from_path(&db_path, bdk_wallet::bitcoin::Network::Regtest).unwrap()
     );
 
     // Spawn multiple tasks that access the database concurrently
@@ -2199,7 +2199,7 @@ async fn test_db_concurrent_access() {
 async fn test_db_corrupt_candidate() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("corrupt_test.db");
-    let snicker = Snicker::new(&db_path, bdk_wallet::bitcoin::Network::Regtest).unwrap();
+    let snicker = Snicker::new_from_path(&db_path, bdk_wallet::bitcoin::Network::Regtest).unwrap();
 
     // Manually insert corrupted data directly into the database
     {

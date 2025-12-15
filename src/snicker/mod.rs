@@ -139,31 +139,48 @@ pub struct SnickerUtxo {
 /// Independent of wallet operations - data is passed in as parameters.
 pub struct Snicker {
     conn: Arc<Mutex<Connection>>,
+    db_manager: Option<crate::encryption::EncryptedMemoryDb>,
     network: Network,
 }
 
 impl Snicker {
-    /// Create a new SNICKER instance
+    /// Create a new SNICKER instance with in-memory encrypted database
     ///
     /// # Arguments
-    /// * `db_path` - Path to the SNICKER database file
+    /// * `conn` - Shared in-memory database connection
+    /// * `db_manager` - Optional encrypted database manager for flushing changes
     /// * `network` - Bitcoin network (mainnet, testnet, signet, regtest)
-    pub fn new(db_path: &std::path::Path, network: Network) -> Result<Self> {
-        let conn = Connection::open(db_path)?;
-        let conn = Arc::new(Mutex::new(conn));
-
-        // Initialize database tables
-        let mut conn_guard = conn.lock().unwrap();
-        Self::init_candidates_table(&mut conn_guard)?;
-        Self::init_decrypted_proposals_table(&mut conn_guard)?;
-        Self::init_snicker_utxos_table(&mut conn_guard)?;
-        Self::init_automation_log_table(&mut conn_guard)?;
-        drop(conn_guard);
-
+    pub fn new(
+        conn: Arc<Mutex<Connection>>,
+        db_manager: Option<crate::encryption::EncryptedMemoryDb>,
+        network: Network,
+    ) -> Result<Self> {
         Ok(Self {
             conn,
+            db_manager,
             network,
         })
+    }
+
+    /// Test-only constructor that creates a connection from a path
+    #[cfg(test)]
+    pub fn new_from_path(db_path: &std::path::Path, network: Network) -> Result<Self> {
+        let mut conn_raw = rusqlite::Connection::open(db_path)?;
+        Self::init_snicker_db(&mut conn_raw)?;
+        let conn = Arc::new(Mutex::new(conn_raw));
+        Self::new(conn, None, network)
+    }
+
+    /// Flush in-memory database to encrypted file
+    ///
+    /// Called after any modification to SNICKER UTXO set
+    fn flush_db(&self) -> Result<()> {
+        if let Some(ref db_manager) = self.db_manager {
+            let conn_guard = self.conn.lock().unwrap();
+            db_manager.flush(&*conn_guard)?;
+            tracing::debug!("💾 Flushed snicker.sqlite.enc after UTXO change");
+        }
+        Ok(())
     }
 
     // ============================================================
@@ -801,6 +818,15 @@ impl Snicker {
     // DATABASE OPERATIONS
     // ============================================================
 
+    /// Initialize all SNICKER database tables (public for wallet generation)
+    pub fn init_snicker_db(conn: &mut Connection) -> Result<()> {
+        Self::init_candidates_table(conn)?;
+        Self::init_decrypted_proposals_table(conn)?;
+        Self::init_snicker_utxos_table(conn)?;
+        Self::init_automation_log_table(conn)?;
+        Ok(())
+    }
+
     /// Initialize the candidates database table
     fn init_candidates_table(conn: &mut Connection) -> Result<()> {
         conn.execute(
@@ -1294,8 +1320,13 @@ impl Snicker {
                 block_height,
             ),
         )?;
+        drop(conn);
 
         tracing::info!("💾 Stored SNICKER UTXO: {}:{} ({} sats)", txid, vout, amount);
+
+        // Flush to encrypted file after UTXO change
+        self.flush_db()?;
+
         Ok(())
     }
 
@@ -1591,7 +1622,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        Snicker::new(&db_path, Network::Regtest).unwrap()
+        Snicker::new_from_path(&db_path, Network::Regtest).unwrap()
     }
 
     fn create_test_transaction() -> Transaction {

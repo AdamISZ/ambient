@@ -19,6 +19,7 @@ pub fn view(step: &GenerateWalletStep, data: &GenerateWalletData) -> Element<'st
         GenerateWalletStep::EnterName => view_enter_name(&wallet_name, &network),
         GenerateWalletStep::EnterPassword => view_enter_password(&password, &password_confirm),
         GenerateWalletStep::ReviewAndGenerate => view_review_and_generate(&wallet_name, &network),
+        GenerateWalletStep::Generating => view_generating(&wallet_name),
         GenerateWalletStep::DisplayMnemonic => view_display_mnemonic(&wallet_name, mnemonic.as_deref()),
         GenerateWalletStep::VerifyMnemonic => view_verify_mnemonic(),
         GenerateWalletStep::Complete => view_complete(),
@@ -174,6 +175,34 @@ fn view_review_and_generate(wallet_name: &str, network: &str) -> Element<'static
                 .padding(10),
         ]
         .spacing(10)
+    ]
+    .spacing(20)
+    .padding(30)
+    .into()
+}
+
+/// Step 3.5: Generating wallet (loading state)
+fn view_generating(wallet_name: &str) -> Element<'static, Message> {
+    let wallet_name = wallet_name.to_string();
+
+    column![
+        text("Create New Wallet").size(32),
+        text("Generating Wallet...").size(20),
+
+        column![
+            text("🔐 Encrypting wallet files").size(16),
+            text(format!("Wallet: {}", wallet_name)).size(14),
+        ].spacing(5),
+
+        container(
+            column![
+                text("Please wait...").size(16),
+                text("• Deriving encryption key (this takes a few seconds for security)").size(14),
+                text("• Creating wallet database").size(14),
+                text("• Generating recovery seed").size(14),
+            ].spacing(5)
+        )
+        .padding(15),
     ]
     .spacing(20)
     .padding(30)

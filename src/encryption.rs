@@ -38,6 +38,7 @@ use chacha20poly1305::{
     ChaCha20Poly1305, Nonce,
 };
 use rand::RngCore;
+use rusqlite;
 
 /// Current encryption format version
 const VERSION: u8 = 0x01;
@@ -226,6 +227,95 @@ impl WalletEncryption {
 impl Default for WalletEncryption {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// In-memory encrypted SQLite database manager
+///
+/// Stores path and password for flushing in-memory databases back to encrypted files.
+/// The Connection itself is owned by the caller.
+#[derive(Clone)]
+pub struct EncryptedMemoryDb {
+    /// Path to encrypted .enc file
+    encrypted_path: std::path::PathBuf,
+    /// Password for encryption/decryption
+    password: String,
+}
+
+impl EncryptedMemoryDb {
+    /// Load an encrypted database into memory
+    ///
+    /// # Arguments
+    /// * `encrypted_path` - Path to .enc file
+    /// * `password` - Decryption password
+    ///
+    /// # Returns
+    /// Tuple of (EncryptedMemoryDb manager, in-memory Connection)
+    pub fn load(encrypted_path: impl Into<std::path::PathBuf>, password: &str) -> Result<(Self, rusqlite::Connection)> {
+        let encrypted_path = encrypted_path.into();
+
+        // Read and decrypt the .enc file
+        let encrypted_data = std::fs::read(&encrypted_path)?;
+        let decrypted_data = WalletEncryption::decrypt_file(&encrypted_data, password)?;
+
+        // Write decrypted data to a temporary file (needed for SQLite to open it)
+        let temp_file = tempfile::NamedTempFile::new()?;
+        std::fs::write(temp_file.path(), &decrypted_data)?;
+
+        // Open the temporary database and backup to :memory:
+        let mut temp_conn = rusqlite::Connection::open(temp_file.path())?;
+        let mut memory_conn = rusqlite::Connection::open_in_memory()?;
+
+        // Use backup API to copy temp DB → memory DB
+        {
+            let backup = rusqlite::backup::Backup::new(&temp_conn, &mut memory_conn)?;
+            backup.run_to_completion(5, std::time::Duration::from_millis(250), None)?;
+            // backup dropped here, releasing borrows
+        }
+
+        // temp_file and temp_conn auto-delete when dropped
+
+        tracing::debug!("Loaded encrypted database into memory: {:?}", encrypted_path);
+
+        let manager = Self {
+            encrypted_path,
+            password: password.to_string(),
+        };
+
+        Ok((manager, memory_conn))
+    }
+
+    /// Flush in-memory database to encrypted file
+    ///
+    /// # Arguments
+    /// * `conn` - The in-memory database connection to flush
+    ///
+    /// Serializes the memory database, encrypts it, and writes to the .enc file.
+    pub fn flush(&self, conn: &rusqlite::Connection) -> Result<()> {
+        // Create a temporary file for backup
+        let temp_file = tempfile::NamedTempFile::new()?;
+        let mut temp_conn = rusqlite::Connection::open(temp_file.path())?;
+
+        // Use backup API to copy memory DB → temp file
+        {
+            let backup = rusqlite::backup::Backup::new(conn, &mut temp_conn)?;
+            backup.run_to_completion(5, std::time::Duration::from_millis(250), None)?;
+            // backup dropped here, releasing borrows
+        }
+
+        // Close temp_conn to flush writes
+        drop(temp_conn);
+
+        // Read temp file, encrypt, and write to .enc
+        let plaintext_data = std::fs::read(temp_file.path())?;
+        let encrypted_data = WalletEncryption::encrypt_file(&plaintext_data, &self.password)?;
+        std::fs::write(&self.encrypted_path, encrypted_data)?;
+
+        // temp_file auto-deletes when dropped
+
+        tracing::debug!("Flushed encrypted database to disk: {:?}", self.encrypted_path);
+
+        Ok(())
     }
 }
 

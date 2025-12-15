@@ -272,7 +272,7 @@ impl AmbientApp {
 
             Message::GenerateWalletRequested => {
                 // Get the wallet name, network, and password from modal
-                if let Some(crate::gui::modal::Modal::GenerateWallet { data, .. }) = &self.active_modal {
+                if let Some(crate::gui::modal::Modal::GenerateWallet { step, data }) = &mut self.active_modal {
                     let name = data.wallet_name.clone();
                     let network = data.network.clone();
                     let password = data.password.clone();
@@ -292,6 +292,9 @@ impl AmbientApp {
                     }
 
                     println!("🪄 Generating wallet '{}' (recovery_height: {})...", name, recovery_height);
+
+                    // Immediately change to Generating step to show loading UI
+                    *step = crate::gui::modal::GenerateWalletStep::Generating;
 
                     // Spawn async task to generate wallet using the LONG-LIVED Tokio runtime
                     // This ensures background auto-sync tasks continue running
@@ -530,7 +533,9 @@ impl AmbientApp {
                         crate::gui::modal::GenerateWalletStep::EnterPassword =>
                             crate::gui::modal::GenerateWalletStep::ReviewAndGenerate,
                         crate::gui::modal::GenerateWalletStep::ReviewAndGenerate =>
-                            crate::gui::modal::GenerateWalletStep::DisplayMnemonic,
+                            crate::gui::modal::GenerateWalletStep::Generating,
+                        crate::gui::modal::GenerateWalletStep::Generating =>
+                            crate::gui::modal::GenerateWalletStep::Generating, // Stay while generating
                         crate::gui::modal::GenerateWalletStep::DisplayMnemonic =>
                             crate::gui::modal::GenerateWalletStep::VerifyMnemonic,
                         crate::gui::modal::GenerateWalletStep::VerifyMnemonic =>
@@ -552,6 +557,8 @@ impl AmbientApp {
                             crate::gui::modal::GenerateWalletStep::EnterName,
                         crate::gui::modal::GenerateWalletStep::ReviewAndGenerate =>
                             crate::gui::modal::GenerateWalletStep::EnterPassword,
+                        crate::gui::modal::GenerateWalletStep::Generating =>
+                            crate::gui::modal::GenerateWalletStep::Generating, // Can't go back while generating
                         crate::gui::modal::GenerateWalletStep::DisplayMnemonic =>
                             crate::gui::modal::GenerateWalletStep::ReviewAndGenerate,
                         crate::gui::modal::GenerateWalletStep::VerifyMnemonic =>
