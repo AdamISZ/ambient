@@ -12,7 +12,7 @@ use bdk_wallet::bitcoin::Transaction;
 /// - Exactly 2 outputs with equal values (the coinjoin outputs for privacy)
 /// - 1 output with different value (proposer's change)
 ///
-/// Note: Output ordering is not considered as it will be randomized.
+/// Note: Output ordering is not considered as it is randomized.
 pub fn is_likely_snicker_transaction(tx: &Transaction) -> bool {
     // Must have at least 2 inputs and exactly 3 outputs
     if tx.input.len() < 2 || tx.output.len() != 3 {

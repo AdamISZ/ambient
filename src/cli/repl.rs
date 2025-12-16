@@ -475,7 +475,7 @@ pub async fn repl(
 
                     println!("🔍 Querying Kyoto headers.db for heights {}-{}...", start_height, end_height);
                     let mgr = arc.read().await;
-                    match mgr.get_block_hashes_from_headers_db(start_height, end_height) {
+                    match mgr.get_block_hashes_from_headers_db(start_height, end_height).await {
                         Ok(hashes) => {
                             println!("✅ Retrieved {} block hashes:", hashes.len());
                             for (height, hash) in hashes.iter().take(10) {

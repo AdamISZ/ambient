@@ -911,17 +911,37 @@ impl Snicker {
                 tweaked_privkey BLOB NOT NULL,
                 snicker_shared_secret BLOB NOT NULL,
                 block_height INTEGER,
-                spent BOOLEAN DEFAULT 0,
+                status TEXT DEFAULT 'unspent',
                 spent_in_txid TEXT,
                 PRIMARY KEY (txid, vout)
             )",
             [],
         )?;
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_snicker_utxos_spent
-             ON snicker_utxos(spent)",
+            "CREATE INDEX IF NOT EXISTS idx_snicker_utxos_status
+             ON snicker_utxos(status)",
             [],
         )?;
+
+        // Migration: Convert old 'spent' boolean column to 'status' text column if it exists
+        let has_spent_column: Result<bool, _> = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('snicker_utxos') WHERE name='spent'",
+            [],
+            |row| {
+                let count: i64 = row.get(0)?;
+                Ok(count > 0)
+            },
+        );
+
+        if has_spent_column.unwrap_or(false) {
+            // Migrate data: spent=0 -> 'unspent', spent=1 -> 'spent'
+            conn.execute(
+                "UPDATE snicker_utxos SET status = CASE WHEN spent = 0 THEN 'unspent' ELSE 'spent' END",
+                [],
+            )?;
+            // Note: SQLite doesn't easily support DROP COLUMN, so old 'spent' column remains but unused
+        }
+
         Ok(())
     }
 
@@ -1330,8 +1350,8 @@ impl Snicker {
 
         conn.execute(
             "INSERT OR REPLACE INTO snicker_utxos
-             (txid, vout, amount, script_pubkey, tweaked_privkey, snicker_shared_secret, block_height, spent)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)",
+             (txid, vout, amount, script_pubkey, tweaked_privkey, snicker_shared_secret, block_height, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'unspent')",
             (
                 txid.to_string(),
                 vout,
@@ -1357,7 +1377,7 @@ impl Snicker {
         let conn = self.conn.lock().unwrap();
 
         let balance: i64 = conn.query_row(
-            "SELECT COALESCE(SUM(amount), 0) FROM snicker_utxos WHERE spent = 0",
+            "SELECT COALESCE(SUM(amount), 0) FROM snicker_utxos WHERE status = 'unspent'",
             [],
             |row| row.get(0),
         )?;
@@ -1372,7 +1392,7 @@ impl Snicker {
         let mut stmt = conn.prepare(
             "SELECT txid, vout, amount, script_pubkey, tweaked_privkey, snicker_shared_secret, block_height
              FROM snicker_utxos
-             WHERE spent = 0
+             WHERE status = 'unspent'
              ORDER BY block_height DESC, amount DESC"
         )?;
 
@@ -1421,11 +1441,11 @@ impl Snicker {
         let conn = self.conn.lock().unwrap();
 
         conn.execute(
-            "UPDATE snicker_utxos SET spent = 1, spent_in_txid = ?1 WHERE txid = ?2 AND vout = ?3",
+            "UPDATE snicker_utxos SET status = 'spent', spent_in_txid = ?1 WHERE txid = ?2 AND vout = ?3",
             (spent_in_txid.to_string(), txid.to_string(), vout),
         )?;
 
-        tracing::info!("✅ Marked SNICKER UTXO {}:{} as spent in {}", txid, vout, spent_in_txid);
+        tracing::info!("✅ Marked SNICKER UTXO {}:{} as SPENT (confirmed) in {}", txid, vout, spent_in_txid);
         Ok(())
     }
 
@@ -1956,7 +1976,7 @@ mod tests {
             .parse().unwrap();
         snicker.mark_snicker_utxo_spent(txid, vout, spending_txid).await.unwrap();
 
-        // list_snicker_utxos filters out spent UTXOs (WHERE spent = 0)
+        // list_snicker_utxos filters out spent UTXOs (WHERE status = 'unspent')
         let utxos = snicker.list_snicker_utxos().await.unwrap();
         assert_eq!(utxos.len(), 0, "Spent UTXOs should be filtered out");
 

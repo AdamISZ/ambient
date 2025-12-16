@@ -1015,9 +1015,12 @@ impl Manager {
             &snicker_shared_secret
         )?;
 
-        // The receiver's tweaked output is always at index 0
-        let output_index = 0;
-        let tweaked_output = &tx.output[output_index];
+        // Find the receiver's tweaked output by matching script_pubkey from proposal
+        // Outputs are randomized, so we can't hardcode index 0
+        let tweaked_script = &proposal.tweak_info.tweaked_output.script_pubkey;
+        let (output_index, tweaked_output) = tx.output.iter().enumerate()
+            .find(|(_, output)| &output.script_pubkey == tweaked_script)
+            .ok_or_else(|| anyhow::anyhow!("Receiver's tweaked output not found in transaction"))?;
         let txid = tx.compute_txid();
 
         // Add the tweaked scriptPubKey to Kyoto's watch list so it gets detected during sync
@@ -1107,8 +1110,8 @@ impl Manager {
     }
 
     /// Get block hashes from headers database (for testing/debugging)
-    pub fn get_block_hashes_from_headers_db(&self, start_height: u32, end_height: u32) -> Result<Vec<(u32, bdk_wallet::bitcoin::BlockHash)>> {
-        self.wallet_node.get_block_hashes_from_headers_db(start_height, end_height)
+    pub async fn get_block_hashes_from_headers_db(&self, start_height: u32, end_height: u32) -> Result<Vec<(u32, bdk_wallet::bitcoin::BlockHash)>> {
+        self.wallet_node.get_block_hashes_from_headers_db(start_height, end_height).await
     }
 
     // ============================================================
