@@ -330,6 +330,7 @@ impl Manager {
         // Create signing callback that signs the proposer's input
         // Use block_in_place to allow blocking operations in async context
         let wallet_clone = self.wallet_node.wallet.clone();
+        let our_utxo_clone = our_utxo.clone();
         let sign_callback = move |psbt: &mut Psbt| -> Result<()> {
             use bdk_wallet::KeychainKind;
 
@@ -338,6 +339,41 @@ impl Manager {
             });
 
             tracing::info!("🔨 Proposer signing PSBT with {} inputs", psbt.inputs.len());
+
+            // Check if proposer's input is a SNICKER UTXO - if so, sign it manually
+            if let crate::wallet_node::WalletUtxo::Snicker { outpoint, amount, script_pubkey, tweaked_privkey } = &our_utxo_clone {
+                tracing::info!("🔑 Proposer's input is a SNICKER UTXO, signing with existing helper");
+
+                // Find which input index corresponds to our SNICKER UTXO
+                let our_input_idx = psbt.unsigned_tx.input.iter().position(|input| {
+                    input.previous_output == *outpoint
+                }).ok_or_else(|| anyhow::anyhow!("Proposer's SNICKER input not found in PSBT"))?;
+
+                // Prepare data in format expected by sign_snicker_inputs helper
+                let snicker_utxo_data = vec![(
+                    outpoint.txid.to_string(),
+                    outpoint.vout,
+                    *amount,
+                    script_pubkey.to_bytes(),
+                    tweaked_privkey.secret_bytes().to_vec(),
+                )];
+
+                // Collect prevouts
+                let prevouts: Vec<_> = psbt.inputs.iter()
+                    .map(|input| input.witness_utxo.clone()
+                        .ok_or_else(|| anyhow::anyhow!("Missing witness_utxo")))
+                    .collect::<Result<Vec<_>>>()?;
+
+                // Use existing signing helper
+                crate::wallet_node::WalletNode::sign_snicker_inputs(
+                    psbt,
+                    &snicker_utxo_data,
+                    &prevouts,
+                    our_input_idx,
+                )?;
+
+                tracing::info!("✅ Signed SNICKER input {} with tweaked privkey", our_input_idx);
+            }
 
             // Get wallet descriptor for comparison
             let ext_descriptor = wallet.public_descriptor(KeychainKind::External);

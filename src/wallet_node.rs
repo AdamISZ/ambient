@@ -922,7 +922,12 @@ impl WalletNode {
         // Only call wallet.sign() if there are regular wallet inputs to sign
         let finalized = if has_regular_wallet_inputs {
             let wallet = self.wallet.lock().await;
-            wallet.sign(psbt, SignOptions::default())?
+            // Use trust_witness_utxo to avoid errors on inputs not in our wallet (e.g., proposer's SNICKER input)
+            let sign_options = SignOptions {
+                trust_witness_utxo: true,
+                ..Default::default()
+            };
+            wallet.sign(psbt, sign_options)?
         } else {
             // All our inputs are SNICKER UTXOs, already signed manually
             false
@@ -1350,7 +1355,7 @@ impl WalletNode {
 
     /// Sign SNICKER inputs in a PSBT using their tweaked private keys
     /// Assumes SNICKER inputs are at indices [start_idx..start_idx+snicker_utxos.len())
-    fn sign_snicker_inputs(
+    pub(crate) fn sign_snicker_inputs(
         psbt: &mut bdk_wallet::bitcoin::psbt::Psbt,
         snicker_utxos: &[(String, u32, u64, Vec<u8>, Vec<u8>)],
         prevouts: &[bdk_wallet::bitcoin::TxOut],
