@@ -1671,21 +1671,20 @@ fn test_build_psbt_correct_order() {
         bdk_wallet::bitcoin::FeeRate::from_sat_per_vb(2).unwrap(),
     ).unwrap();
 
-    // Verify input order: receiver first, proposer second
+    // Verify both inputs are present (order is randomized for privacy)
     let receiver_outpoint = OutPoint {
         txid: target_tx.compute_txid(),
         vout: 0,
     };
-    assert_eq!(
-        psbt.unsigned_tx.input[0].previous_output,
-        receiver_outpoint,
-        "First input should be receiver's"
-    );
-    assert_eq!(
-        psbt.unsigned_tx.input[1].previous_output,
-        proposer_outpoint,
-        "Second input should be proposer's"
-    );
+
+    let has_receiver = psbt.unsigned_tx.input.iter()
+        .any(|input| input.previous_output == receiver_outpoint);
+    let has_proposer = psbt.unsigned_tx.input.iter()
+        .any(|input| input.previous_output == proposer_outpoint);
+
+    assert!(has_receiver, "PSBT should contain receiver's input");
+    assert!(has_proposer, "PSBT should contain proposer's input");
+    assert_eq!(psbt.unsigned_tx.input.len(), 2, "PSBT should have exactly 2 inputs");
 }
 
 #[test]
@@ -1761,24 +1760,37 @@ fn test_build_psbt_includes_witness_utxos() {
         bdk_wallet::bitcoin::FeeRate::from_sat_per_vb(2).unwrap(),
     ).unwrap();
 
+    // Find receiver and proposer inputs (order is randomized)
+    let receiver_outpoint = OutPoint {
+        txid: target_tx.compute_txid(),
+        vout: 0,
+    };
+
+    let receiver_input_idx = psbt.unsigned_tx.input.iter()
+        .position(|input| input.previous_output == receiver_outpoint)
+        .expect("Should find receiver input");
+    let proposer_input_idx = psbt.unsigned_tx.input.iter()
+        .position(|input| input.previous_output == proposer_outpoint)
+        .expect("Should find proposer input");
+
     // Verify both inputs have witness_utxo set
     assert!(
-        psbt.inputs[0].witness_utxo.is_some(),
+        psbt.inputs[receiver_input_idx].witness_utxo.is_some(),
         "Receiver input should have witness_utxo"
     );
     assert!(
-        psbt.inputs[1].witness_utxo.is_some(),
+        psbt.inputs[proposer_input_idx].witness_utxo.is_some(),
         "Proposer input should have witness_utxo"
     );
 
     // Verify the witness_utxo values match what we expect
     assert_eq!(
-        psbt.inputs[0].witness_utxo.as_ref().unwrap().value,
+        psbt.inputs[receiver_input_idx].witness_utxo.as_ref().unwrap().value,
         Amount::from_sat(100_000),
         "Receiver witness_utxo value should match"
     );
     assert_eq!(
-        psbt.inputs[1].witness_utxo.as_ref().unwrap().value,
+        psbt.inputs[proposer_input_idx].witness_utxo.as_ref().unwrap().value,
         Amount::from_sat(200_000),
         "Proposer witness_utxo value should match"
     );

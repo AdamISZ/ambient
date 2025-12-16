@@ -37,10 +37,23 @@ cargo test test_wallet_creation -- --test-threads=1 --nocapture
 
 3. **Per-Test Wallets**: Each test creates its own isolated wallet with:
    - Unique BIP39 mnemonic
-   - Fresh temporary database
+   - Fresh temporary databases (unencrypted for testing)
    - Independent Kyoto light client sync
 
 4. **Dynamic Heights**: Tests adapt to the current blockchain state rather than assuming fixed heights, allowing tests to run in any order.
+
+### Test vs Production Databases
+
+**Test Environment:**
+- Uses **unencrypted file-based SQLite** databases in `/tmp/`
+- Simpler for testing, no password required
+- Databases are temporary and cleaned up after tests
+
+**Production Environment:**
+- Uses **encrypted in-memory SQLite** databases (`:memory:`)
+- All wallet data encrypted with ChaCha20-Poly1305 + Argon2id
+- Encrypted `.enc` files stored in `~/.local/share/ambient/`
+- See [`../docs/ENCRYPTED_STORAGE.md`](../docs/ENCRYPTED_STORAGE.md) for details
 
 ### Test Components
 
@@ -102,11 +115,14 @@ If `wait_for_sync()` times out:
 - Verify compact block filters are enabled (should be automatic)
 - Try running with `--nocapture` to see sync progress
 
-### Wallet database errors
-Each test creates a unique database file. If you see conflicts:
+### Database errors
+Each test creates unique wallet and SNICKER database files. If you see conflicts:
 ```bash
-# Clean up old test databases
+# Clean up old test databases (wallet.sqlite + snicker.sqlite)
 rm -rf /tmp/ambient_*
+
+# Note: Production uses encrypted .enc files in ~/.local/share/ambient/
+# These are NOT affected by test cleanup
 ```
 
 ## Manual Testing with regtest.sh

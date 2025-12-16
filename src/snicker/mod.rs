@@ -375,6 +375,7 @@ impl Snicker {
         proposer_change_addr: bdk_wallet::bitcoin::Address,
     ) -> Result<(Vec<TxOut>, bdk_wallet::bitcoin::Amount)> {
         use bdk_wallet::bitcoin::Amount;
+        use bdk_wallet::bitcoin::secp256k1::rand::{self, seq::SliceRandom};
 
         // Calculate equal output size
         let receiver_amount_sats = receiver_output.value.to_sat() as i64;
@@ -406,7 +407,7 @@ impl Snicker {
         }
 
         // Build outputs vector
-        let outputs = vec![
+        let mut outputs = vec![
             // Equal output 1: to receiver (tweaked)
             TxOut {
                 value: equal_output_amount,
@@ -423,6 +424,10 @@ impl Snicker {
                 script_pubkey: proposer_change_addr.script_pubkey(),
             },
         ];
+
+        // Randomize output order for privacy
+        let mut rng = rand::thread_rng();
+        outputs.shuffle(&mut rng);
 
         Ok((outputs, estimated_fee))
     }
@@ -477,10 +482,9 @@ impl Snicker {
             vout: output_index as u32,
         };
 
-        let tx = BdkTransaction {
-            version: Version::TWO,
-            lock_time: bdk_wallet::bitcoin::locktime::absolute::LockTime::ZERO,
-            input: vec![
+        // Create inputs with associated metadata
+        let mut inputs_with_metadata = vec![
+            (
                 // Receiver's input (to be signed by receiver)
                 TxIn {
                     previous_output: receiver_outpoint,
@@ -488,6 +492,9 @@ impl Snicker {
                     sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                     witness: Witness::new(),
                 },
+                receiver_output.clone(),
+            ),
+            (
                 // Proposer's input (to be signed by us)
                 TxIn {
                     previous_output: proposer_outpoint,
@@ -495,23 +502,38 @@ impl Snicker {
                     sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                     witness: Witness::new(),
                 },
-            ],
+                proposer_txout.clone(),
+            ),
+        ];
+
+        // Randomize input order for privacy
+        use bdk_wallet::bitcoin::secp256k1::rand::{self, seq::SliceRandom};
+        let mut rng = rand::thread_rng();
+        inputs_with_metadata.shuffle(&mut rng);
+
+        // Separate inputs and witness_utxos after shuffling
+        let (tx_inputs, witness_utxos): (Vec<_>, Vec<_>) = inputs_with_metadata.into_iter().unzip();
+
+        let tx = BdkTransaction {
+            version: Version::TWO,
+            lock_time: bdk_wallet::bitcoin::locktime::absolute::LockTime::ZERO,
+            input: tx_inputs,
             output: outputs,
         };
 
         // Create PSBT from transaction
         let mut psbt = Psbt::from_unsigned_tx(tx)?;
 
-        // Add witness_utxo for receiver's input (input 0 - hardcoded for now)
-        psbt.inputs[0].witness_utxo = Some(receiver_output.clone());
-
-        // Add witness_utxo for proposer's input (input 1 - hardcoded for now)
-        psbt.inputs[1].witness_utxo = Some(proposer_txout.clone());
+        // Add witness_utxo for each input (now in randomized order)
+        for (i, witness_utxo) in witness_utxos.iter().enumerate() {
+            psbt.inputs[i].witness_utxo = Some(witness_utxo.clone());
+        }
 
         // Set sighash type for taproot signing (SIGHASH_ALL is standard)
         use bdk_wallet::bitcoin::sighash::TapSighashType;
-        psbt.inputs[0].sighash_type = Some(TapSighashType::All.into());
-        psbt.inputs[1].sighash_type = Some(TapSighashType::All.into());
+        for input in &mut psbt.inputs {
+            input.sighash_type = Some(TapSighashType::All.into());
+        }
 
         // PHASE 1 DEBUG: Dump PSBT state after manual creation (before adding tap fields)
         Self::dump_psbt_state(&psbt, "After manual SNICKER PSBT creation - BEFORE adding tap fields");

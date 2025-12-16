@@ -31,9 +31,12 @@ Ambient is a Bitcoin wallet that implements [SNICKER](https://gist.github.com/Ad
 
 - **Non-interactive**: No back-and-forth communication between parties
 - **Encrypted proposals**: Proposals are encrypted to the receiver's public key for privacy (+)
+- **Encrypted storage**: All wallet data encrypted at rest with ChaCha20-Poly1305 and Argon2id key derivation
+- **In-memory security**: Databases decrypted only in RAM, never written to disk as plaintext
 - **Recoverable from seed**: Uses deterministic tweaks (proposer's input key) enabling full wallet recovery from seed phrase alone
 - **Taproot-only**: [BIP86](#bip86-key-derivation) keypath spending for efficiency and privacy (++)
 - **Light client**: Uses compact block filters (BIP157) via Kyoto - no need to run a full node
+- **GUI & CLI**: Desktop GUI (Linux) and command-line interface
 
 (+) - The encryption is done with ChaCha20-Poly1305 stream ciphering, much better than the original CBC proposal in the [SNICKER](#snicker-bip-draft) gist.
 
@@ -46,9 +49,12 @@ Ambient is a Bitcoin wallet that implements [SNICKER](https://gist.github.com/Ad
 - **[Rust](https://www.rust-lang.org/)** - Systems programming language
 - **[BDK (Bitcoin Dev Kit)](https://bitcoindevkit.org/)** - Bitcoin wallet library
 - **[Kyoto](https://github.com/rustaceanrob/kyoto)** - Compact block filter light client (BIP157/158)
+- **[Iced](https://github.com/iced-rs/iced)** - Cross-platform GUI framework
 - **Taproot ([BIP341](#bip341-taproot))** - Modern Bitcoin scripting with keypath spending
 - **[BIP86](#bip86-key-derivation)** - Deterministic key derivation for Taproot
 - **[SNICKER](#snicker-bip-draft)** - Non-interactive coinjoin protocol
+- **ChaCha20-Poly1305** - Authenticated encryption (AEAD) for wallet files
+- **Argon2id** - Memory-hard key derivation function
 
 ---
 
@@ -58,16 +64,18 @@ Ambient is a Bitcoin wallet that implements [SNICKER](https://gist.github.com/Ad
 - ✅ Basic Taproot wallet functionality (send, receive, balance)
 - ✅ [SNICKER](#snicker-bip-draft) protocol implementation (propose, receive, validate)
 - ✅ Encrypted proposal system
+- ✅ Encrypted wallet storage (ChaCha20-Poly1305 + Argon2id)
+- ✅ In-memory database security (no plaintext on disk)
 - ✅ Recoverable tweaked outputs
 - ✅ Light client sync via Kyoto
+- ✅ GUI interface (Iced framework)
 - ✅ End-to-end integration tests
 
 **TODO:**
 - [ ] Proposal broadcast/discovery mechanism (Nostr, DHT, etc.)
-- [ ] Background automation (passive scanning and accepting)
 - [ ] UTXO selection strategies
 - [ ] Fee estimation improvements
-- [ ] GUI interface - planned for Linux desktop binary distribution, only
+- [ ] Password change functionality
 - [ ] Comprehensive testing on signet/mainnet
 
 ---
@@ -81,6 +89,17 @@ Ambient is a Bitcoin wallet that implements [SNICKER](https://gist.github.com/Ad
 
 ### Build
 
+**CLI only:**
+```bash
+cargo build --release --bin ambient-cli
+```
+
+**GUI (requires Linux desktop environment):**
+```bash
+cargo build --release --features gui --bin ambient-gui
+```
+
+**Both:**
 ```bash
 cargo build --release
 ```
@@ -106,15 +125,57 @@ ambient/
 ├── src/
 │   ├── manager.rs        # High-level wallet + SNICKER coordination
 │   ├── wallet_node.rs    # Bitcoin wallet (BDK + Kyoto)
+│   ├── encryption.rs     # Encrypted in-memory database management
 │   ├── snicker/
 │   │   ├── mod.rs        # SNICKER protocol logic
 │   │   └── tweak.rs      # Cryptographic primitives (ECDH, tweaking)
-│   └── main.rs           # CLI interface
+│   ├── gui/              # GUI interface (Iced framework)
+│   │   ├── app.rs        # Application state and message handling
+│   │   ├── views/        # UI views (wallet, settings, modals)
+│   │   └── widgets/      # Custom UI components
+│   ├── main.rs           # CLI interface
+│   └── gui_main.rs       # GUI entry point
 ├── tests/                # Integration tests
 └── docs/
-    ├── PROTOCOL.md       # Complete protocol description
-    └── SNICKER_RECOVERY.md  # Wallet recovery design
+    ├── PROTOCOL.md           # Complete protocol description
+    ├── ENCRYPTED_STORAGE.md  # Encrypted storage architecture and schemas
+    └── SNICKER_RECOVERY.md   # Wallet recovery design
 ```
+
+### Data Flow
+
+```
+┌─────────────────┐
+│ Encrypted Files │  ← wallet.sqlite.enc, snicker.sqlite.enc, mnemonic.enc
+│ (Disk Storage)  │
+└────────┬────────┘
+         │ Decrypt with password (Argon2id + ChaCha20-Poly1305)
+         ↓
+┌─────────────────┐
+│  In-Memory DBs  │  ← SQLite :memory: connections
+│  (RAM only)     │
+└────────┬────────┘
+         │
+    ┌────┴────┬──────────┐
+    ↓         ↓          ↓
+┌─────┐  ┌────────┐  ┌────────┐
+│ BDK │  │ Kyoto  │  │SNICKER │
+└─────┘  └────────┘  └────────┘
+    │         │          │
+    └─────────┴──────────┘
+              ↓
+        ┌──────────┐
+        │ Manager  │
+        └────┬─────┘
+             │
+        ┌────┴─────┐
+        ↓          ↓
+    ┌──────┐  ┌──────┐
+    │ CLI  │  │ GUI  │
+    └──────┘  └──────┘
+```
+
+See [`docs/ENCRYPTED_STORAGE.md`](docs/ENCRYPTED_STORAGE.md) for detailed encryption architecture and database schemas.
 
 ---
 
