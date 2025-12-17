@@ -26,6 +26,7 @@ use bdk_kyoto::builder::{Builder, BuilderExt};
 use bdk_kyoto::{Info, LightClient, Receiver, ScanType, UnboundedReceiver, Warning, TxBroadcast, TxBroadcastPolicy, HeaderCheckpoint};
 
 use crate::encryption::WalletEncryption;
+use crate::fee;
 
 const RECOVERY_LOOKAHEAD: u32 = 50;
 const NUM_CONNECTIONS: u8 = 1;
@@ -122,6 +123,8 @@ pub struct WalletNode {
     update_tx: broadcast::Sender<WalletUpdate>,
     /// Encrypted in-memory wallet database (for flush on shutdown)
     wallet_db: crate::encryption::EncryptedMemoryDb,
+    /// Fee estimator for real-time fee rate estimates
+    pub fee_estimator: fee::FeeEstimator,
     /// Encrypted in-memory SNICKER database (for flush on UTXO changes)
     snicker_db: crate::encryption::EncryptedMemoryDb,
 }
@@ -325,6 +328,9 @@ impl WalletNode {
 
         info!("✅ Wallet loaded. Auto-sync enabled in background.");
 
+        // Initialize fee estimator with default settings (5 min cache, 10s timeout)
+        let fee_estimator = fee::FeeEstimator::new(network, 300, 10);
+
         Ok(Self {
             wallet,
             conn,
@@ -339,6 +345,7 @@ impl WalletNode {
             update_tx,
             wallet_db,
             snicker_db,
+            fee_estimator,
         })
     }
 
@@ -1008,7 +1015,23 @@ impl WalletNode {
         Ok(txid)
     }
 
-    /// Convenience method: Build, sign, finalize, and broadcast a transaction in one step.
+    /// Send funds with automatic fee estimation (6-block target)
+    ///
+    /// Estimates optimal fee rate from mempool.space (or static defaults for regtest).
+    /// Returns error if estimation fails - user must specify manual fee rate.
+    pub async fn send_to_address_auto(&mut self, address_str: &str, amount_sats: u64) -> Result<Txid> {
+        // Estimate fee rate for 6 blocks
+        let fee_rate = self.fee_estimator.estimate(6).await
+            .map_err(|e| anyhow!(
+                "Fee estimation failed: {}.\nPlease specify a manual fee rate using: send <address> <amount> <fee_rate_sat_vb>",
+                e
+            ))? as f32;
+
+        info!("📊 Using estimated fee rate: {:.2} sat/vB for ~6 blocks", fee_rate);
+        self.send_to_address(address_str, amount_sats, fee_rate).await
+    }
+
+    /// Convenience method: Build, sign, finalize, and broadcast a transaction in one step with manual fee rate.
     /// This is the simple "send" interface for basic usage.
     ///
     /// HYBRID VERSION: Uses SNICKER UTXOs up to available amount, then fills remainder with regular UTXOs

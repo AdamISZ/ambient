@@ -10,6 +10,7 @@ pub mod cli;
 pub mod config;
 pub mod automation;
 pub mod encryption;
+pub mod fee;
 
 // GUI module - only include if iced feature is enabled
 #[cfg(feature = "gui")]

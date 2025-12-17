@@ -294,9 +294,10 @@ pub async fn repl(
             }
 
             "send" => {
-                if args.len() != 3 {
-                    println!("Usage: send <address> <amount_sats> <fee_rate_sat_vb>");
-                    println!("Example: send tb1q... 10000 1.5");
+                if args.len() < 2 || args.len() > 3 {
+                    println!("Usage: send <address> <amount_sats> [fee_rate_sat_vb]");
+                    println!("Example: send tb1q... 10000           (auto fee estimation)");
+                    println!("Example: send tb1q... 10000 1.5       (manual fee rate)");
                     continue;
                 }
                 if let Some(arc) = manager_arc.as_ref() {
@@ -308,19 +309,29 @@ pub async fn repl(
                             continue;
                         }
                     };
-                    let fee_rate: f32 = match args[2].parse() {
-                        Ok(f) => f,
-                        Err(_) => {
-                            println!("Invalid fee rate");
-                            continue;
-                        }
-                    };
 
-                    println!("Sending {} sats to {} (fee rate: {} sat/vB)...", amount, address, fee_rate);
                     let mut mgr = arc.write().await;
-                    match mgr.send_to_address(address, amount, fee_rate).await {
-                        Ok(txid) => println!("✅ Transaction broadcast: {}", txid),
-                        Err(e) => println!("❌ Error: {}", e),
+
+                    // Use auto fee estimation if no fee rate provided
+                    if args.len() == 2 {
+                        println!("Sending {} sats to {} (auto fee estimation)...", amount, address);
+                        match mgr.send_to_address_auto(address, amount).await {
+                            Ok(txid) => println!("✅ Transaction broadcast: {}", txid),
+                            Err(e) => println!("❌ Error: {}", e),
+                        }
+                    } else {
+                        let fee_rate: f32 = match args[2].parse() {
+                            Ok(f) => f,
+                            Err(_) => {
+                                println!("Invalid fee rate");
+                                continue;
+                            }
+                        };
+                        println!("Sending {} sats to {} (fee rate: {} sat/vB)...", amount, address, fee_rate);
+                        match mgr.send_to_address(address, amount, fee_rate).await {
+                            Ok(txid) => println!("✅ Transaction broadcast: {}", txid),
+                            Err(e) => println!("❌ Error: {}", e),
+                        }
                     }
                 } else {
                     println!("No wallet loaded.");

@@ -141,7 +141,18 @@ impl Manager {
         self.wallet_node.subscribe_to_updates()
     }
 
-    /// Send to address (simple interface)
+    /// Send to address with automatic fee estimation (6-block target)
+    ///
+    /// Returns error if fee estimation fails - user must specify manual fee rate.
+    pub async fn send_to_address_auto(
+        &mut self,
+        address_str: &str,
+        amount_sats: u64,
+    ) -> Result<bdk_wallet::bitcoin::Txid> {
+        self.wallet_node.send_to_address_auto(address_str, amount_sats).await
+    }
+
+    /// Send to address with manual fee rate
     pub async fn send_to_address(
         &mut self,
         address_str: &str,
