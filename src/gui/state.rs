@@ -16,6 +16,11 @@ pub enum AppState {
         available_wallets: Vec<String>,
     },
 
+    /// Loading a wallet (shows loading indicator)
+    LoadingWallet {
+        wallet_name: String,
+    },
+
     /// Wallet loaded and active
     WalletLoaded {
         manager: Arc<RwLock<Manager>>,

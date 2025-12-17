@@ -19,7 +19,7 @@
 //! No attempt tracking is implemented as it provides no real security on general-purpose
 //! computers where attackers have filesystem access. Security relies on:
 //! - Strong password (user responsibility)
-//! - Expensive KDF (Argon2id with 64MB memory, 3 iterations)
+//! - Memory-hard KDF (Argon2id with 16MB memory, 1 iteration)
 //!
 //! ## TODOs for v2
 //! - [ ] Password strength validation/enforcement
@@ -43,10 +43,10 @@ use rusqlite;
 /// Current encryption format version
 const VERSION: u8 = 0x01;
 
-/// Argon2id parameters (tuned for security vs performance)
-const ARGON2_MEM_COST: u32 = 65536; // 64 MB
-const ARGON2_TIME_COST: u32 = 3; // 3 iterations
-const ARGON2_PARALLELISM: u32 = 4; // 4 threads
+/// Argon2id parameters (balanced for usability, relies on strong passwords)
+const ARGON2_MEM_COST: u32 = 16384; // 16 MB
+const ARGON2_TIME_COST: u32 = 1; // 1 iteration
+const ARGON2_PARALLELISM: u32 = 1; // 1 thread
 const ARGON2_OUTPUT_LEN: usize = 32; // 32 bytes (256 bits)
 
 /// Salt length for Argon2id

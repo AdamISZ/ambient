@@ -41,6 +41,10 @@ pub enum Message {
     WizardStepChanged(crate::gui::modal::GenerateWalletStep),
     FocusPasswordConfirmField,
 
+    // Keyboard events for tab navigation
+    TabPressed,
+    ShiftTabPressed,
+
     // Wallet tab navigation
     TabChanged(crate::gui::state::WalletTab),
 

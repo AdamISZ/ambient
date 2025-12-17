@@ -131,10 +131,34 @@ impl AmbientApp {
                 };
 
                 // Combine subscriptions
-                iced::Subscription::batch([balance_sub, automation_sub])
+                iced::Subscription::batch([balance_sub, automation_sub, Self::keyboard_subscription()])
             }
-            _ => iced::Subscription::none()
+            _ => Self::keyboard_subscription()
         }
+    }
+
+    /// Keyboard event subscription for tab navigation
+    fn keyboard_subscription() -> iced::Subscription<Message> {
+        use iced::keyboard;
+        use iced::keyboard::Key;
+        use iced::Event;
+
+        iced::event::listen_with(|event, _status, _window| {
+            match event {
+                Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: Key::Named(keyboard::key::Named::Tab),
+                    modifiers,
+                    ..
+                }) => {
+                    if modifiers.shift() {
+                        Some(Message::ShiftTabPressed)
+                    } else {
+                        Some(Message::TabPressed)
+                    }
+                }
+                _ => None,
+            }
+        })
     }
 
     fn handle_message(&mut self, message: Message) -> Task<Message> {
@@ -189,6 +213,7 @@ impl AmbientApp {
                         entries
                             .filter_map(|e| e.ok())
                             .filter(|e| e.file_type().ok().map(|t| t.is_dir()).unwrap_or(false))
+                            .filter(|e| is_wallet_directory(&e.path()))
                             .filter_map(|e| e.file_name().into_string().ok())
                             .collect::<Vec<_>>()
                     })
@@ -345,8 +370,11 @@ impl AmbientApp {
                     let name = data.wallet_name.clone();
                     let password = data.password.clone();
 
-                    // Close the modal
+                    // Close the modal and show loading state
                     self.active_modal = None;
+                    self.state = crate::gui::state::AppState::LoadingWallet {
+                        wallet_name: name.clone(),
+                    };
 
                     println!("Loading generated wallet '{}'...", name);
                     return Task::done(Message::LoadWalletRequested(name, password));
@@ -360,6 +388,12 @@ impl AmbientApp {
                 let name = wallet_name.clone();
                 let recovery_height = self.config.recovery_height;
                 let rt_handle = self.tokio_runtime.handle().clone();
+
+                // Close modal and set loading state
+                self.active_modal = None;
+                self.state = crate::gui::state::AppState::LoadingWallet {
+                    wallet_name: name.clone(),
+                };
 
                 println!("📁 Loading wallet '{}' (recovery_height: {})...", name, recovery_height);
 
@@ -411,14 +445,40 @@ impl AmbientApp {
                     Err(e) => {
                         eprintln!("❌ Failed to load wallet: {}", e);
 
-                        // Check if it's a password error - if so, keep modal open for retry
+                        // Check if it's a password error - if so, reopen modal for retry
                         if e.contains("Wrong password") || e.contains("Encryption") {
-                            // Update error message in OpenWallet modal
-                            if let Some(crate::gui::modal::Modal::OpenWallet { error_message, password, .. }) = &mut self.active_modal {
-                                *error_message = Some(e);
-                                // Clear password for retry
-                                *password = String::new();
-                            }
+                            // Get wallet name from LoadingWallet state
+                            let wallet_name = if let AppState::LoadingWallet { wallet_name } = &self.state {
+                                Some(wallet_name.clone())
+                            } else {
+                                None
+                            };
+
+                            // Scan for available wallets
+                            let wallet_dir = self.config.network_wallet_dir();
+                            let available_wallets = std::fs::read_dir(&wallet_dir)
+                                .ok()
+                                .map(|entries| {
+                                    entries
+                                        .filter_map(|e| e.ok())
+                                        .filter(|e| e.file_type().ok().map(|t| t.is_dir()).unwrap_or(false))
+                                        .filter(|e| is_wallet_directory(&e.path()))
+                                        .filter_map(|e| e.file_name().into_string().ok())
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default();
+
+                            // Return to NoWallet state and reopen modal with error
+                            self.state = AppState::NoWallet {
+                                available_wallets: available_wallets.clone(),
+                            };
+
+                            self.active_modal = Some(crate::gui::modal::Modal::OpenWallet {
+                                available_wallets,
+                                selected: wallet_name,
+                                password: String::new(),
+                                error_message: Some(e),
+                            });
                         } else {
                             // Other errors (file not found, etc.) - show error state
                             self.state = AppState::Error {
@@ -522,6 +582,58 @@ impl AmbientApp {
                 // Focus the password confirmation field (for Tab navigation)
                 use iced::widget::text_input;
                 text_input::focus(text_input::Id::new("password_confirm_field"))
+            }
+
+            Message::TabPressed => {
+                // Handle Tab key for focus navigation
+                use iced::widget::text_input;
+
+                if let Some(modal) = &self.active_modal {
+                    match modal {
+                        crate::gui::modal::Modal::GenerateWallet { step, .. } => {
+                            match step {
+                                crate::gui::modal::GenerateWalletStep::EnterName => {
+                                    // No additional fields to tab to in this step
+                                    Task::none()
+                                }
+                                crate::gui::modal::GenerateWalletStep::EnterPassword => {
+                                    // Tab from password to password_confirm
+                                    text_input::focus(text_input::Id::new("password_confirm_field"))
+                                }
+                                _ => Task::none(),
+                            }
+                        }
+                        crate::gui::modal::Modal::OpenWallet { .. } => {
+                            // No additional fields in open wallet dialog
+                            Task::none()
+                        }
+                        _ => Task::none(),
+                    }
+                } else {
+                    Task::none()
+                }
+            }
+
+            Message::ShiftTabPressed => {
+                // Handle Shift+Tab key for reverse focus navigation
+                use iced::widget::text_input;
+
+                if let Some(modal) = &self.active_modal {
+                    match modal {
+                        crate::gui::modal::Modal::GenerateWallet { step, .. } => {
+                            match step {
+                                crate::gui::modal::GenerateWalletStep::EnterPassword => {
+                                    // Shift+Tab from password_confirm back to password
+                                    text_input::focus(text_input::Id::new("password_field"))
+                                }
+                                _ => Task::none(),
+                            }
+                        }
+                        _ => Task::none(),
+                    }
+                } else {
+                    Task::none()
+                }
             }
 
             Message::WizardNextStep => {
@@ -1420,6 +1532,25 @@ impl AmbientApp {
                 crate::gui::views::no_wallet::view(available_wallets)
             }
 
+            AppState::LoadingWallet { wallet_name } => {
+                let wallet_name = wallet_name.clone();
+                container(
+                    column![
+                        text("Loading Wallet").size(32),
+                        text(format!("Loading '{}'...", wallet_name)).size(20),
+                        text("🔐 Decrypting wallet files").size(16),
+                        text("⏳ This may take a few seconds...").size(14),
+                    ]
+                    .spacing(20)
+                    .padding(40)
+                )
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill)
+                .into()
+            }
+
             AppState::WalletLoaded { manager, wallet_data } => {
                 crate::gui::views::wallet_loaded::view(manager, wallet_data)
             }
@@ -1465,12 +1596,14 @@ impl Default for AmbientApp {
 /// A wallet directory should contain at least one of the core wallet files.
 /// This can be updated if the wallet structure changes.
 fn is_wallet_directory(path: &std::path::Path) -> bool {
-    // Check for presence of core wallet files
+    // Check for presence of encrypted wallet files (production)
+    let has_encrypted_wallet_db = path.join("wallet.sqlite.enc").exists();
+    let has_encrypted_mnemonic = path.join("mnemonic.enc").exists();
+
+    // Also check for unencrypted files (test environments)
     let has_wallet_db = path.join("wallet.sqlite").exists();
     let has_mnemonic = path.join("mnemonic.txt").exists();
-    let has_snicker_db = path.join("snicker.sqlite").exists();
 
-    // Directory is a wallet if it has the wallet database or mnemonic
-    // (snicker.sqlite alone isn't sufficient as it might be orphaned)
-    has_wallet_db || has_mnemonic
+    // Directory is a wallet if it has any of the wallet database or mnemonic files
+    has_encrypted_wallet_db || has_encrypted_mnemonic || has_wallet_db || has_mnemonic
 }
