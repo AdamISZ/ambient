@@ -7,6 +7,25 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::fs;
 
+/// Default minimum change output size to create (in satoshis)
+///
+/// Set to 5× the dust limit (546 sats) = 2730 sats.
+///
+/// Rationale: The dust limit (546 sats) is a Bitcoin Core policy rule that prevents
+/// creation of economically unspendable outputs. While technically valid above 546 sats,
+/// small UTXOs between 546-2730 sats are still uneconomical to spend in many scenarios:
+/// - At 10 sat/vB, spending a P2TR input costs ~580 sats in fees
+/// - At 50 sat/vB (high fee environment), it costs ~2900 sats
+/// - Creating slightly larger UTXOs (5× dust) provides a safety margin
+///
+/// For SNICKER proposals, when change would fall below this threshold, we drop the
+/// change output entirely and bump the miner fee instead. This keeps the UTXO set
+/// smaller and avoids creating economically marginal outputs.
+///
+/// Note: This applies to ALL SNICKER proposal creation (manual and automated), not just
+/// automation. It controls transaction building logic for the final "leftover" amount.
+pub const DEFAULT_MIN_CHANGE_OUTPUT_SIZE: u64 = 5 * 546; // 2730 sats
+
 /// Network type for Bitcoin
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -120,6 +139,13 @@ pub struct SnickerAutomation {
     /// (vs all taproot UTXOs in range)
     #[serde(default = "default_snicker_pattern_only")]
     pub snicker_pattern_only: bool,
+
+    /// Minimum change output size to create (in sats)
+    /// Change outputs smaller than this will be dropped (bumping miner fee instead)
+    /// Default: 5 × 546 (dust limit) = 2730 sats
+    /// Applies to all SNICKER proposal creation (manual and automated)
+    #[serde(default = "default_min_change_output_size")]
+    pub min_change_output_size: u64,
 }
 
 impl Default for SnickerAutomation {
@@ -130,6 +156,7 @@ impl Default for SnickerAutomation {
             max_proposals_per_day: default_max_proposals_per_day(),
             prefer_snicker_outputs: default_prefer_snicker_outputs(),
             snicker_pattern_only: default_snicker_pattern_only(),
+            min_change_output_size: default_min_change_output_size(),
         }
     }
 }
@@ -288,6 +315,11 @@ fn default_prefer_snicker_outputs() -> bool {
 /// Get the default for snicker_pattern_only
 fn default_snicker_pattern_only() -> bool {
     true
+}
+
+/// Get the default minimum change output size (5 × dust limit)
+fn default_min_change_output_size() -> u64 {
+    DEFAULT_MIN_CHANGE_OUTPUT_SIZE
 }
 
 /// Get the configuration file path

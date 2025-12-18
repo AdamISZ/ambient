@@ -58,6 +58,7 @@ pub fn view(edited_config: &Config) -> Element<'static, Message> {
     let wallet_dir = edited_config.wallet_dir.to_string_lossy().to_string();
     let recovery_height_value = edited_config.recovery_height.to_string();
     let proposals_dir = edited_config.proposals_directory.to_string_lossy().to_string();
+    let min_change_output_size_value = edited_config.snicker_automation.min_change_output_size.to_string();
 
     // Build scrollable content section
     let scrollable_content = column![
@@ -104,6 +105,16 @@ pub fn view(edited_config: &Config) -> Element<'static, Message> {
             text_input("Proposals directory path", &proposals_dir)
                 .on_input(Message::SettingsProposalsDirChanged)
                 .width(Length::Fixed(400.0))
+        ].spacing(5),
+
+        // Minimum change output size input
+        column![
+            text("Minimum Change Output Size (sats)").size(16),
+            text("Minimum size for change outputs in SNICKER proposals (default: 2730 = 5× dust limit)").size(12),
+            text("Change below this will be dropped and added to miner fee instead").size(12),
+            text_input("2730", &min_change_output_size_value)
+                .on_input(Message::SettingsMinChangeOutputSizeChanged)
+                .width(Length::Fixed(200.0))
         ].spacing(5),
     ]
     .spacing(20);

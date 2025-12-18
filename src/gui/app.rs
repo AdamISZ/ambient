@@ -89,20 +89,30 @@ impl AmbientApp {
 
                             let receiver = receiver_opt.as_mut().unwrap();
 
-                            // Wait for next blockchain update event
-                            match receiver.recv().await {
-                                Ok(update) => {
-                                    // Convert WalletUpdate to our Message
+                            // Wait for next blockchain update event with timeout to prevent busy-waiting
+                            let result = tokio::time::timeout(
+                                Duration::from_millis(100),
+                                receiver.recv()
+                            ).await;
+
+                            match result {
+                                Ok(Ok(update)) => {
+                                    // Received an update
                                     Some((Message::BlockchainUpdate(update), receiver_opt))
                                 }
-                                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(n))) => {
                                     // We missed some updates - that's OK, just get the next one
                                     tracing::warn!("Blockchain update subscription lagged by {} events", n);
                                     Some((Message::SyncRequested, receiver_opt))
                                 }
-                                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
                                     // Channel closed - stop subscription
                                     None
+                                }
+                                Err(_timeout) => {
+                                    // Timeout - no update received, sleep briefly and continue
+                                    async_std::task::sleep(Duration::from_millis(100)).await;
+                                    Some((Message::Noop, receiver_opt))
                                 }
                             }
                         }
@@ -163,6 +173,11 @@ impl AmbientApp {
 
     fn handle_message(&mut self, message: Message) -> Task<Message> {
         match message {
+            Message::Noop => {
+                // No-op message for subscription throttling
+                Task::none()
+            }
+
             Message::OpenModal(modal) => {
                 self.active_modal = Some(modal);
                 Task::none()
@@ -538,6 +553,15 @@ impl AmbientApp {
             Message::SettingsProposalsDirChanged(dir) => {
                 if let Some(crate::gui::modal::Modal::Settings { edited_config }) = &mut self.active_modal {
                     edited_config.proposals_directory = std::path::PathBuf::from(dir);
+                }
+                Task::none()
+            }
+
+            Message::SettingsMinChangeOutputSizeChanged(size_str) => {
+                if let Some(crate::gui::modal::Modal::Settings { edited_config }) = &mut self.active_modal {
+                    if let Ok(size) = size_str.parse::<u64>() {
+                        edited_config.snicker_automation.min_change_output_size = size;
+                    }
                 }
                 Task::none()
             }
@@ -1171,7 +1195,7 @@ impl AmbientApp {
                         async move {
                             rt_handle.spawn(async move {
                                 let mut manager = manager_clone.write().await;
-                                let (proposal, encrypted) = manager.create_snicker_proposal(&opportunity, delta_sats as i64).await?;
+                                let (proposal, encrypted) = manager.create_snicker_proposal(&opportunity, delta_sats as i64, crate::config::DEFAULT_MIN_CHANGE_OUTPUT_SIZE).await?;
 
                                 let tag_hex = ::hex::encode(&proposal.tag);
 
@@ -1382,6 +1406,7 @@ impl AmbientApp {
                         max_proposals_per_day: max_per_day,
                         prefer_snicker_outputs: true,  // Default
                         snicker_pattern_only: true,    // Default
+                        min_change_output_size: crate::config::DEFAULT_MIN_CHANGE_OUTPUT_SIZE,
                     };
 
                     let mode = wallet_data.automation_mode;

@@ -17,6 +17,9 @@ impl std::fmt::Debug for ManagerWrapper {
 /// All possible messages/events in the application
 #[derive(Debug, Clone)]
 pub enum Message {
+    // System
+    Noop, // No-operation message (for subscription throttling)
+
     // Modal control
     OpenModal(crate::gui::modal::Modal),
     CloseModal,
@@ -116,6 +119,7 @@ pub enum Message {
     SettingsWalletDirChanged(String),
     SettingsRecoveryHeightChanged(String),
     SettingsProposalsDirChanged(String),
+    SettingsMinChangeOutputSizeChanged(String),
     SettingsSave,
     SettingsSaved(Result<(), String>),
 

@@ -198,6 +198,7 @@ async fn test_snicker_end_to_end() -> Result<()> {
     let (signed_psbt, encrypted_proposal) = bob_mgr.create_snicker_proposal(
         opportunity,
         delta_sats,
+        ambient::config::DEFAULT_MIN_CHANGE_OUTPUT_SIZE,
     ).await?;
 
     println!("   ✅ Proposal created and signed by Bob");

@@ -311,6 +311,7 @@ impl Manager {
         &mut self,
         opportunity: &ProposalOpportunity,
         delta_sats: i64,
+        min_change_output_size: u64,
     ) -> Result<(Proposal, EncryptedProposal)> {
         // Get our UTXO from unified UTXO list
         let all_utxos = self.wallet_node.get_all_wallet_utxos().await?;
@@ -527,6 +528,7 @@ impl Manager {
             change_output_addr,
             delta_sats,
             fee_rate,
+            min_change_output_size,
             sign_callback,
         )?;
 
@@ -1434,7 +1436,7 @@ impl Manager {
             }
 
             // Create proposal
-            match self.create_snicker_proposal(&opportunity, delta_sats).await {
+            match self.create_snicker_proposal(&opportunity, delta_sats, config.min_change_output_size).await {
                 Ok((proposal, encrypted_proposal)) => {
                     created_count += 1;
                     let tag_hex = hex::encode(proposal.tag);

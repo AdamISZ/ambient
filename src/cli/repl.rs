@@ -683,7 +683,7 @@ pub async fn repl(
                     println!("   Target: {} sats, Delta: {} sats", opp.target_value.to_sat(), delta_sats);
 
                     let mut mgr = arc.write().await;
-                    match mgr.create_snicker_proposal(opp, delta_sats).await {
+                    match mgr.create_snicker_proposal(opp, delta_sats, crate::config::DEFAULT_MIN_CHANGE_OUTPUT_SIZE).await {
                         Ok((proposal, encrypted_proposal)) => {
                             println!("✅ Proposal created!");
                             println!("   Tag: {}", ::hex::encode(&proposal.tag));

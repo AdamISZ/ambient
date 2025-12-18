@@ -205,6 +205,7 @@ impl Snicker {
     /// * `proposer_change_output_addr` - Address for proposer's change output
     /// * `delta_sats` - Fee adjustment (positive = receiver pays, 0 = proposer pays all, negative = proposer pays receiver)
     /// * `fee_rate` - Fee rate for the transaction
+    /// * `min_change_output_size` - Minimum UTXO size to create (change below this bumps fee)
     /// * `sign_psbt` - Callback to sign the PSBT (should only sign proposer's input)
     ///
     /// # Returns
@@ -220,6 +221,7 @@ impl Snicker {
         proposer_change_output_addr: bdk_wallet::bitcoin::Address,
         delta_sats: i64,
         fee_rate: bdk_wallet::bitcoin::FeeRate,
+        min_change_output_size: u64,
         sign_psbt: F,
     ) -> Result<(Proposal, EncryptedProposal)>
     where
@@ -250,6 +252,7 @@ impl Snicker {
             proposer_change_output_addr,
             delta_sats,
             fee_rate,
+            min_change_output_size,
         )?;
 
         // 3. Sign the proposer's input (partial signature)
@@ -363,6 +366,9 @@ impl Snicker {
     /// - Proposer gets one change output
     /// - Receiver gets no change (to avoid increasing their UTXO count)
     ///
+    /// # Arguments
+    /// * `min_change_output_size` - Minimum UTXO size to create (change below this bumps fee)
+    ///
     /// # Returns
     /// Tuple of (outputs_vector, total_fees)
     fn build_equal_outputs_structure(
@@ -373,6 +379,7 @@ impl Snicker {
         tweaked_output: TxOut,
         proposer_equal_addr: bdk_wallet::bitcoin::Address,
         proposer_change_addr: bdk_wallet::bitcoin::Address,
+        min_change_output_size: u64,
     ) -> Result<(Vec<TxOut>, bdk_wallet::bitcoin::Amount)> {
         use bdk_wallet::bitcoin::Amount;
         use bdk_wallet::bitcoin::secp256k1::rand::{self, seq::SliceRandom};
@@ -389,7 +396,7 @@ impl Snicker {
         }
         let equal_output_amount = Amount::from_sat(equal_output_sats as u64);
 
-        // Estimate transaction weight: 2 P2TR inputs + 3 P2TR outputs
+        // Estimate transaction weight: 2 P2TR inputs + variable outputs
         // Overhead: version(4) + locktime(4) + #inputs(1) + #outputs(1) = 10 bytes non-witness = 40 WU
         //           + segwit flag/marker(2) witness bytes = 2 WU
         //           Total overhead: 42 WU
@@ -398,16 +405,17 @@ impl Snicker {
         //                 Total per input: 230 WU
         // Per P2TR output: amount(8) + script_len(1) + scriptpubkey(34) = 43 bytes non-witness = 172 WU
         // Formula: (42 + 230*num_inputs + 172*num_outputs + 3) / 4  (the +3 ensures rounding up)
-        let weight_units = 42 + (230 * 2) + (172 * 3); // = 1018 WU
-        let estimated_vsize = (weight_units + 3) / 4; // = 255 vbytes
-        let estimated_fee = fee_rate.fee_vb(estimated_vsize)
+        let weight_units_3_outputs = 42 + (230 * 2) + (172 * 3); // = 1018 WU
+        let estimated_vsize_3_outputs = (weight_units_3_outputs + 3) / 4; // = 255 vbytes
+        let estimated_fee_3_outputs = fee_rate.fee_vb(estimated_vsize_3_outputs)
             .ok_or_else(|| anyhow::anyhow!("Fee calculation overflow"))?;
 
-        // Calculate change
+        // Calculate change (initially assuming 3 outputs)
         let total_in = receiver_output.value + proposer_amount;
         let total_out_before_change = equal_output_amount + equal_output_amount;
-        let change_amount = total_in - total_out_before_change - estimated_fee;
+        let change_amount = total_in - total_out_before_change - estimated_fee_3_outputs;
 
+        // Check if change is below dust limit (cannot create at all)
         if change_amount.to_sat() < 546 {
             return Err(anyhow::anyhow!(
                 "Insufficient proposer funds: change would be dust ({} sats)",
@@ -415,30 +423,64 @@ impl Snicker {
             ));
         }
 
-        // Build outputs vector
-        let mut outputs = vec![
-            // Equal output 1: to receiver (tweaked)
-            TxOut {
-                value: equal_output_amount,
-                script_pubkey: tweaked_output.script_pubkey,
-            },
-            // Equal output 2: to proposer
-            TxOut {
-                value: equal_output_amount,
-                script_pubkey: proposer_equal_addr.script_pubkey(),
-            },
-            // Change output: to proposer
-            TxOut {
-                value: change_amount,
-                script_pubkey: proposer_change_addr.script_pubkey(),
-            },
-        ];
+        // Build outputs vector - drop change if below min_change_output_size
+        let (outputs, actual_fee) = if change_amount.to_sat() < min_change_output_size {
+            // Change is above dust but below min_change_output_size - drop it and bump fee
+            tracing::info!(
+                "💸 Change output {} sats is below min_change_output_size {} sats - dropping and bumping miner fee",
+                change_amount.to_sat(), min_change_output_size
+            );
+
+            // Recalculate fee for 2-output transaction (no change)
+            let weight_units_2_outputs = 42 + (230 * 2) + (172 * 2); // = 846 WU
+            let estimated_vsize_2_outputs = (weight_units_2_outputs + 3) / 4; // = 212 vbytes
+            let estimated_fee_2_outputs = fee_rate.fee_vb(estimated_vsize_2_outputs)
+                .ok_or_else(|| anyhow::anyhow!("Fee calculation overflow"))?;
+
+            // Actual fee will be: estimated_fee_2_outputs + change_amount
+            let actual_fee = estimated_fee_2_outputs + change_amount;
+
+            let outputs = vec![
+                // Equal output 1: to receiver (tweaked)
+                TxOut {
+                    value: equal_output_amount,
+                    script_pubkey: tweaked_output.script_pubkey,
+                },
+                // Equal output 2: to proposer
+                TxOut {
+                    value: equal_output_amount,
+                    script_pubkey: proposer_equal_addr.script_pubkey(),
+                },
+            ];
+            (outputs, actual_fee)
+        } else {
+            // Change is above min_change_output_size - include it
+            let outputs = vec![
+                // Equal output 1: to receiver (tweaked)
+                TxOut {
+                    value: equal_output_amount,
+                    script_pubkey: tweaked_output.script_pubkey,
+                },
+                // Equal output 2: to proposer
+                TxOut {
+                    value: equal_output_amount,
+                    script_pubkey: proposer_equal_addr.script_pubkey(),
+                },
+                // Change output: to proposer
+                TxOut {
+                    value: change_amount,
+                    script_pubkey: proposer_change_addr.script_pubkey(),
+                },
+            ];
+            (outputs, estimated_fee_3_outputs)
+        };
 
         // Randomize output order for privacy
         let mut rng = rand::thread_rng();
+        let mut outputs = outputs; // Make mutable for shuffle
         outputs.shuffle(&mut rng);
 
-        Ok((outputs, estimated_fee))
+        Ok((outputs, actual_fee))
     }
 
     /// Build a PSBT for a SNICKER transaction
@@ -455,6 +497,7 @@ impl Snicker {
     /// * `proposer_change_addr` - Address for proposer's change output
     /// * `delta_sats` - Fee adjustment (positive = receiver pays, negative = proposer incentivizes)
     /// * `fee_rate` - Fee rate for the transaction
+    /// * `min_change_output_size` - Minimum UTXO size to create (change below this bumps fee)
     fn build_psbt(
         &self,
         target_tx: &Transaction,
@@ -466,6 +509,7 @@ impl Snicker {
         proposer_change_addr: bdk_wallet::bitcoin::Address,
         delta_sats: i64,
         fee_rate: bdk_wallet::bitcoin::FeeRate,
+        min_change_output_size: u64,
     ) -> Result<Psbt> {
         use bdk_wallet::bitcoin::{Transaction as BdkTransaction, TxIn, Sequence, Witness};
         use bdk_wallet::bitcoin::transaction::Version;
@@ -483,6 +527,7 @@ impl Snicker {
             tweaked_output,
             proposer_equal_addr.clone(),
             proposer_change_addr.clone(),
+            min_change_output_size,
         )?;
 
         // Build the transaction
@@ -1992,6 +2037,106 @@ mod tests {
         // Balance should now be 0 (spent UTXOs excluded)
         let balance = snicker.get_snicker_balance().await.unwrap();
         assert_eq!(balance, 0);
+    }
+
+    #[tokio::test]
+    async fn test_small_change_dropped() {
+        use bdk_wallet::bitcoin::{Network, FeeRate, Amount, TxOut, Address, OutPoint, Transaction, TxIn, Witness};
+        use bdk_wallet::bitcoin::secp256k1::{Secp256k1, rand};
+        use bdk_wallet::bitcoin::transaction::Version;
+        use bdk_wallet::bitcoin::locktime::absolute::LockTime;
+        use bdk_wallet::bitcoin::Sequence;
+
+        let snicker = create_test_snicker();
+        let secp = Secp256k1::new();
+        let mut rng = rand::thread_rng();
+
+        // Create a receiver UTXO (10000 sats)
+        let receiver_internal_key = bdk_wallet::bitcoin::secp256k1::SecretKey::new(&mut rng).x_only_public_key(&secp).0;
+        let receiver_script = ScriptBuf::new_p2tr(&secp, receiver_internal_key, None);
+        let receiver_output = TxOut {
+            value: Amount::from_sat(10000),
+            script_pubkey: receiver_script.clone(),
+        };
+
+        // Create receiver's target transaction
+        let target_tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![],
+            output: vec![receiver_output.clone()],
+        };
+
+        // Set delta such that equal outputs are 9000 sats (10000 - 1000)
+        let delta_sats = 1000i64;
+        let equal_output_sats = 10000 - delta_sats; // = 9000 sats
+
+        // Fee rate: 10 sat/vB
+        // Fee for 2 inputs + 3 outputs = 255 vB × 10 = 2550 sats
+        // Fee for 2 inputs + 2 outputs = 212 vB × 10 = 2120 sats
+        let fee_rate = FeeRate::from_sat_per_vb(10).unwrap();
+        let fee_3_outputs = 255 * 10; // 2550 sats
+        let fee_2_outputs = 212 * 10; // 2120 sats
+
+        // Calculate proposer UTXO size needed to create change between 546 and 2730
+        // Total out (2 equal outputs) = 2 × 9000 = 18000
+        // Total in = receiver (10000) + proposer_amount
+        // Change = total_in - total_out - fee_3_outputs
+        //        = 10000 + proposer_amount - 18000 - 2550
+        //        = proposer_amount - 10550
+        // We want: 546 ≤ change < 2730
+        // So: 546 ≤ proposer_amount - 10550 < 2730
+        //     11096 ≤ proposer_amount < 13280
+        // Let's use 11500, which gives change = 950 sats
+        let proposer_amount = Amount::from_sat(11500);
+        let expected_change_3_outputs = 10000 + 11500 - 18000 - fee_3_outputs;
+        println!("Expected change with 3 outputs: {} sats", expected_change_3_outputs);
+        assert!(expected_change_3_outputs >= 546 && expected_change_3_outputs < 2730,
+                "Test setup error: change should be between 546 and 2730");
+
+        // Create proposer UTXO and addresses
+        let proposer_internal_key = bdk_wallet::bitcoin::secp256k1::SecretKey::new(&mut rng).x_only_public_key(&secp).0;
+        let proposer_script = ScriptBuf::new_p2tr(&secp, proposer_internal_key, None);
+        let proposer_txout = TxOut {
+            value: proposer_amount,
+            script_pubkey: proposer_script,
+        };
+
+        let proposer_equal_addr = Address::from_script(&receiver_script, Network::Regtest).unwrap();
+        let proposer_change_addr = Address::from_script(&receiver_script, Network::Regtest).unwrap();
+
+        // Call build_equal_outputs_structure with min_change_output_size
+        let min_change_output_size = crate::config::DEFAULT_MIN_CHANGE_OUTPUT_SIZE;
+        let result = Snicker::build_equal_outputs_structure(
+            &receiver_output,
+            proposer_amount,
+            delta_sats,
+            fee_rate,
+            receiver_output.clone(), // tweaked_output (simplified for test)
+            proposer_equal_addr,
+            proposer_change_addr,
+            min_change_output_size,
+        );
+
+        assert!(result.is_ok(), "Should succeed with valid inputs");
+        let (outputs, actual_fee) = result.unwrap();
+
+        // Verify: should have only 2 outputs (no change)
+        assert_eq!(outputs.len(), 2, "Should have 2 outputs (no change output)");
+
+        // Verify: both outputs are equal-sized (9000 sats each)
+        for output in &outputs {
+            assert_eq!(output.value.to_sat(), 9000, "Both outputs should be 9000 sats");
+        }
+
+        // Verify: actual fee should be approximately fee_2_outputs + change_amount
+        // expected_actual_fee = 2120 + 950 = 3070 sats
+        let expected_actual_fee = fee_2_outputs + expected_change_3_outputs as u64;
+        assert_eq!(actual_fee.to_sat(), expected_actual_fee,
+                   "Actual fee should be base fee + dropped change amount");
+
+        println!("✅ Test passed: change output {} sats was dropped, fee bumped to {} sats",
+                 expected_change_3_outputs, actual_fee.to_sat());
     }
 
 }
