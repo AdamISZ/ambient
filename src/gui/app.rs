@@ -68,6 +68,13 @@ impl AmbientApp {
         use std::time::{Duration, Instant};
         use iced::futures::StreamExt;
 
+        // Keyboard subscription - only when a modal is open that needs it
+        let keyboard_sub = if self.active_modal.is_some() {
+            Self::keyboard_subscription()
+        } else {
+            iced::Subscription::none()
+        };
+
         // Only subscribe to events when wallet is loaded
         match &self.state {
             AppState::WalletLoaded { manager, wallet_data, .. } => {
@@ -89,30 +96,20 @@ impl AmbientApp {
 
                             let receiver = receiver_opt.as_mut().unwrap();
 
-                            // Wait for next blockchain update event with timeout to prevent busy-waiting
-                            let result = tokio::time::timeout(
-                                Duration::from_millis(100),
-                                receiver.recv()
-                            ).await;
-
-                            match result {
-                                Ok(Ok(update)) => {
-                                    // Received an update
+                            // Wait for next blockchain update event
+                            match receiver.recv().await {
+                                Ok(update) => {
+                                    // Convert WalletUpdate to our Message
                                     Some((Message::BlockchainUpdate(update), receiver_opt))
                                 }
-                                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(n))) => {
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                                     // We missed some updates - that's OK, just get the next one
                                     tracing::warn!("Blockchain update subscription lagged by {} events", n);
                                     Some((Message::SyncRequested, receiver_opt))
                                 }
-                                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                                     // Channel closed - stop subscription
                                     None
-                                }
-                                Err(_timeout) => {
-                                    // Timeout - no update received, sleep briefly and continue
-                                    async_std::task::sleep(Duration::from_millis(100)).await;
-                                    Some((Message::Noop, receiver_opt))
                                 }
                             }
                         }
@@ -141,9 +138,9 @@ impl AmbientApp {
                 };
 
                 // Combine subscriptions
-                iced::Subscription::batch([balance_sub, automation_sub, Self::keyboard_subscription()])
+                iced::Subscription::batch([balance_sub, automation_sub, keyboard_sub])
             }
-            _ => Self::keyboard_subscription()
+            _ => keyboard_sub
         }
     }
 
@@ -173,11 +170,6 @@ impl AmbientApp {
 
     fn handle_message(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::Noop => {
-                // No-op message for subscription throttling
-                Task::none()
-            }
-
             Message::OpenModal(modal) => {
                 self.active_modal = Some(modal);
                 Task::none()

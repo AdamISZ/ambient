@@ -2413,9 +2413,22 @@ async fn trace_logs(
 ) {
     loop {
         select! {
-            warn = warn_rx.recv() => if let Some(warn) = warn { tracing::warn!("{warn}") },
+            warn = warn_rx.recv() => {
+                if let Some(warn) = warn {
+                    tracing::warn!("{warn}");
+                } else {
+                    // Channel closed, exit loop
+                    break;
+                }
+            },
             // Suppress info messages from Kyoto to reduce log spam
-            _info = info_rx.recv() => { /* Silently consume Kyoto info messages */ },
+            _info = info_rx.recv() => {
+                // If channel closed, exit loop
+                if _info.is_none() {
+                    break;
+                }
+            },
         }
     }
+    tracing::debug!("trace_logs task exiting");
 }
