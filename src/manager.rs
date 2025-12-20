@@ -54,9 +54,10 @@ impl Manager {
         network_str: &str,
         recovery_height: u32,
         password: &str,
+        peer: Option<String>,
     ) -> Result<Self> {
         // Load wallet and start node
-        let wallet_node = WalletNode::load(wallet_name, network_str, recovery_height, password).await?;
+        let wallet_node = WalletNode::load(wallet_name, network_str, recovery_height, password, peer).await?;
 
         // Initialize SNICKER with shared in-memory database
         let snicker_conn = wallet_node.get_snicker_conn();
@@ -336,8 +337,8 @@ impl Manager {
         // Derive our input private key (the proposer's input key used for SNICKER tweak)
         let our_input_privkey = self.wallet_node.derive_utxo_privkey(&our_utxo)?;
 
-        // Get fee rate from wallet
-        let fee_rate = self.wallet_node.get_fee_rate();
+        // Get fee rate from wallet (uses real-time fee estimation)
+        let fee_rate = self.wallet_node.get_fee_rate().await;
 
         // Create signing callback that signs the proposer's input
         // Use block_in_place to allow blocking operations in async context

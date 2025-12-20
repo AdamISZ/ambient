@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use directories::ProjectDirs;
 use tokio::select;
 use tokio::sync::{Mutex, broadcast};
@@ -206,7 +206,7 @@ impl WalletNode {
         fs::write(&snicker_db_enc_path, snicker_db_encrypted)?;
         info!("💾 Created encrypted SNICKER database");
 
-        let node = Self::load(name, network_str, recovery_height, password).await?;
+        let node = Self::load(name, network_str, recovery_height, password, None).await?;
 
         Ok((node, mnemonic))
     }
@@ -229,6 +229,7 @@ impl WalletNode {
         network_str: &str,
         recovery_height: u32,
         password: &str,
+        peer: Option<String>,
     ) -> Result<Self> {
         let network = Self::parse_network(network_str)?;
         let (wallet_dir, wallet_db_enc_path, snicker_db_enc_path, mnemonic_path) =
@@ -265,7 +266,7 @@ impl WalletNode {
         tracing::info!("💾 Flushed wallet database after initial load/create");
 
         let (requester, update_subscriber) =
-            Self::start_node(&wallet, network, recovery_height, name).await?;
+            Self::start_node(&wallet, network, recovery_height, name, peer).await?;
 
         // Derive xprv from mnemonic for SNICKER operations
         let xkey: ExtendedKey = mnemonic.into_extended_key()?;
@@ -565,6 +566,7 @@ impl WalletNode {
         network: Network,
         from_height: u32,
         wallet_name: &str,
+        peer: Option<String>,
     ) -> Result<(bdk_kyoto::Requester, bdk_kyoto::UpdateSubscriber)> {
         use super::blockchain_data::{BlockchainDataProvider, MempoolSpaceApi};
 
@@ -612,26 +614,33 @@ impl WalletNode {
         info!("🔍 Scan type: Recovery with lookahead {}", RECOVERY_LOOKAHEAD);
         info!("🔍 ==========================================");
 
-        // Select peer based on network
-        let peer = match network {
-            Network::Regtest => {
-                // Connect to local regtest node
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 18444)
-            }
-            Network::Signet => {
-                // Public signet node (hardcoded fallback from Bitcoin Core)
-                // Source: https://github.com/bitcoin/bitcoin/blob/master/src/kernel/chainparams.cpp
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(178, 128, 221, 177)), 38333)
-            }
-            Network::Bitcoin | Network::Testnet => {
-                // TODO: Add mainnet/testnet peers
-                return Err(anyhow!("Mainnet/Testnet peers not configured yet"));
-            }
-            _ => {
-                return Err(anyhow!("Unsupported network: {:?}", network));
+        // Select peer: use configured peer if provided, otherwise use network default
+        let peer_addr = if let Some(peer_str) = peer {
+            // Parse configured peer
+            peer_str.parse::<SocketAddr>()
+                .with_context(|| format!("Invalid peer address: {}", peer_str))?
+        } else {
+            // Use network default
+            match network {
+                Network::Regtest => {
+                    // Connect to local regtest node
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 18444)
+                }
+                Network::Signet => {
+                    // Public signet node (hardcoded fallback from Bitcoin Core)
+                    // Source: https://github.com/bitcoin/bitcoin/blob/master/src/kernel/chainparams.cpp
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(178, 128, 221, 177)), 38333)
+                }
+                Network::Bitcoin | Network::Testnet => {
+                    // TODO: Add mainnet/testnet peers
+                    return Err(anyhow!("Mainnet/Testnet peers not configured yet"));
+                }
+                _ => {
+                    return Err(anyhow!("Unsupported network: {:?}", network));
+                }
             }
         };
-        info!("🔗 Connecting to peer: {}", peer);
+        info!("🔗 Connecting to peer: {}", peer_addr);
 
         // Create Kyoto peer database directory (unique per wallet to avoid conflicts)
         let project_dirs = ProjectDirs::from("org", "code", "ambient")
@@ -668,7 +677,7 @@ impl WalletNode {
             update_subscriber,
             node,
         } = Builder::new(network)
-            .add_peer(peer)
+            .add_peer(peer_addr)
             .required_peers(NUM_CONNECTIONS)
             .data_dir(kyoto_db_path_actual)  // This will be ignored anyway, but pass it for API compatibility
             .build_with_wallet(wallet, scan_type)
@@ -1913,16 +1922,27 @@ impl WalletNode {
 
     /// Get the current fee rate for transaction construction
     ///
-    /// TODO: Implement proper fee estimation by querying mempool or fee estimation service
-    pub fn get_fee_rate(&self) -> bdk_wallet::bitcoin::FeeRate {
-        // For now, return a conservative default
-        // In production, this should query:
-        // - Mempool.space API
-        // - Bitcoin Core estimatesmartfee
-        // - Electrum server fee estimation
-        // - Or allow user configuration
-        bdk_wallet::bitcoin::FeeRate::from_sat_per_vb(10)
-            .expect("valid default fee rate")
+    /// Uses the FeeEstimator to get real-time fee estimates from mempool.space.
+    /// Falls back to 10 sat/vB if estimation fails.
+    pub async fn get_fee_rate(&self) -> bdk_wallet::bitcoin::FeeRate {
+        // Estimate for 6 block confirmation (~1 hour)
+        match self.fee_estimator.estimate(6).await {
+            Ok(rate) => {
+                tracing::info!("📊 Using estimated fee rate: {:.2} sat/vB for ~6 blocks", rate);
+                // Convert f64 to u64, handling edge cases
+                let rate_sat_vb = if rate < 1.0 {
+                    tracing::warn!("Fee rate {:.2} sat/vB too low, using minimum 1 sat/vB", rate);
+                    1
+                } else {
+                    rate.ceil() as u64  // Round up to ensure confirmation
+                };
+                bdk_wallet::bitcoin::FeeRate::from_sat_per_vb(rate_sat_vb).unwrap()
+            }
+            Err(e) => {
+                tracing::warn!("Fee estimation failed: {}. Using fallback 10 sat/vB", e);
+                bdk_wallet::bitcoin::FeeRate::from_sat_per_vb(10).unwrap()
+            }
+        }
     }
 
     // ============================================================

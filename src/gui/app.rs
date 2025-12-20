@@ -394,6 +394,7 @@ impl AmbientApp {
                 let network = self.config.network.as_str().to_string();
                 let name = wallet_name.clone();
                 let recovery_height = self.config.recovery_height;
+                let peer = self.config.peer.clone();
                 let rt_handle = self.tokio_runtime.handle().clone();
 
                 // Close modal and set loading state
@@ -409,7 +410,7 @@ impl AmbientApp {
                 Task::perform(
                     async move {
                         rt_handle.spawn(async move {
-                            crate::manager::Manager::load(&name, &network, recovery_height, &password).await
+                            crate::manager::Manager::load(&name, &network, recovery_height, &password, peer).await
                         }).await.unwrap()
                     },
                     move |result| match result {

@@ -123,7 +123,7 @@ async fn main() -> Result<()> {
     };
 
     // delegate all user interactions to the CLI layer
-    cli::repl(network.as_str(), args.recovery_height, rpc_config).await?;
+    cli::repl(network.as_str(), args.recovery_height, rpc_config, config.peer).await?;
 
     Ok(())
 }

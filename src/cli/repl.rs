@@ -88,6 +88,7 @@ pub async fn repl(
     network_str: &str,
     recovery_height: u32,
     rpc_config: Option<(String, String, String)>,
+    peer: Option<String>,
 ) -> Result<()> {
     println!("RustSnicker Wallet 🥷");
     println!("Type 'help' for commands.\n");
@@ -179,7 +180,7 @@ pub async fn repl(
                     };
 
                     println!("📁 Loading wallet '{name}' …");
-                    match Manager::load(name, network_str, recovery_height, &password).await {
+                    match Manager::load(name, network_str, recovery_height, &password, peer.clone()).await {
                         Ok(mut manager) => {
                             // Configure RPC if provided
                             if let Some((ref url, ref user, ref password)) = rpc_config {
