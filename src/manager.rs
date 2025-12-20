@@ -635,9 +635,10 @@ impl Manager {
     /// Serialize an encrypted proposal to a string format (for file storage/network sharing)
     pub fn serialize_encrypted_proposal(&self, proposal: &EncryptedProposal) -> String {
         format!(
-            "{{\n  \"ephemeral_pubkey\": \"{}\",\n  \"tag\": \"{}\",\n  \"encrypted_data\": \"{}\"\n}}",
+            "{{\n  \"ephemeral_pubkey\": \"{}\",\n  \"tag\": \"{}\",\n  \"version\": {},\n  \"encrypted_data\": \"{}\"\n}}",
             proposal.ephemeral_pubkey,
             ::hex::encode(&proposal.tag),
+            proposal.version,
             ::hex::encode(&proposal.encrypted_data)
         )
     }
@@ -658,6 +659,12 @@ impl Manager {
             .and_then(|l| l.split('"').nth(3))
             .ok_or_else(|| anyhow::anyhow!("Missing tag"))?;
 
+        let version_str = serialized
+            .lines()
+            .find(|l| l.contains("\"version\""))
+            .and_then(|l| l.split(':').nth(1))
+            .and_then(|s| s.trim().trim_end_matches(',').parse::<u8>().ok());
+
         let encrypted_data_hex = serialized
             .lines()
             .find(|l| l.contains("encrypted_data"))
@@ -676,9 +683,13 @@ impl Manager {
         let mut tag = [0u8; 8];
         tag.copy_from_slice(&tag_bytes);
 
+        // Default to v1 if not specified (backward compatibility)
+        let version = version_str.unwrap_or(crate::snicker::SNICKER_VERSION_V1);
+
         let proposal = EncryptedProposal {
             ephemeral_pubkey: pubkey,
             tag,
+            version,
             encrypted_data,
         };
 

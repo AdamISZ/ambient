@@ -1,3 +1,4 @@
+mod blockchain_data;
 mod manager;
 mod snicker;
 mod cli;

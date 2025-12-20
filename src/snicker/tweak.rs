@@ -377,6 +377,62 @@ pub fn decrypt_proposal(encrypted: &[u8], shared_secret: &[u8; 32]) -> Result<Ve
     Ok(plaintext)
 }
 
+/// Encrypt a proposal using ChaCha20-Poly1305 with v1 format (includes flags)
+///
+/// # Arguments
+/// * `plaintext` - The proposal data to encrypt
+/// * `flags` - Feature flags (4 bytes, prepended to plaintext before encryption)
+/// * `shared_secret` - The 32-byte DH shared secret
+///
+/// # Returns
+/// Encrypted data: [nonce:12][ciphertext:variable]
+/// where ciphertext encrypts [flags:4][plaintext]
+pub fn encrypt_proposal_v1(
+    plaintext: &[u8],
+    flags: u32,
+    shared_secret: &[u8; 32],
+) -> Result<Vec<u8>> {
+    // Prepend flags to plaintext
+    let mut data = Vec::with_capacity(4 + plaintext.len());
+    data.extend_from_slice(&flags.to_be_bytes());
+    data.extend_from_slice(plaintext);
+
+    // Encrypt [flags || plaintext] using existing function
+    encrypt_proposal(&data, shared_secret)
+}
+
+/// Decrypt a v1 proposal and extract flags
+///
+/// # Arguments
+/// * `encrypted` - The encrypted data (nonce || ciphertext || tag)
+/// * `shared_secret` - The 32-byte DH shared secret
+///
+/// # Returns
+/// Tuple of (flags, proposal_data)
+pub fn decrypt_proposal_v1(
+    encrypted: &[u8],
+    shared_secret: &[u8; 32],
+) -> Result<(u32, Vec<u8>)> {
+    // Decrypt using existing function
+    let plaintext = decrypt_proposal(encrypted, shared_secret)?;
+
+    // Extract flags (first 4 bytes)
+    if plaintext.len() < 4 {
+        return Err(anyhow!("Decrypted data too short (need at least 4 bytes for flags)"));
+    }
+
+    let flags = u32::from_be_bytes([
+        plaintext[0],
+        plaintext[1],
+        plaintext[2],
+        plaintext[3],
+    ]);
+
+    let proposal_data = plaintext[4..].to_vec();
+
+    Ok((flags, proposal_data))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -677,6 +733,87 @@ mod tests {
             println!("   ✅ Both parity scenarios tested!");
         } else {
             println!("   ⚠️  Only one parity scenario occurred. Re-run test for better coverage.");
+        }
+    }
+
+    #[test]
+    fn test_encrypt_decrypt_proposal_v1() {
+        // Create test data
+        let plaintext = b"Test proposal data";
+        let flags = 0x12345678u32;
+        let shared_secret = [0xAA; 32];
+
+        // Encrypt with v1 format
+        let encrypted = encrypt_proposal_v1(plaintext, flags, &shared_secret).unwrap();
+
+        // Decrypt with v1 format
+        let (decrypted_flags, decrypted_plaintext) = decrypt_proposal_v1(&encrypted, &shared_secret).unwrap();
+
+        // Verify
+        assert_eq!(decrypted_flags, flags);
+        assert_eq!(decrypted_plaintext, plaintext);
+    }
+
+    #[test]
+    fn test_encrypt_proposal_v1_with_zero_flags() {
+        let plaintext = b"Another test";
+        let flags = 0x00000000u32;
+        let shared_secret = [0xBB; 32];
+
+        let encrypted = encrypt_proposal_v1(plaintext, flags, &shared_secret).unwrap();
+        let (decrypted_flags, decrypted_plaintext) = decrypt_proposal_v1(&encrypted, &shared_secret).unwrap();
+
+        assert_eq!(decrypted_flags, 0);
+        assert_eq!(decrypted_plaintext, plaintext);
+    }
+
+    #[test]
+    fn test_decrypt_proposal_v1_wrong_key_fails() {
+        let plaintext = b"Secret data";
+        let flags = 0x00000001u32;
+        let shared_secret = [0xCC; 32];
+        let wrong_secret = [0xDD; 32];
+
+        let encrypted = encrypt_proposal_v1(plaintext, flags, &shared_secret).unwrap();
+
+        // Try to decrypt with wrong key
+        let result = decrypt_proposal_v1(&encrypted, &wrong_secret);
+
+        // Should fail (authentication tag won't match)
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decrypt_proposal_v1_too_short() {
+        let shared_secret = [0xEE; 32];
+
+        // Create encrypted data that's too short (less than 4 bytes after decryption)
+        let too_short = vec![0xFF; 3];
+
+        let result = decrypt_proposal_v1(&too_short, &shared_secret);
+
+        // Should fail because we can't extract 4-byte flags
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_encrypt_proposal_v1_flags_serialization() {
+        let plaintext = b"Test";
+        let shared_secret = [0xFF; 32];
+
+        // Test various flag values
+        let test_flags = [
+            0x00000000,
+            0x00000001,
+            0x12345678,
+            0xFFFFFFFF,
+            0xDEADBEEF,
+        ];
+
+        for &flags in &test_flags {
+            let encrypted = encrypt_proposal_v1(plaintext, flags, &shared_secret).unwrap();
+            let (decrypted_flags, _) = decrypt_proposal_v1(&encrypted, &shared_secret).unwrap();
+            assert_eq!(decrypted_flags, flags, "Flag value 0x{:08x} not preserved", flags);
         }
     }
 }

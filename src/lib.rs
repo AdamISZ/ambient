@@ -3,14 +3,15 @@
 
 extern crate hex;
 
-pub mod manager;
+pub mod blockchain_data;
+pub mod encryption;
+pub mod fee;
 pub mod snicker;
 pub mod wallet_node;
+pub mod manager;
 pub mod cli;
 pub mod config;
 pub mod automation;
-pub mod encryption;
-pub mod fee;
 
 // GUI module - only include if iced feature is enabled
 #[cfg(feature = "gui")]

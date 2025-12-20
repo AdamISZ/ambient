@@ -38,12 +38,85 @@ mod validation_tests;
 use std::sync::{Arc, Mutex};
 use std::str::FromStr;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use bdk_wallet::{
     bitcoin::{Network, OutPoint, Transaction, TxOut, Txid, psbt::Psbt, secp256k1::PublicKey},
     rusqlite::Connection,
 };
 use serde::{Serialize, Deserialize};
+
+// ============================================================
+// SNICKER PROPOSAL VERSIONING
+// ============================================================
+
+/// Magic bytes identifying a SNICKER proposal: "SNIC" in ASCII
+/// Used to prevent false positives when scanning files/network data
+pub const SNICKER_MAGIC: [u8; 4] = [0x53, 0x4E, 0x49, 0x43];
+
+/// Current proposal format version
+pub const SNICKER_VERSION_V1: u8 = 0x01;
+
+/// Proposal feature flags (reserved for future use)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProposalFlags(pub u32);
+
+impl ProposalFlags {
+    /// No flags set (current default)
+    pub const NONE: u32 = 0x00000000;
+
+    // Reserved for future features:
+    // pub const FEATURE_RBF: u32           = 0x00000001; // Opt-in RBF
+    // pub const FEATURE_TAPROOT_ONLY: u32  = 0x00000002; // All inputs are Taproot
+    // pub const FEATURE_BATCH: u32         = 0x00000004; // Part of batch proposal
+    // pub const FEATURE_TIME_LOCKED: u32   = 0x00000008; // Contains time locks
+
+    pub fn new(flags: u32) -> Self {
+        ProposalFlags(flags)
+    }
+
+    pub fn none() -> Self {
+        ProposalFlags(Self::NONE)
+    }
+}
+
+/// Validate proposal header (magic + version)
+/// Returns the version if valid, or an error
+pub fn validate_proposal_header(bytes: &[u8]) -> Result<u8> {
+    if bytes.len() < 5 {
+        return Err(anyhow!("Proposal too short (need at least 5 bytes for header)"));
+    }
+
+    // Check magic bytes
+    if &bytes[0..4] != SNICKER_MAGIC {
+        return Err(anyhow!(
+            "Invalid magic bytes: expected 'SNIC' (0x534E4943), got {:02x}{:02x}{:02x}{:02x}",
+            bytes[0], bytes[1], bytes[2], bytes[3]
+        ));
+    }
+
+    let version = bytes[4];
+
+    // Validate version
+    match version {
+        SNICKER_VERSION_V1 => Ok(version),
+        _ => Err(anyhow!("Unsupported proposal version: 0x{:02x}", version)),
+    }
+}
+
+/// Extract proposal blob (after magic+version header)
+pub fn extract_proposal_blob(bytes: &[u8]) -> Result<Vec<u8>> {
+    validate_proposal_header(bytes)?;
+    Ok(bytes[5..].to_vec())
+}
+
+/// Prepend magic+version to proposal blob for transmission/storage
+pub fn wrap_proposal_blob(version: u8, encrypted_data: &[u8]) -> Vec<u8> {
+    let mut wrapped = Vec::with_capacity(5 + encrypted_data.len());
+    wrapped.extend_from_slice(&SNICKER_MAGIC);
+    wrapped.push(version);
+    wrapped.extend_from_slice(encrypted_data);
+    wrapped
+}
 
 // ============================================================
 // SNICKER TRANSACTION FILTERS
@@ -112,7 +185,10 @@ pub struct EncryptedProposal {
     pub ephemeral_pubkey: PublicKey,
     /// Tag for efficient matching (first 8 bytes of hash of shared secret)
     pub tag: [u8; 8],
-    /// Encrypted Proposal data
+    /// Proposal format version (prepended to encrypted_data on wire)
+    pub version: u8,
+    /// Encrypted Proposal data (contains [flags:4 bytes][proposal_bytes])
+    /// Wire format: [MAGIC:4][version:1][encrypted_data]
     pub encrypted_data: Vec<u8>,
 }
 
@@ -300,11 +376,15 @@ impl Snicker {
         // 9. Serialize and encrypt the proposal (contains partially-signed PSBT)
         // After decryption, receiver will extract proposer's input key from PSBT witness
         let proposal_bytes = serde_json::to_vec(&proposal)?;
-        let encrypted_data = tweak::encrypt_proposal(&proposal_bytes, &encryption_shared_secret)?;
+
+        // Use v1 encryption with flags (currently no flags set)
+        let flags = ProposalFlags::none().0;
+        let encrypted_data = tweak::encrypt_proposal_v1(&proposal_bytes, flags, &encryption_shared_secret)?;
 
         let encrypted_proposal = EncryptedProposal {
             ephemeral_pubkey,
             tag,
+            version: SNICKER_VERSION_V1,
             encrypted_data,
         };
 
@@ -1101,7 +1181,7 @@ impl Snicker {
     ) -> Result<Proposal>
     {
         use crate::snicker::tweak::{
-            calculate_dh_shared_secret, compute_proposal_tag, decrypt_proposal,
+            calculate_dh_shared_secret, compute_proposal_tag, decrypt_proposal_v1,
         };
 
         // Calculate shared secret = ECDH(tweaked_privkey, ephemeral_pubkey)
@@ -1115,8 +1195,13 @@ impl Snicker {
             return Err(anyhow::anyhow!("Tag mismatch - proposal not for this SNICKER UTXO"));
         }
 
-        // Decrypt the proposal
-        let decrypted_bytes = decrypt_proposal(&encrypted.encrypted_data, &shared_secret)?;
+        // Decrypt the proposal (v1 format with flags)
+        let (flags, decrypted_bytes) = decrypt_proposal_v1(&encrypted.encrypted_data, &shared_secret)?;
+
+        // Log flags if any are set (currently should be 0)
+        if flags != ProposalFlags::NONE {
+            tracing::info!("📋 Proposal has flags set: 0x{:08x}", flags);
+        }
 
         // Deserialize the proposal
         let proposal = serde_json::from_slice::<Proposal>(&decrypted_bytes)?;
@@ -1136,7 +1221,7 @@ impl Snicker {
         F: Fn(&crate::wallet_node::WalletUtxo) -> Result<bdk_wallet::bitcoin::secp256k1::SecretKey>,
     {
         use crate::snicker::tweak::{
-            calculate_dh_shared_secret, compute_proposal_tag, decrypt_proposal,
+            calculate_dh_shared_secret, compute_proposal_tag, decrypt_proposal_v1,
         };
 
         // Get secret key for this UTXO using unified derivation
@@ -1153,8 +1238,13 @@ impl Snicker {
             return Err(anyhow::anyhow!("Tag mismatch - proposal not for this UTXO"));
         }
 
-        // Try to decrypt
-        let decrypted_bytes = decrypt_proposal(&encrypted.encrypted_data, &shared_secret)?;
+        // Try to decrypt (v1 format with flags)
+        let (flags, decrypted_bytes) = decrypt_proposal_v1(&encrypted.encrypted_data, &shared_secret)?;
+
+        // Log flags if any are set (currently should be 0)
+        if flags != ProposalFlags::NONE {
+            tracing::info!("📋 Proposal has flags set: 0x{:08x}", flags);
+        }
 
         // Deserialize the proposal
         let proposal = serde_json::from_slice::<Proposal>(&decrypted_bytes)?;
@@ -1857,6 +1947,7 @@ mod tests {
         let proposal = EncryptedProposal {
             ephemeral_pubkey,
             tag: [0xAA; 8],
+            version: SNICKER_VERSION_V1,
             encrypted_data: vec![1, 2, 3, 4, 5],
         };
 
@@ -1881,6 +1972,7 @@ mod tests {
             let proposal = EncryptedProposal {
                 ephemeral_pubkey,
                 tag: [i as u8; 8],
+                version: SNICKER_VERSION_V1,
                 encrypted_data: vec![i as u8; 10],
             };
 
@@ -2137,6 +2229,128 @@ mod tests {
 
         println!("✅ Test passed: change output {} sats was dropped, fee bumped to {} sats",
                  expected_change_3_outputs, actual_fee.to_sat());
+    }
+
+    // ============================================================
+    // VERSIONING TESTS
+    // ============================================================
+
+    #[test]
+    fn test_magic_bytes_constant() {
+        assert_eq!(SNICKER_MAGIC, [0x53, 0x4E, 0x49, 0x43]); // "SNIC"
+        assert_eq!(SNICKER_VERSION_V1, 0x01);
+    }
+
+    #[test]
+    fn test_validate_proposal_header_valid() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&SNICKER_MAGIC);
+        data.push(SNICKER_VERSION_V1);
+        data.extend_from_slice(&[0xAA; 10]); // Some encrypted data
+
+        let result = validate_proposal_header(&data);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), SNICKER_VERSION_V1);
+    }
+
+    #[test]
+    fn test_validate_proposal_header_too_short() {
+        let data = vec![0x53, 0x4E, 0x49]; // Only 3 bytes
+        let result = validate_proposal_header(&data);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("too short"));
+    }
+
+    #[test]
+    fn test_validate_proposal_header_invalid_magic() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]); // Wrong magic
+        data.push(SNICKER_VERSION_V1);
+        data.extend_from_slice(&[0xAA; 10]);
+
+        let result = validate_proposal_header(&data);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Invalid magic bytes"));
+    }
+
+    #[test]
+    fn test_validate_proposal_header_unknown_version() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&SNICKER_MAGIC);
+        data.push(0x99); // Unknown version
+        data.extend_from_slice(&[0xAA; 10]);
+
+        let result = validate_proposal_header(&data);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Unsupported proposal version"));
+    }
+
+    #[test]
+    fn test_extract_proposal_blob() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&SNICKER_MAGIC);
+        data.push(SNICKER_VERSION_V1);
+        let encrypted_data = vec![0xAA, 0xBB, 0xCC, 0xDD];
+        data.extend_from_slice(&encrypted_data);
+
+        let result = extract_proposal_blob(&data);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), encrypted_data);
+    }
+
+    #[test]
+    fn test_wrap_proposal_blob() {
+        let encrypted_data = vec![0xAA, 0xBB, 0xCC, 0xDD];
+        let wrapped = wrap_proposal_blob(SNICKER_VERSION_V1, &encrypted_data);
+
+        // Should be: magic (4) + version (1) + data (4) = 9 bytes
+        assert_eq!(wrapped.len(), 9);
+        assert_eq!(&wrapped[0..4], &SNICKER_MAGIC);
+        assert_eq!(wrapped[4], SNICKER_VERSION_V1);
+        assert_eq!(&wrapped[5..], &encrypted_data[..]);
+    }
+
+    #[test]
+    fn test_proposal_flags_creation() {
+        let flags = ProposalFlags::none();
+        assert_eq!(flags.0, 0x00000000);
+
+        let flags = ProposalFlags::new(0x12345678);
+        assert_eq!(flags.0, 0x12345678);
+
+        let flags = ProposalFlags(ProposalFlags::NONE);
+        assert_eq!(flags.0, 0);
+    }
+
+    #[test]
+    fn test_round_trip_wrap_extract() {
+        let original_data = vec![0x01, 0x02, 0x03, 0x04, 0x05];
+        let wrapped = wrap_proposal_blob(SNICKER_VERSION_V1, &original_data);
+        let extracted = extract_proposal_blob(&wrapped).unwrap();
+
+        assert_eq!(extracted, original_data);
+    }
+
+    #[test]
+    fn test_encrypted_proposal_with_version() {
+        use bdk_wallet::bitcoin::secp256k1::{Secp256k1, SecretKey};
+
+        let secp = Secp256k1::new();
+        let mut rng = bdk_wallet::bitcoin::secp256k1::rand::thread_rng();
+
+        let ephemeral_key = SecretKey::new(&mut rng);
+        let ephemeral_pubkey = ephemeral_key.public_key(&secp);
+
+        let proposal = EncryptedProposal {
+            ephemeral_pubkey,
+            tag: [0xAA; 8],
+            version: SNICKER_VERSION_V1,
+            encrypted_data: vec![1, 2, 3, 4, 5],
+        };
+
+        assert_eq!(proposal.version, SNICKER_VERSION_V1);
+        assert_eq!(proposal.tag, [0xAA; 8]);
+        assert_eq!(proposal.encrypted_data, vec![1, 2, 3, 4, 5]);
     }
 
 }

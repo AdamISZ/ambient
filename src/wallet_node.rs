@@ -260,8 +260,12 @@ impl WalletNode {
 
         let (wallet, conn) = Self::load_or_create_wallet(&mnemonic, network, conn)?;
 
+        // Flush wallet database to encrypted file after initial load/create
+        wallet_db.flush(&conn)?;
+        tracing::info!("💾 Flushed wallet database after initial load/create");
+
         let (requester, update_subscriber) =
-            Self::start_node(&wallet, network, recovery_height, name)?;
+            Self::start_node(&wallet, network, recovery_height, name).await?;
 
         // Derive xprv from mnemonic for SNICKER operations
         let xkey: ExtendedKey = mnemonic.into_extended_key()?;
@@ -300,6 +304,7 @@ impl WalletNode {
         // Spawn background task to auto-sync
         let wallet_clone = wallet.clone();
         let conn_clone = conn.clone();
+        let wallet_db_clone = wallet_db.clone();
         let sub_clone = update_subscriber.clone();
         let snicker_conn_clone = snicker_conn.clone();
         let snicker_db_clone = snicker_db.clone();
@@ -313,6 +318,7 @@ impl WalletNode {
             Self::background_sync(
                 wallet_clone,
                 conn_clone,
+                wallet_db_clone,
                 sub_clone,
                 snicker_conn_clone,
                 snicker_db_clone,
@@ -443,6 +449,28 @@ impl WalletNode {
         info!("   External: {} chars", external_desc_static.len());
         info!("   Internal: {} chars", internal_desc_static.len());
 
+        // DEBUG: Check what tables exist in the database
+        let tables: Vec<String> = conn.prepare("SELECT name FROM sqlite_master WHERE type='table'")?
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        info!("🔍 Database tables: {:?}", tables);
+
+        // DEBUG: Check if there's any chain data (BDK stores chain state in bdk_blocks)
+        if tables.contains(&"bdk_blocks".to_string()) {
+            let count: i64 = conn.query_row("SELECT COUNT(*) FROM bdk_blocks", [], |row| row.get(0))?;
+            info!("🔍 bdk_blocks table has {} rows", count);
+
+            // Also check if there's a tip (highest block)
+            if count > 0 {
+                let tip_height: Option<u32> = conn.query_row(
+                    "SELECT MAX(height) FROM bdk_blocks",
+                    [],
+                    |row| row.get(0)
+                ).ok();
+                info!("🔍 Highest block in database: {:?}", tip_height);
+            }
+        }
+
         let maybe_wallet = Wallet::load()
             .descriptor(KeychainKind::External, Some(external_desc_static))
             .descriptor(KeychainKind::Internal, Some(internal_desc_static))
@@ -450,7 +478,7 @@ impl WalletNode {
             .check_network(network)
             .load_wallet(&mut conn)?;
 
-        info!("🔍 Wallet load completed");
+        info!("🔍 Wallet load result: {}", if maybe_wallet.is_some() { "Found existing wallet" } else { "No wallet found - will create new" });
 
         let wallet = if let Some(mut loaded) = maybe_wallet {
             info!("✅ Loaded existing wallet from database");
@@ -532,27 +560,45 @@ impl WalletNode {
         Ok((wallet, conn))
     }
 
-    fn start_node(
+    async fn start_node(
         wallet: &PersistedWallet<Connection>,
         network: Network,
         from_height: u32,
         wallet_name: &str,
     ) -> Result<(bdk_kyoto::Requester, bdk_kyoto::UpdateSubscriber)> {
+        use super::blockchain_data::{BlockchainDataProvider, MempoolSpaceApi};
+
         // Get checkpoint from wallet's local chain if it exists, otherwise use genesis or requested height
         let wallet_tip = wallet.local_chain().tip();
         let (checkpoint_height, checkpoint_hash) = if wallet_tip.height() > 0 {
             // Wallet has synced before, use its current tip
+            info!("📍 Wallet already synced to height {}, resuming from tip", wallet_tip.height());
             (wallet_tip.height(), wallet_tip.hash())
         } else if from_height == 0 {
             // New wallet starting from genesis
             use bdk_wallet::bitcoin::blockdata::constants::genesis_block;
+            info!("📍 New wallet starting from genesis (height 0)");
             (0, genesis_block(network).block_hash())
         } else {
-            // New wallet but requested non-zero height - use genesis anyway to avoid hash mismatch
-            // The wallet will sync from genesis to the current tip
-            use bdk_wallet::bitcoin::blockdata::constants::genesis_block;
-            tracing::warn!("Requested start from height {}, but using genesis to avoid checkpoint hash issues", from_height);
-            (0, genesis_block(network).block_hash())
+            // New wallet with requested recovery height - fetch block hash from API
+            info!("📍 New wallet requesting recovery from height {}, fetching block hash...", from_height);
+
+            let api = MempoolSpaceApi::new(network).with_timeout(15);
+            match api.get_block_hash(from_height).await {
+                Ok(block_hash) => {
+                    info!("✅ Successfully fetched block hash for height {}: {}", from_height, block_hash);
+                    (from_height, block_hash)
+                }
+                Err(e) => {
+                    // Fallback to genesis if API fails
+                    use bdk_wallet::bitcoin::blockdata::constants::genesis_block;
+                    tracing::warn!(
+                        "⚠️  Failed to fetch block hash for height {} ({}), falling back to genesis",
+                        from_height, e
+                    );
+                    (0, genesis_block(network).block_hash())
+                }
+            }
         };
 
         let checkpoint = HeaderCheckpoint::new(checkpoint_height, checkpoint_hash);
@@ -560,7 +606,11 @@ impl WalletNode {
             used_script_index: RECOVERY_LOOKAHEAD,
             checkpoint,
         };
-        info!("🔍 Recovery starting from height {} with hash {}", checkpoint_height, checkpoint_hash);
+        info!("🔍 ========== KYOTO SYNC STARTING ==========");
+        info!("🔍 Checkpoint height: {}", checkpoint_height);
+        info!("🔍 Checkpoint hash: {}", checkpoint_hash);
+        info!("🔍 Scan type: Recovery with lookahead {}", RECOVERY_LOOKAHEAD);
+        info!("🔍 ==========================================");
 
         // Select peer based on network
         let peer = match network {
@@ -587,14 +637,29 @@ impl WalletNode {
         let project_dirs = ProjectDirs::from("org", "code", "ambient")
             .ok_or_else(|| anyhow!("Cannot determine project dir"))?;
 
-        let kyoto_db_path = project_dirs
+        // WORKAROUND: bip157 crate ignores the data_dir parameter and always uses "./light_client_data/{network}/"
+        // relative to the current working directory. This is a known issue.
+        // For now, we'll just use the default path and document this limitation.
+        // TODO: File an issue upstream or patch bip157 to respect data_dir
+
+        let kyoto_db_path_intended = project_dirs
             .data_local_dir()
             .join(format!("{:?}", network).to_lowercase())
             .join(wallet_name)
             .join("kyoto_peers");
 
-        std::fs::create_dir_all(&kyoto_db_path)?;
-        info!("📁 Kyoto peer database: {:?}", kyoto_db_path);
+        // Create the directory anyway for future use
+        std::fs::create_dir_all(&kyoto_db_path_intended)?;
+
+        // Use the actual path that bip157 will use (./light_client_data/{network}/)
+        let kyoto_db_path_actual = std::path::PathBuf::from("light_client_data");
+        std::fs::create_dir_all(&kyoto_db_path_actual)?;
+
+        tracing::warn!(
+            "⚠️  Kyoto database location: {} (bip157 ignores our configured path: {})",
+            kyoto_db_path_actual.display(),
+            kyoto_db_path_intended.display()
+        );
 
         let LightClient {
             requester,
@@ -605,7 +670,7 @@ impl WalletNode {
         } = Builder::new(network)
             .add_peer(peer)
             .required_peers(NUM_CONNECTIONS)
-            .data_dir(kyoto_db_path)
+            .data_dir(kyoto_db_path_actual)  // This will be ignored anyway, but pass it for API compatibility
             .build_with_wallet(wallet, scan_type)
             .unwrap();
 
@@ -629,6 +694,7 @@ impl WalletNode {
     async fn background_sync(
         wallet: Arc<Mutex<PersistedWallet<Connection>>>,
         conn: Arc<Mutex<Connection>>,
+        wallet_db: crate::encryption::EncryptedMemoryDb,
         update_subscriber: Arc<Mutex<bdk_kyoto::UpdateSubscriber>>,
         snicker_conn: Arc<std::sync::Mutex<Connection>>,
         snicker_db: crate::encryption::EncryptedMemoryDb,
@@ -681,6 +747,11 @@ impl WalletNode {
 
                     if let Err(e) = wallet_guard.persist(&mut conn_guard) {
                         tracing::error!("Failed to persist wallet: {e}");
+                    }
+
+                    // Flush in-memory database to encrypted file immediately
+                    if let Err(e) = wallet_db.flush(&*conn_guard) {
+                        tracing::error!("Failed to flush wallet database: {e}");
                     }
 
                     let height = wallet_guard.local_chain().tip().height();

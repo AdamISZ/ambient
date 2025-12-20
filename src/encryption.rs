@@ -267,9 +267,10 @@ impl EncryptedMemoryDb {
         let mut memory_conn = rusqlite::Connection::open_in_memory()?;
 
         // Use backup API to copy temp DB → memory DB
+        // Use large page count (1000) and no sleep (0ms) since we have exclusive access
         {
             let backup = rusqlite::backup::Backup::new(&temp_conn, &mut memory_conn)?;
-            backup.run_to_completion(5, std::time::Duration::from_millis(250), None)?;
+            backup.run_to_completion(1000, std::time::Duration::from_millis(0), None)?;
             // backup dropped here, releasing borrows
         }
 
@@ -297,9 +298,10 @@ impl EncryptedMemoryDb {
         let mut temp_conn = rusqlite::Connection::open(temp_file.path())?;
 
         // Use backup API to copy memory DB → temp file
+        // Use large page count (1000) and no sleep (0ms) since we have exclusive access
         {
             let backup = rusqlite::backup::Backup::new(conn, &mut temp_conn)?;
-            backup.run_to_completion(5, std::time::Duration::from_millis(250), None)?;
+            backup.run_to_completion(1000, std::time::Duration::from_millis(0), None)?;
             // backup dropped here, releasing borrows
         }
 

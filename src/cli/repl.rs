@@ -14,9 +14,10 @@ use std::str::FromStr;
 /// Format an EncryptedProposal for display with hex-encoded data
 fn format_encrypted_proposal(proposal: &EncryptedProposal) -> String {
     format!(
-        "{{\n  \"ephemeral_pubkey\": \"{}\",\n  \"tag\": \"{}\",\n  \"encrypted_data\": \"{}\"\n}}",
+        "{{\n  \"ephemeral_pubkey\": \"{}\",\n  \"tag\": \"{}\",\n  \"version\": {},\n  \"encrypted_data\": \"{}\"\n}}",
         proposal.ephemeral_pubkey,
         ::hex::encode(&proposal.tag),
+        proposal.version,
         ::hex::encode(&proposal.encrypted_data)
     )
 }
@@ -30,6 +31,7 @@ fn parse_encrypted_proposal(text: &str) -> Result<EncryptedProposal> {
 
     let mut ephemeral_pubkey_str = None;
     let mut tag_hex = None;
+    let mut version = None;
     let mut encrypted_data_hex = None;
 
     for line in lines {
@@ -38,9 +40,17 @@ fn parse_encrypted_proposal(text: &str) -> Result<EncryptedProposal> {
             if let Some(value) = line.split('"').nth(3) {
                 ephemeral_pubkey_str = Some(value);
             }
-        } else if line.contains("tag") {
+        } else if line.contains("\"tag\"") {
             if let Some(value) = line.split('"').nth(3) {
                 tag_hex = Some(value);
+            }
+        } else if line.contains("version") {
+            // Extract version number (format: "version": 1,)
+            if let Some(value_str) = line.split(':').nth(1) {
+                let value_str = value_str.trim().trim_end_matches(',');
+                if let Ok(v) = value_str.parse::<u8>() {
+                    version = Some(v);
+                }
             }
         } else if line.contains("encrypted_data") {
             if let Some(value) = line.split('"').nth(3) {
@@ -63,9 +73,13 @@ fn parse_encrypted_proposal(text: &str) -> Result<EncryptedProposal> {
         encrypted_data_hex.ok_or_else(|| anyhow::anyhow!("Missing encrypted_data"))?
     )?;
 
+    // Version defaults to v1 if not specified (for backward compatibility during transition)
+    let version_val = version.unwrap_or(crate::snicker::SNICKER_VERSION_V1);
+
     Ok(EncryptedProposal {
         ephemeral_pubkey,
         tag,
+        version: version_val,
         encrypted_data,
     })
 }
