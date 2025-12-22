@@ -51,13 +51,13 @@ impl NetworkOption {
 }
 
 /// Render the settings dialog
-pub fn view(edited_config: &Config) -> Element<'static, Message> {
+pub fn view(edited_config: &Config, wallet_loaded: bool) -> Element<'static, Message> {
     // Clone data for 'static lifetime
     let network = NetworkOption::from(&edited_config.network);
     let peer_value = edited_config.peer.clone().unwrap_or_default();
     let wallet_dir = edited_config.wallet_dir.to_string_lossy().to_string();
     let recovery_height_value = edited_config.recovery_height.to_string();
-    let proposals_dir = edited_config.proposals_directory.to_string_lossy().to_string();
+    let proposals_dir = edited_config.proposal_network.file_directory.to_string_lossy().to_string();
     let min_change_output_size_value = edited_config.snicker_automation.min_change_output_size.to_string();
 
     // Build scrollable content section
@@ -65,11 +65,22 @@ pub fn view(edited_config: &Config) -> Element<'static, Message> {
         // Network selection
         column![
             text("Network").size(16),
-            pick_list(
-                &NetworkOption::ALL[..],
-                Some(network),
-                |selected| Message::SettingsNetworkChanged(selected.as_str().to_string())
-            )
+            if wallet_loaded {
+                // Show current network as disabled text when wallet is loaded
+                column![
+                    text(format!("{}", network)).size(14),
+                    text("(Cannot change network while wallet is loaded)").size(12)
+                ].spacing(2)
+            } else {
+                // Show editable picker when no wallet is loaded
+                column![
+                    pick_list(
+                        &NetworkOption::ALL[..],
+                        Some(network),
+                        |selected| Message::SettingsNetworkChanged(selected.as_str().to_string())
+                    )
+                ].spacing(0)
+            }
         ].spacing(5),
 
         // Peer input

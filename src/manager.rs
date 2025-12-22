@@ -9,12 +9,16 @@ use tracing::info;
 
 use crate::wallet_node::WalletNode;
 use crate::snicker::{Snicker, ProposalOpportunity, EncryptedProposal, Proposal};
+use crate::network::{ProposalNetwork, ProposalFilter};
 use std::path::Path;
+use std::sync::Arc;
 
 /// High-level application manager that coordinates wallet and SNICKER operations
 pub struct Manager {
     pub wallet_node: WalletNode,
     pub snicker: Snicker,
+    /// Network backend for publishing/subscribing to proposals
+    pub network: Arc<dyn ProposalNetwork>,
 }
 
 /// Result of scanning a proposals directory
@@ -64,9 +68,14 @@ impl Manager {
         let snicker_db = wallet_node.get_snicker_db_manager();
         let snicker = crate::snicker::Snicker::new(snicker_conn, Some(snicker_db), wallet_node.network)?;
 
+        // Initialize network backend from config
+        let config = crate::config::Config::load()?;
+        let network = config.create_proposal_network();
+
         Ok(Self {
             wallet_node,
             snicker,
+            network,
         })
     }
 
@@ -91,9 +100,14 @@ impl Manager {
         let snicker_db = wallet_node.get_snicker_db_manager();
         let snicker = crate::snicker::Snicker::new(snicker_conn, Some(snicker_db), wallet_node.network)?;
 
+        // Initialize network backend from config
+        let config = crate::config::Config::load()?;
+        let network = config.create_proposal_network();
+
         Ok((Self {
             wallet_node,
             snicker,
+            network,
         }, mnemonic))
     }
 
@@ -633,17 +647,6 @@ impl Manager {
         Ok(())
     }
 
-    /// Serialize an encrypted proposal to a string format (for file storage/network sharing)
-    pub fn serialize_encrypted_proposal(&self, proposal: &EncryptedProposal) -> String {
-        format!(
-            "{{\n  \"ephemeral_pubkey\": \"{}\",\n  \"tag\": \"{}\",\n  \"version\": {},\n  \"encrypted_data\": \"{}\"\n}}",
-            proposal.ephemeral_pubkey,
-            ::hex::encode(&proposal.tag),
-            proposal.version,
-            ::hex::encode(&proposal.encrypted_data)
-        )
-    }
-
     /// Deserialize and store a proposal from its serialized form
     /// Returns the proposal tag
     pub async fn load_proposal_from_serialized(&mut self, serialized: &str) -> Result<[u8; 8]> {
@@ -733,93 +736,137 @@ impl Manager {
     }
 
 
-    /// Scan proposals directory and find all valid proposals matching criteria
+    /// Process a single incoming proposal (pub-sub architecture)
     ///
-    /// Automatically discovers proposal files, deserializes, decrypts with our UTXOs,
+    /// Attempts to load and decrypt a single proposal. If successful and within delta range,
+    /// returns a ProposalScanResult. This is the pub-sub equivalent of scan_proposals_directory.
+    ///
+    /// # Arguments
+    /// * `proposal` - The encrypted proposal to process
+    /// * `delta_range` - (min_delta, max_delta) acceptable range in sats
+    ///
+    /// # Returns
+    /// Some(ProposalScanResult) if proposal is decryptable and within range, None otherwise
+    pub async fn process_incoming_proposal(
+        &mut self,
+        proposal: &crate::snicker::EncryptedProposal,
+        delta_range: (i64, i64),
+    ) -> Result<Option<ProposalScanResult>> {
+        use crate::network::serialization::serialize_proposal_json_pretty;
+
+        // Serialize the proposal to the format expected by load_proposal_from_serialized
+        let serialized = serialize_proposal_json_pretty(proposal);
+
+        // Try to load (deserialize, decrypt, store)
+        let tag = match self.load_proposal_from_serialized(&serialized).await {
+            Ok(tag) => tag,
+            Err(e) => {
+                // Proposal not decryptable with our UTXOs or invalid
+                tracing::debug!("Skipped proposal: {}", e);
+                return Ok(None);
+            }
+        };
+
+        // Query the database to get the decrypted proposal
+        let decrypted = match self.snicker.get_decrypted_proposal_by_tag(&tag).await? {
+            Some(proposal) => proposal,
+            None => {
+                // Not in database - means proposal wasn't decryptable (not for our wallet)
+                // This is normal - most proposals won't be for us
+                tracing::debug!("Proposal {} not decryptable with our UTXOs", hex::encode(&tag));
+                return Ok(None);
+            }
+        };
+
+        // Calculate delta
+        let delta = match self.snicker.calculate_delta_from_proposal(&decrypted) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!("Failed to calculate delta for proposal {}: {}",
+                         hex::encode(&tag), e);
+                return Ok(None);
+            }
+        };
+
+        // Check delta range
+        if delta < delta_range.0 || delta > delta_range.1 {
+            tracing::debug!("Proposal {} delta {} outside range ({}, {})",
+                     hex::encode(&tag), delta, delta_range.0, delta_range.1);
+            return Ok(None);
+        }
+
+        // Get proposal details using existing formatting method
+        let (tag_hex, proposer_input, proposer_value, receiver_output_value, _delta) =
+            self.format_proposal_info(&decrypted);
+
+        // Build result
+        let result = ProposalScanResult {
+            tag,
+            tag_hex,
+            filename: hex::encode(&tag), // Use tag as filename for stream-received proposals
+            delta,
+            proposer_input,
+            proposer_value,
+            receiver_output_value,
+        };
+
+        tracing::info!("✅ Accepted incoming proposal {} (delta: {} sats)",
+                 hex::encode(&tag), delta);
+
+        Ok(Some(result))
+    }
+
+    /// Scan proposals and find all valid proposals matching criteria
+    ///
+    /// Automatically discovers proposals from the network, deserializes, decrypts with our UTXOs,
     /// and filters by delta range. This provides a foundation for automated SNICKER.
     ///
     /// # Arguments
-    /// * `proposals_dir` - Directory containing proposal files
     /// * `delta_range` - (min_delta, max_delta) acceptable range in sats
     ///
     /// # Returns
     /// Vec of ProposalScanResult containing all matching proposals with details
     pub async fn scan_proposals_directory(
         &mut self,
-        proposals_dir: &Path,
         delta_range: (i64, i64),
     ) -> Result<Vec<ProposalScanResult>> {
-        use std::fs;
+        tracing::debug!("🔍 Fetching proposals from network");
 
-        // Create directory if it doesn't exist
-        if !proposals_dir.exists() {
-            fs::create_dir_all(proposals_dir)?;
-            tracing::debug!("📁 Created proposals directory: {}", proposals_dir.display());
-            return Ok(Vec::new());
-        }
-
-        tracing::debug!("🔍 Scanning proposals directory: {}", proposals_dir.display());
-
-        // Read all files in directory
-        let entries = fs::read_dir(proposals_dir)
-            .with_context(|| format!("Failed to read proposals directory: {}", proposals_dir.display()))?;
+        // Fetch proposals from network
+        let proposals = self.network.fetch_proposals(ProposalFilter::default()).await?;
 
         let mut encrypted_proposals = Vec::new();
-        let mut file_count = 0;
         let mut skipped_count = 0;
 
-        for entry in entries {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(e) => {
-                    tracing::warn!("Failed to read directory entry: {}", e);
-                    continue;
-                }
-            };
+        // Process each proposal: serialize, deserialize with load_proposal_from_serialized
+        for encrypted_proposal in proposals.iter() {
+            // Serialize the proposal to the format expected by load_proposal_from_serialized
+            let serialized = format!(
+                "{{\n  \"ephemeral_pubkey\": \"{}\",\n  \"tag\": \"{}\",\n  \"version\": {},\n  \"encrypted_data\": \"{}\"\n}}",
+                encrypted_proposal.ephemeral_pubkey,
+                hex::encode(&encrypted_proposal.tag),
+                encrypted_proposal.version,
+                hex::encode(&encrypted_proposal.encrypted_data)
+            );
 
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-
-            file_count += 1;
-
-            // Limit to prevent scanning too many files
-            if file_count > 1000 {
-                tracing::warn!("Directory has >1000 files, limiting scan to first 1000");
-                break;
-            }
-
-            // Try to read and deserialize file
-            match fs::read_to_string(&path) {
-                Ok(contents) => {
-                    match self.load_proposal_from_serialized(&contents).await {
-                        Ok(tag) => {
-                            // Successfully loaded encrypted proposal
-                            let filename = path.file_name()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or("unknown")
-                                .to_string();
-                            encrypted_proposals.push((tag, filename));
-                        }
-                        Err(e) => {
-                            // Skip invalid files silently (might not be proposal files)
-                            skipped_count += 1;
-                            if file_count < 10 { // Only log first few to avoid spam
-                                tracing::debug!("Skipped {}: {}", path.display(), e);
-                            }
-                        }
-                    }
+            match self.load_proposal_from_serialized(&serialized).await {
+                Ok(tag) => {
+                    // Successfully loaded encrypted proposal
+                    let filename = hex::encode(&tag);
+                    encrypted_proposals.push((tag, filename));
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to read {}: {}", path.display(), e);
+                    // Skip invalid proposals silently
                     skipped_count += 1;
+                    if encrypted_proposals.len() < 10 {
+                        tracing::debug!("Skipped proposal: {}", e);
+                    }
                 }
             }
         }
 
-        tracing::debug!("📄 Found {} files, {} valid proposal(s), {} skipped",
-                 file_count, encrypted_proposals.len(), skipped_count);
+        tracing::debug!("📄 Found {} proposal(s), {} valid, {} skipped",
+                 proposals.len(), encrypted_proposals.len(), skipped_count);
 
         if encrypted_proposals.is_empty() {
             return Ok(Vec::new());
@@ -1454,17 +1501,10 @@ impl Manager {
                     let tag_hex = hex::encode(proposal.tag);
                     tracing::info!("✅ Auto-created proposal {}", tag_hex);
 
-                    // Save to proposals directory
-                    let proposals_dir = std::path::Path::new("./proposals");  // TODO: Use config path
-                    if let Err(e) = tokio::fs::create_dir_all(proposals_dir).await {
-                        tracing::warn!("Failed to create proposals directory: {}", e);
+                    // Publish to network
+                    if let Err(e) = self.network.publish_proposal(&encrypted_proposal).await {
+                        tracing::warn!("Failed to publish proposal: {}", e);
                         continue;
-                    }
-
-                    let filename = proposals_dir.join(&tag_hex);
-                    let serialized = self.serialize_encrypted_proposal(&encrypted_proposal);
-                    if let Err(e) = tokio::fs::write(&filename, serialized).await {
-                        tracing::warn!("Failed to save proposal file: {}", e);
                     }
 
                     // Log success

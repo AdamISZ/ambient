@@ -1,5 +1,6 @@
 mod blockchain_data;
 mod manager;
+mod network;
 mod snicker;
 mod cli;
 mod wallet_node;

@@ -236,8 +236,10 @@ impl AmbientApp {
 
             Message::MenuSettings => {
                 // Open settings modal
+                let wallet_loaded = matches!(self.state, AppState::WalletLoaded { .. });
                 let modal = crate::gui::modal::Modal::Settings {
                     edited_config: self.config.clone(),
+                    wallet_loaded,
                 };
                 self.active_modal = Some(modal);
                 Task::none()
@@ -508,7 +510,7 @@ impl AmbientApp {
             }
 
             Message::SettingsNetworkChanged(network_str) => {
-                if let Some(crate::gui::modal::Modal::Settings { edited_config }) = &mut self.active_modal {
+                if let Some(crate::gui::modal::Modal::Settings { edited_config, wallet_loaded: _ }) = &mut self.active_modal {
                     if let Ok(network) = network_str.parse() {
                         edited_config.network = network;
                     }
@@ -517,7 +519,7 @@ impl AmbientApp {
             }
 
             Message::SettingsPeerChanged(peer) => {
-                if let Some(crate::gui::modal::Modal::Settings { edited_config }) = &mut self.active_modal {
+                if let Some(crate::gui::modal::Modal::Settings { edited_config, wallet_loaded: _ }) = &mut self.active_modal {
                     edited_config.peer = if peer.is_empty() {
                         None
                     } else {
@@ -528,14 +530,14 @@ impl AmbientApp {
             }
 
             Message::SettingsWalletDirChanged(dir) => {
-                if let Some(crate::gui::modal::Modal::Settings { edited_config }) = &mut self.active_modal {
+                if let Some(crate::gui::modal::Modal::Settings { edited_config, wallet_loaded: _ }) = &mut self.active_modal {
                     edited_config.wallet_dir = std::path::PathBuf::from(dir);
                 }
                 Task::none()
             }
 
             Message::SettingsRecoveryHeightChanged(height_str) => {
-                if let Some(crate::gui::modal::Modal::Settings { edited_config }) = &mut self.active_modal {
+                if let Some(crate::gui::modal::Modal::Settings { edited_config, wallet_loaded: _ }) = &mut self.active_modal {
                     if let Ok(height) = height_str.parse::<u32>() {
                         edited_config.recovery_height = height;
                     }
@@ -544,14 +546,14 @@ impl AmbientApp {
             }
 
             Message::SettingsProposalsDirChanged(dir) => {
-                if let Some(crate::gui::modal::Modal::Settings { edited_config }) = &mut self.active_modal {
-                    edited_config.proposals_directory = std::path::PathBuf::from(dir);
+                if let Some(crate::gui::modal::Modal::Settings { edited_config, wallet_loaded: _ }) = &mut self.active_modal {
+                    edited_config.proposal_network.file_directory = std::path::PathBuf::from(dir);
                 }
                 Task::none()
             }
 
             Message::SettingsMinChangeOutputSizeChanged(size_str) => {
-                if let Some(crate::gui::modal::Modal::Settings { edited_config }) = &mut self.active_modal {
+                if let Some(crate::gui::modal::Modal::Settings { edited_config, wallet_loaded: _ }) = &mut self.active_modal {
                     if let Ok(size) = size_str.parse::<u64>() {
                         edited_config.snicker_automation.min_change_output_size = size;
                     }
@@ -560,7 +562,7 @@ impl AmbientApp {
             }
 
             Message::SettingsSave => {
-                if let Some(crate::gui::modal::Modal::Settings { edited_config }) = &self.active_modal {
+                if let Some(crate::gui::modal::Modal::Settings { edited_config, wallet_loaded: _ }) = &self.active_modal {
                     match edited_config.validate() {
                         Ok(_) => {
                             match edited_config.save() {
@@ -1179,7 +1181,6 @@ impl AmbientApp {
 
                     let opportunity = wallet_data.snicker_opportunities_data[index].clone();
                     let manager_clone = manager.clone();
-                    let proposals_dir = self.config.proposals_directory.clone();
                     let rt_handle = self.tokio_runtime.handle().clone();
 
                     println!("📝 Creating SNICKER proposal (index {}, delta {} sats)...", index, delta_sats);
@@ -1192,17 +1193,10 @@ impl AmbientApp {
 
                                 let tag_hex = ::hex::encode(&proposal.tag);
 
-                                // Serialize the proposal
-                                let serialized = manager.serialize_encrypted_proposal(&encrypted);
+                                // Publish to network
+                                let receipt = manager.network.publish_proposal(&encrypted).await?;
 
-                                // Ensure proposals directory exists
-                                tokio::fs::create_dir_all(&proposals_dir).await?;
-
-                                // Write to file in proposals directory
-                                let filename = proposals_dir.join(&tag_hex);
-                                tokio::fs::write(&filename, serialized).await?;
-
-                                println!("✅ Proposal created and saved to {}", filename.display());
+                                println!("✅ Proposal created and published: {}", receipt.id);
                                 Ok(tag_hex)
                             }).await.unwrap()
                         },
@@ -1240,14 +1234,13 @@ impl AmbientApp {
                              min_delta, max_delta);
 
                     let manager_clone = manager.clone();
-                    let proposals_dir = self.config.proposals_directory.clone();
                     let rt_handle = self.tokio_runtime.handle().clone();
 
                     return Task::perform(
                         async move {
                             rt_handle.spawn(async move {
                                 let mut manager = manager_clone.write().await;
-                                manager.scan_proposals_directory(&proposals_dir, (min_delta, max_delta)).await
+                                manager.scan_proposals_directory((min_delta, max_delta)).await
                             }).await.unwrap()
                         },
                         |result| match result {
@@ -1406,15 +1399,6 @@ impl AmbientApp {
                     let manager_clone = manager.clone();
                     let rt_handle = self.tokio_runtime.handle().clone();
 
-                    // Get proposals directory from config
-                    let proposals_dir = match crate::config::Config::load() {
-                        Ok(cfg) => cfg.proposals_directory,
-                        Err(_) => {
-                            eprintln!("❌ Failed to load config, using default proposals directory");
-                            std::path::PathBuf::from(".local/share/ambient/proposals")
-                        }
-                    };
-
                     println!("🤖 Starting SNICKER automation...");
                     println!("   Mode: {:?}", mode);
                     println!("   Max delta: {} sats", max_delta);
@@ -1434,7 +1418,6 @@ impl AmbientApp {
                                     manager_clone,
                                     snicker_config,
                                     task_config,
-                                    proposals_dir,
                                 ).await;
                                 println!("✅ Automation started");
                             }).await.map_err(|e| e.to_string())

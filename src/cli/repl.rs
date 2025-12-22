@@ -900,7 +900,6 @@ pub async fn repl(
                         arc.clone(),
                         config.snicker_automation.clone(),
                         task_config,
-                        config.proposals_directory.clone(),
                     ).await;
 
                     automation_task = Some(task);

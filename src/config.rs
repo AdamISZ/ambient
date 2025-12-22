@@ -113,6 +113,76 @@ impl std::str::FromStr for AutomationMode {
     }
 }
 
+/// Proposal network backend type
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProposalNetworkBackend {
+    /// File-based proposal distribution (default)
+    FileBased,
+    /// Nostr-based distribution
+    Nostr,
+}
+
+impl Default for ProposalNetworkBackend {
+    fn default() -> Self {
+        ProposalNetworkBackend::FileBased
+    }
+}
+
+impl std::fmt::Display for ProposalNetworkBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProposalNetworkBackend::FileBased => write!(f, "File-Based"),
+            ProposalNetworkBackend::Nostr => write!(f, "Nostr"),
+        }
+    }
+}
+
+impl std::str::FromStr for ProposalNetworkBackend {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.to_lowercase().as_str() {
+            "filebased" | "file-based" | "file" => Ok(ProposalNetworkBackend::FileBased),
+            "nostr" => Ok(ProposalNetworkBackend::Nostr),
+            _ => Err(anyhow::anyhow!("Invalid network backend: {}", s)),
+        }
+    }
+}
+
+/// Proposal network configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProposalNetworkConfig {
+    /// Backend type to use
+    #[serde(default)]
+    pub backend: ProposalNetworkBackend,
+
+    /// Directory for file-based backend
+    /// Default: ~/.local/share/ambient/{network}/proposals/
+    #[serde(default = "default_proposals_dir")]
+    pub file_directory: PathBuf,
+
+    /// Relay URLs for Nostr backend
+    #[serde(default = "default_nostr_relays")]
+    pub nostr_relays: Vec<String>,
+
+    /// PoW difficulty for publishing to Nostr (0-255, higher = more spam protection)
+    /// Default: 20 (moderate protection, ~1-2 seconds to compute)
+    #[serde(default = "default_nostr_pow_difficulty")]
+    pub nostr_pow_difficulty: Option<u8>,
+}
+
+impl Default for ProposalNetworkConfig {
+    fn default() -> Self {
+        Self {
+            backend: ProposalNetworkBackend::FileBased,
+            file_directory: default_proposals_dir(),
+            nostr_relays: default_nostr_relays(),
+            nostr_pow_difficulty: default_nostr_pow_difficulty(),
+        }
+    }
+}
+
 /// SNICKER automation configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnickerAutomation {
@@ -179,10 +249,14 @@ pub struct Config {
     #[serde(default = "default_recovery_height")]
     pub recovery_height: u32,
 
-    /// Directory where SNICKER proposals are stored for auto-discovery
-    /// Default: ~/.local/share/ambient/{network}/proposals/
-    #[serde(default = "default_proposals_dir")]
-    pub proposals_directory: PathBuf,
+    /// Proposal network configuration (backend type and settings)
+    #[serde(default)]
+    pub proposal_network: ProposalNetworkConfig,
+
+    /// DEPRECATED: Use proposal_network.file_directory instead
+    /// Kept for backward compatibility - if present, it will override proposal_network.file_directory
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proposals_directory: Option<PathBuf>,
 
     /// SNICKER automation settings
     #[serde(default)]
@@ -196,7 +270,8 @@ impl Default for Config {
             peer: None,
             wallet_dir: default_wallet_dir(),
             recovery_height: default_recovery_height(),
-            proposals_directory: default_proposals_dir(),
+            proposal_network: ProposalNetworkConfig::default(),
+            proposals_directory: None,
             snicker_automation: SnickerAutomation::default(),
         }
     }
@@ -247,6 +322,45 @@ impl Config {
     /// Get the path where wallet data is stored for this network
     pub fn network_wallet_dir(&self) -> PathBuf {
         self.wallet_dir.join(self.network.as_str())
+    }
+
+    /// Create a proposal network backend based on configuration
+    ///
+    /// Returns an Arc<dyn ProposalNetwork> configured according to the user's settings.
+    /// Handles backward compatibility with deprecated proposals_directory field.
+    ///
+    /// # Panics
+    /// Panics if Nostr network creation fails (should only happen with invalid config)
+    pub fn create_proposal_network(&self) -> std::sync::Arc<dyn crate::network::ProposalNetwork> {
+        use std::sync::Arc;
+        use crate::network::ProposalNetwork;
+
+        // Get the directory to use (backward compatibility)
+        let directory = self.proposals_directory
+            .clone()
+            .unwrap_or_else(|| self.proposal_network.file_directory.clone());
+
+        match self.proposal_network.backend {
+            ProposalNetworkBackend::FileBased => {
+                Arc::new(crate::network::file_based::FileBasedNetwork::new(directory))
+                    as Arc<dyn ProposalNetwork>
+            }
+            ProposalNetworkBackend::Nostr => {
+                // Nostr network creation is async, so we need to block on it
+                // This is okay since it's only called during Manager initialization
+                let network = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        crate::network::nostr::NostrNetwork::new(
+                            self.proposal_network.nostr_relays.clone(),
+                            self.proposal_network.nostr_pow_difficulty,
+                        ).await
+                    })
+                });
+
+                Arc::new(network.expect("Failed to create Nostr network"))
+                    as Arc<dyn ProposalNetwork>
+            }
+        }
     }
 
     /// Validate configuration
@@ -322,6 +436,19 @@ fn default_min_change_output_size() -> u64 {
     DEFAULT_MIN_CHANGE_OUTPUT_SIZE
 }
 
+/// Get the default Nostr relays
+fn default_nostr_relays() -> Vec<String> {
+    vec![
+        "wss://relay.damus.io".to_string(),
+        "wss://nostr.wine".to_string(),
+    ]
+}
+
+/// Get the default Nostr PoW difficulty
+fn default_nostr_pow_difficulty() -> Option<u8> {
+    Some(20)
+}
+
 /// Get the configuration file path
 fn config_file_path() -> Result<PathBuf> {
     let config_dir = directories::ProjectDirs::from("", "", "ambient")
@@ -365,17 +492,23 @@ mod tests {
             peer: Some("localhost:18444".to_string()),
             wallet_dir: PathBuf::from("/tmp/wallets"),
             recovery_height: 0,
-            proposals_directory: PathBuf::from("/tmp/proposals"),
+            proposal_network: ProposalNetworkConfig {
+                backend: ProposalNetworkBackend::FileBased,
+                file_directory: PathBuf::from("/tmp/proposals"),
+            },
+            proposals_directory: None,
             snicker_automation: SnickerAutomation::default(),
         };
 
         let toml = toml::to_string(&config).unwrap();
         assert!(toml.contains("network = \"regtest\""));
         assert!(toml.contains("peer = \"localhost:18444\""));
+        assert!(toml.contains("backend = \"filebased\""));
 
         let deserialized: Config = toml::from_str(&toml).unwrap();
         assert_eq!(deserialized.network, Network::Regtest);
         assert_eq!(deserialized.peer, Some("localhost:18444".to_string()));
+        assert_eq!(deserialized.proposal_network.backend, ProposalNetworkBackend::FileBased);
     }
 
     #[test]

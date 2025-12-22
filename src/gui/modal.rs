@@ -16,6 +16,7 @@ pub enum Modal {
     /// Settings dialog
     Settings {
         edited_config: Config,
+        wallet_loaded: bool,
     },
 
     /// Open existing wallet dialog
@@ -80,8 +81,8 @@ impl Modal {
             Modal::GenerateWallet { step, data } => {
                 crate::gui::views::modals::generate_wallet_wizard::view(step, data)
             }
-            Modal::Settings { edited_config } => {
-                crate::gui::views::modals::settings_dialog::view(edited_config)
+            Modal::Settings { edited_config, wallet_loaded } => {
+                crate::gui::views::modals::settings_dialog::view(edited_config, *wallet_loaded)
             }
             Modal::OpenWallet { available_wallets, selected, password, error_message } => {
                 crate::gui::views::modals::open_wallet_dialog::view(available_wallets, selected, password, error_message)

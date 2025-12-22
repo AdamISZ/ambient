@@ -40,6 +40,16 @@ reqwest = { version = "0.11", features = ["json"] }
 thiserror = "1.0"
 async-trait = "0.1"
 
+# Async utilities for network layer
+futures = "0.3"
+async-stream = "0.3"
+
+# File watching for proposal directory
+notify = "6.1"
+
+# Nostr network backend
+nostr-sdk = "0.37"
+
 # GUI dependencies (optional)
 iced = { version = "0.13.1", optional = true }
 async-std = { version = "1.12", optional = true }
