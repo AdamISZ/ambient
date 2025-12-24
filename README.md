@@ -27,10 +27,25 @@ Ambient is a Bitcoin wallet that implements [SNICKER](https://gist.github.com/Ad
 3. **Receiver** discovers proposals meant for them, validates, and signs if acceptable
 4. Completed coinjoin transaction is broadcast to Bitcoin network
 
+### Trustless Validation
+
+Ambient includes a **partial UTXO set** feature that enables trustless validation of incoming proposals:
+
+- **Maintains a filtered UTXO set**: Tracks P2TR outputs ≥ 5000 sats from the last ~1000 blocks
+- **Validates proposer UTXOs**: Verifies that proposer's inputs actually exist and are unspent
+- **Prevents spam attacks**: Rejects proposals with fake or spent UTXOs without external API calls
+- **Privacy-preserving**: Downloads all blocks (like a full node) but stores only filtered UTXOs (~60 MB)
+- **Automatic maintenance**: Updates in real-time as new blocks arrive, self-prunes old data
+
+This "lobotomized full node" approach provides the security of full validation with the lightweight storage of an SPV client.
+
+See [`docs/AMBIENT_UTXO_MANAGEMENT.md`](docs/AMBIENT_UTXO_MANAGEMENT.md) for the complete design.
+
 ### Key Features
 
 - **Non-interactive**: No back-and-forth communication between parties
 - **Encrypted proposals**: Proposals are encrypted to the receiver's public key for privacy (+)
+- **Trustless validation**: Maintains a partial UTXO set to validate proposer UTXOs without external services
 - **Encrypted storage**: All wallet data encrypted at rest with ChaCha20-Poly1305 and Argon2id key derivation
 - **In-memory security**: Databases decrypted only in RAM, never written to disk as plaintext
 - **Recoverable from seed**: Uses deterministic tweaks (proposer's input key) enabling full wallet recovery from seed phrase alone
@@ -67,12 +82,15 @@ Ambient is a Bitcoin wallet that implements [SNICKER](https://gist.github.com/Ad
 - ✅ Encrypted wallet storage (ChaCha20-Poly1305 + Argon2id)
 - ✅ In-memory database security (no plaintext on disk)
 - ✅ Recoverable tweaked outputs
-- ✅ Light client sync via Kyoto
+- ✅ Light client sync via Kyoto (BIP157/158)
+- ✅ Partial UTXO set for trustless proposer validation
 - ✅ GUI interface (Iced framework)
+- ✅ Real-time wallet status updates
 - ✅ End-to-end integration tests
 
 **TODO:**
 - [ ] Proposal broadcast/discovery mechanism (Nostr, DHT, etc.)
+- [ ] Fallback validation mode for UTXOs outside scan window
 - [ ] UTXO selection strategies
 - [ ] Fee estimation improvements
 - [ ] Password change functionality
@@ -123,56 +141,60 @@ See [`tests/README.md`](tests/README.md) for detailed testing instructions.
 ```
 ambient/
 ├── src/
-│   ├── manager.rs        # High-level wallet + SNICKER coordination
-│   ├── wallet_node.rs    # Bitcoin wallet (BDK + Kyoto)
-│   ├── encryption.rs     # Encrypted in-memory database management
+│   ├── manager.rs            # High-level wallet + SNICKER coordination
+│   ├── wallet_node.rs        # Bitcoin wallet (BDK + Kyoto)
+│   ├── partial_utxo_set.rs   # Partial UTXO set for trustless validation
+│   ├── encryption.rs         # Encrypted in-memory database management
 │   ├── snicker/
-│   │   ├── mod.rs        # SNICKER protocol logic
-│   │   └── tweak.rs      # Cryptographic primitives (ECDH, tweaking)
-│   ├── gui/              # GUI interface (Iced framework)
-│   │   ├── app.rs        # Application state and message handling
-│   │   ├── views/        # UI views (wallet, settings, modals)
-│   │   └── widgets/      # Custom UI components
-│   ├── main.rs           # CLI interface
-│   └── gui_main.rs       # GUI entry point
-├── tests/                # Integration tests
+│   │   ├── mod.rs            # SNICKER protocol logic
+│   │   └── tweak.rs          # Cryptographic primitives (ECDH, tweaking)
+│   ├── gui/                  # GUI interface (Iced framework)
+│   │   ├── app.rs            # Application state and message handling
+│   │   ├── state.rs          # Application state management
+│   │   ├── views/            # UI views (wallet, settings, modals)
+│   │   └── widgets/          # Custom UI components
+│   ├── main.rs               # CLI interface
+│   └── gui_main.rs           # GUI entry point
+├── tests/                    # Integration tests
 └── docs/
-    ├── PROTOCOL.md           # Complete protocol description
-    ├── ENCRYPTED_STORAGE.md  # Encrypted storage architecture and schemas
-    └── SNICKER_RECOVERY.md   # Wallet recovery design
+    ├── PROTOCOL.md                  # Complete protocol description
+    ├── ENCRYPTED_STORAGE.md         # Encrypted storage architecture and schemas
+    ├── SNICKER_RECOVERY.md          # Wallet recovery design
+    └── AMBIENT_UTXO_MANAGEMENT.md   # Partial UTXO set design
 ```
 
 ### Data Flow
 
 ```
-┌─────────────────┐
-│ Encrypted Files │  ← wallet.sqlite.enc, snicker.sqlite.enc, mnemonic.enc
-│ (Disk Storage)  │
-└────────┬────────┘
-         │ Decrypt with password (Argon2id + ChaCha20-Poly1305)
-         ↓
-┌─────────────────┐
-│  In-Memory DBs  │  ← SQLite :memory: connections
-│  (RAM only)     │
-└────────┬────────┘
-         │
-    ┌────┴────┬──────────┐
-    ↓         ↓          ↓
-┌─────┐  ┌────────┐  ┌────────┐
-│ BDK │  │ Kyoto  │  │SNICKER │
-└─────┘  └────────┘  └────────┘
-    │         │          │
-    └─────────┴──────────┘
-              ↓
-        ┌──────────┐
-        │ Manager  │
-        └────┬─────┘
-             │
-        ┌────┴─────┐
-        ↓          ↓
-    ┌──────┐  ┌──────┐
-    │ CLI  │  │ GUI  │
-    └──────┘  └──────┘
+┌─────────────────────────────────────────────────────────┐
+│ Encrypted Files (Disk Storage)                          │
+│  ← wallet.sqlite.enc, snicker.sqlite.enc, mnemonic.enc  │
+└─────────────────────┬───────────────────────────────────┘
+                      │ Decrypt with password (Argon2id + ChaCha20-Poly1305)
+                      ↓
+┌─────────────────────────────────────────────────────────┐
+│  In-Memory DBs (RAM only)                               │
+│  ← SQLite :memory: connections                          │
+└─────────────────────┬───────────────────────────────────┘
+                      │
+       ┌──────────────┼──────────────┬──────────────┐
+       ↓              ↓              ↓              ↓
+   ┌─────┐      ┌────────┐     ┌────────┐   ┌─────────────┐
+   │ BDK │      │ Kyoto  │     │SNICKER │   │ Partial     │
+   │     │      │(BIP157)│     │        │   │ UTXO Set    │
+   └─────┘      └────────┘     └────────┘   └─────────────┘
+       │              │              │              │
+       │              └──────┬───────┴──────────────┘
+       │                     ↓
+       │              ┌──────────┐
+       └──────────────> Manager  │
+                      └────┬─────┘
+                           │
+                      ┌────┴─────┐
+                      ↓          ↓
+                  ┌──────┐  ┌──────┐
+                  │ CLI  │  │ GUI  │  ← Real-time updates
+                  └──────┘  └──────┘
 ```
 
 See [`docs/ENCRYPTED_STORAGE.md`](docs/ENCRYPTED_STORAGE.md) for detailed encryption architecture and database schemas.
