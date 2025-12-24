@@ -82,7 +82,11 @@ pub fn view(manager: &Arc<RwLock<Manager>>, data: &WalletData) -> Element<'stati
             .height(Length::Fill),
         ]
         .spacing(0),
+
+        // Status bar at bottom
+        status_bar(data)
     ]
+    .spacing(0)
     .into()
 }
 
@@ -151,6 +155,29 @@ fn sidebar_button(label: &str, tab: WalletTab, current: WalletTab) -> Element<'s
 }
 
 /// Create a styled menu button with rounded corners
+/// Create status bar at bottom
+fn status_bar(data: &WalletData) -> Element<'static, Message> {
+    if let Some(status) = &data.status_message {
+        let status = status.clone();
+        container(
+            text(status).size(14)
+        )
+        .padding(8)
+        .width(Length::Fill)
+        .style(|_theme: &Theme| {
+            container::Style {
+                background: Some(iced::Background::Color(Color::from_rgb(0.2, 0.3, 0.4))),
+                text_color: Some(Color::WHITE),
+                ..Default::default()
+            }
+        })
+        .into()
+    } else {
+        // Empty placeholder when no status
+        container(text("")).height(0).into()
+    }
+}
+
 fn menu_button(label: &str, message: Message) -> Element<'static, Message> {
     let label = label.to_string();
 

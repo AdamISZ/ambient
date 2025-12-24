@@ -13,6 +13,7 @@ pub mod manager;
 pub mod cli;
 pub mod config;
 pub mod automation;
+pub mod partial_utxo_set;
 
 // GUI module - only include if iced feature is enabled
 #[cfg(feature = "gui")]

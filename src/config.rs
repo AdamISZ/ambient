@@ -72,6 +72,31 @@ impl std::str::FromStr for Network {
     }
 }
 
+/// Validation mode for proposer UTXOs not in partial set
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ValidationMode {
+    /// Reject anything outside scan window (enforces freshness)
+    Strict,
+    /// Fall back to Tor APIs for validation
+    Fallback,
+}
+
+impl Default for ValidationMode {
+    fn default() -> Self {
+        ValidationMode::Strict
+    }
+}
+
+impl std::fmt::Display for ValidationMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ValidationMode::Strict => write!(f, "Strict"),
+            ValidationMode::Fallback => write!(f, "Fallback (Tor APIs)"),
+        }
+    }
+}
+
 /// SNICKER automation mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -183,6 +208,44 @@ impl Default for ProposalNetworkConfig {
     }
 }
 
+/// Partial UTXO set configuration for trustless proposer UTXO validation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartialUtxoSetConfig {
+    /// Scan window (number of recent blocks to keep in partial UTXO set)
+    /// Default: 1000 blocks (~1 week)
+    /// Adjustable: 500-5000 for desktop
+    #[serde(default = "default_scan_window_blocks")]
+    pub scan_window_blocks: u32,
+
+    /// Minimum UTXO amount to track (sats)
+    /// Default: 5000 sats (anti-dust/inscription filter)
+    #[serde(default = "default_min_utxo_amount")]
+    pub min_utxo_amount_sats: u64,
+
+    /// Maximum age difference between proposer and receiver UTXOs (blocks)
+    /// Must be <= scan_window_blocks
+    /// Default: 1000 blocks
+    #[serde(default = "default_max_utxo_age_delta")]
+    pub max_utxo_age_delta_blocks: u32,
+
+    /// Validation mode when proposer UTXO not in partial set
+    /// strict = reject if outside scan window (enforces freshness)
+    /// fallback = use Tor APIs (adds latency, reduces privacy slightly)
+    #[serde(default)]
+    pub validation_mode: ValidationMode,
+}
+
+impl Default for PartialUtxoSetConfig {
+    fn default() -> Self {
+        Self {
+            scan_window_blocks: default_scan_window_blocks(),
+            min_utxo_amount_sats: default_min_utxo_amount(),
+            max_utxo_age_delta_blocks: default_max_utxo_age_delta(),
+            validation_mode: ValidationMode::Strict,
+        }
+    }
+}
+
 /// SNICKER automation configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnickerAutomation {
@@ -258,6 +321,10 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proposals_directory: Option<PathBuf>,
 
+    /// Partial UTXO set configuration for trustless proposer validation
+    #[serde(default)]
+    pub partial_utxo_set: PartialUtxoSetConfig,
+
     /// SNICKER automation settings
     #[serde(default)]
     pub snicker_automation: SnickerAutomation,
@@ -272,6 +339,7 @@ impl Default for Config {
             recovery_height: default_recovery_height(),
             proposal_network: ProposalNetworkConfig::default(),
             proposals_directory: None,
+            partial_utxo_set: PartialUtxoSetConfig::default(),
             snicker_automation: SnickerAutomation::default(),
         }
     }
@@ -449,6 +517,22 @@ fn default_nostr_pow_difficulty() -> Option<u8> {
     Some(20)
 }
 
+/// Get the default scan window (1000 blocks ~1 week)
+fn default_scan_window_blocks() -> u32 {
+    1000
+}
+
+/// Get the default minimum UTXO amount (5000 sats)
+/// This matches the minimum change output size for SNICKER
+fn default_min_utxo_amount() -> u64 {
+    5000
+}
+
+/// Get the default maximum UTXO age delta (1000 blocks)
+fn default_max_utxo_age_delta() -> u32 {
+    1000
+}
+
 /// Get the configuration file path
 fn config_file_path() -> Result<PathBuf> {
     let config_dir = directories::ProjectDirs::from("", "", "ambient")
@@ -495,8 +579,11 @@ mod tests {
             proposal_network: ProposalNetworkConfig {
                 backend: ProposalNetworkBackend::FileBased,
                 file_directory: PathBuf::from("/tmp/proposals"),
+                nostr_relays: vec![],
+                nostr_pow_difficulty: None,
             },
             proposals_directory: None,
+            partial_utxo_set: PartialUtxoSetConfig::default(),
             snicker_automation: SnickerAutomation::default(),
         };
 
@@ -504,11 +591,14 @@ mod tests {
         assert!(toml.contains("network = \"regtest\""));
         assert!(toml.contains("peer = \"localhost:18444\""));
         assert!(toml.contains("backend = \"filebased\""));
+        assert!(toml.contains("scan_window_blocks"));
 
         let deserialized: Config = toml::from_str(&toml).unwrap();
         assert_eq!(deserialized.network, Network::Regtest);
         assert_eq!(deserialized.peer, Some("localhost:18444".to_string()));
         assert_eq!(deserialized.proposal_network.backend, ProposalNetworkBackend::FileBased);
+        assert_eq!(deserialized.partial_utxo_set.scan_window_blocks, 1000);
+        assert_eq!(deserialized.partial_utxo_set.min_utxo_amount_sats, 5000);
     }
 
     #[test]

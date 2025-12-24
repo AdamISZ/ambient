@@ -999,38 +999,73 @@ impl Manager {
 
         println!("✅ Found proposal");
 
-        println!("🔍 Step 2: Getting UTXOs...");
+        println!("🔍 Step 2: Validating proposer UTXO...");
+        // Extract proposer's input from PSBT (first input is proposer's)
+        let proposer_input = proposal.psbt.unsigned_tx.input.first()
+            .ok_or_else(|| anyhow::anyhow!("Proposal PSBT has no inputs"))?;
+        let proposer_outpoint = proposer_input.previous_output;
+
+        // Get proposer's UTXO value from PSBT input
+        let proposer_value = proposal.psbt.inputs.first()
+            .and_then(|input| input.witness_utxo.as_ref())
+            .map(|utxo| utxo.value.to_sat())
+            .ok_or_else(|| anyhow::anyhow!("Cannot determine proposer UTXO value from PSBT"))?;
+
+        // Validate the proposer's UTXO using our partial UTXO set
+        match self.wallet_node.validate_proposer_utxo(&proposer_outpoint, proposer_value).await {
+            Ok(()) => {
+                println!("✅ Proposer UTXO validated: {}:{} ({} sats)",
+                    proposer_outpoint.txid, proposer_outpoint.vout, proposer_value);
+                tracing::info!(
+                    "✅ Validated proposer UTXO {}:{} via partial UTXO set",
+                    proposer_outpoint.txid, proposer_outpoint.vout
+                );
+            }
+            Err(e) => {
+                println!("❌ Proposer UTXO validation failed: {}", e);
+                tracing::warn!(
+                    "❌ Rejected proposal {} - proposer UTXO validation failed: {}",
+                    hex::encode(tag), e
+                );
+                return Err(anyhow::anyhow!(
+                    "Proposer UTXO validation failed: {}. This proposal may use a fake, spent, or very old UTXO.",
+                    e
+                ));
+            }
+        }
+
+        println!("🔍 Step 3: Getting UTXOs...");
         let our_utxos = self.wallet_node.get_all_wallet_utxos().await?;
 
-        println!("🔍 Step 3: Accepting and signing proposal...");
+        println!("🔍 Step 4: Accepting and signing proposal...");
         // Accept and sign the proposal
         let psbt = self.accept_snicker_proposal(tag, acceptable_delta_range).await?;
 
-        println!("🔍 Step 4: Finalizing PSBT...");
+        println!("🔍 Step 5: Finalizing PSBT...");
         // Finalize the PSBT
         let tx = self.finalize_psbt(psbt).await?;
 
-        println!("🔍 Step 5: Storing SNICKER UTXO...");
+        println!("🔍 Step 6: Storing SNICKER UTXO...");
         // Store the SNICKER UTXO for future spending
         self.store_accepted_snicker_utxo(&proposal, &tx, &our_utxos).await?;
         println!("📋 SNICKER UTXO tracked (will be detected during sync)");
 
-        println!("🔍 Step 6: Broadcasting transaction...");
+        println!("🔍 Step 7: Broadcasting transaction...");
         // Broadcast the transaction
         let txid = self.broadcast_transaction(tx.clone()).await?;
 
-        println!("🔍 Step 7: Marking spent SNICKER UTXO...");
-        // Mark the input SNICKER UTXO as spent
-        // Find our input in the transaction
+        println!("🔍 Step 8: Marking pending SNICKER UTXO...");
+        // Mark the input SNICKER UTXO as pending (broadcast but not confirmed)
+        // This will re-subscribe to the script before marking as pending
         for input in &tx.input {
             if let Some(utxo) = our_utxos.iter().find(|u| u.outpoint() == input.previous_output) {
                 if matches!(utxo, crate::wallet_node::WalletUtxo::Snicker { .. }) {
-                    self.wallet_node.mark_snicker_utxo_spent(
+                    self.wallet_node.mark_snicker_utxo_pending(
                         &input.previous_output.txid.to_string(),
                         input.previous_output.vout,
                         &txid.to_string(),
                     ).await?;
-                    println!("✅ Marked SNICKER input {}:{} as spent",
+                    println!("✅ Marked SNICKER input {}:{} as pending",
                         input.previous_output.txid, input.previous_output.vout);
                 }
             }
@@ -1131,22 +1166,18 @@ impl Manager {
             .ok_or_else(|| anyhow::anyhow!("Receiver's tweaked output not found in transaction"))?;
         let txid = tx.compute_txid();
 
-        // Add the tweaked scriptPubKey to Kyoto's watch list so it gets detected during sync
+        // CRITICAL: Subscribe to script BEFORE storing in database
+        // This ensures atomicity: if we crash after subscribe but before DB write,
+        // the subscription exists (harmless duplicate on restart) but UTXO not in DB (safe).
+        // If we crash after DB write, restart re-subscription will restore it.
         {
-            match self.wallet_node.update_subscriber.try_lock() {
-                Ok(mut update_subscriber) => {
-                    update_subscriber.add_script(tweaked_output.script_pubkey.clone());
-                    println!("✅ Added SNICKER tweaked script to Kyoto watch list");
-                }
-                Err(_) => {
-                    // Update subscriber is busy, but the UTXO will still be in the database
-                    // and will be detected on next sync
-                    println!("⚠️  Update subscriber busy, SNICKER UTXO will be detected on next sync");
-                }
-            }
+            let mut update_subscriber = self.wallet_node.update_subscriber.lock().await;
+            update_subscriber.add_script(tweaked_output.script_pubkey.clone());
+            drop(update_subscriber);
+            println!("✅ Subscribed to SNICKER script before storing UTXO");
         }
 
-        // Store in database
+        // Store in database AFTER subscription
         self.snicker.store_snicker_utxo(
             txid,
             output_index as u32,

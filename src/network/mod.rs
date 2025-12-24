@@ -7,6 +7,13 @@ pub mod file_based;
 pub mod nostr;
 pub mod serialization;
 
+// Test utilities (available with test-utils feature or in tests)
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_relay;
+
+#[cfg(any(test, feature = "test-utils"))]
+pub mod embedded_relay;
+
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::stream::BoxStream;

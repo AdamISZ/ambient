@@ -8,6 +8,7 @@ mod config;
 mod automation;
 mod encryption;
 mod fee;
+mod partial_utxo_set;
 
 use anyhow::Result;
 use clap::{Parser, ValueEnum};

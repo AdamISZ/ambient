@@ -1076,6 +1076,24 @@ impl Snicker {
             // Note: SQLite doesn't easily support DROP COLUMN, so old 'spent' column remains but unused
         }
 
+        // Migration: Add pending_since timestamp column if it doesn't exist
+        let has_pending_since: Result<bool, _> = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('snicker_utxos') WHERE name='pending_since'",
+            [],
+            |row| {
+                let count: i64 = row.get(0)?;
+                Ok(count > 0)
+            },
+        );
+
+        if !has_pending_since.unwrap_or(true) {
+            conn.execute(
+                "ALTER TABLE snicker_utxos ADD COLUMN pending_since INTEGER",
+                [],
+            )?;
+            tracing::info!("✅ Added pending_since column to snicker_utxos table");
+        }
+
         Ok(())
     }
 

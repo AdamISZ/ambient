@@ -552,6 +552,40 @@ impl AmbientApp {
                 Task::none()
             }
 
+            Message::SettingsProposalNetworkBackendChanged(backend_str) => {
+                if let Some(crate::gui::modal::Modal::Settings { edited_config, wallet_loaded: _ }) = &mut self.active_modal {
+                    edited_config.proposal_network.backend = match backend_str.as_str() {
+                        "FileBased" => crate::config::ProposalNetworkBackend::FileBased,
+                        "Nostr" => crate::config::ProposalNetworkBackend::Nostr,
+                        _ => edited_config.proposal_network.backend.clone(),
+                    };
+                }
+                Task::none()
+            }
+
+            Message::SettingsNostrRelaysChanged(relays_str) => {
+                if let Some(crate::gui::modal::Modal::Settings { edited_config, wallet_loaded: _ }) = &mut self.active_modal {
+                    // Parse comma-separated relay URLs
+                    edited_config.proposal_network.nostr_relays = relays_str
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                }
+                Task::none()
+            }
+
+            Message::SettingsNostrPowDifficultyChanged(pow_str) => {
+                if let Some(crate::gui::modal::Modal::Settings { edited_config, wallet_loaded: _ }) = &mut self.active_modal {
+                    edited_config.proposal_network.nostr_pow_difficulty = if pow_str.is_empty() {
+                        None
+                    } else {
+                        pow_str.parse::<u8>().ok()
+                    };
+                }
+                Task::none()
+            }
+
             Message::SettingsMinChangeOutputSizeChanged(size_str) => {
                 if let Some(crate::gui::modal::Modal::Settings { edited_config, wallet_loaded: _ }) = &mut self.active_modal {
                     if let Ok(size) = size_str.parse::<u64>() {
@@ -762,6 +796,7 @@ impl AmbientApp {
                     // Update balance with data from event
                     wallet_data.balance = bdk_wallet::bitcoin::Amount::from_sat(update.balance_sats);
                     wallet_data.is_syncing = false; // Clear syncing flag
+                    wallet_data.status_message = update.status_message.clone();
 
                     tracing::info!("📊 Blockchain update: height={}, balance={} sats",
                                   update.height, update.balance_sats);

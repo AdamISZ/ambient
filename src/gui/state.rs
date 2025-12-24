@@ -49,6 +49,7 @@ pub struct WalletData {
     pub balance: Amount,
     pub last_address: Option<String>,
     pub is_syncing: bool,
+    pub status_message: Option<String>,
 
     // Send form state
     pub send_address: String,
@@ -90,6 +91,7 @@ impl Default for WalletData {
             balance: Amount::ZERO,
             last_address: None,
             is_syncing: false,
+            status_message: None,
             send_address: String::new(),
             send_amount: String::new(),
             send_fee_rate: String::from("1.0"),

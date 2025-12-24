@@ -27,6 +27,7 @@ use bdk_kyoto::{Info, LightClient, Receiver, ScanType, UnboundedReceiver, Warnin
 
 use crate::encryption::WalletEncryption;
 use crate::fee;
+use crate::partial_utxo_set::{PartialUtxoSet, UtxoStatus};
 
 const RECOVERY_LOOKAHEAD: u32 = 50;
 const NUM_CONNECTIONS: u8 = 1;
@@ -39,6 +40,8 @@ pub struct WalletUpdate {
     pub height: u32,
     /// Total balance in sats (regular + SNICKER)
     pub balance_sats: u64,
+    /// Optional status message for GUI display (e.g., "Scanning blocks: 50/1000")
+    pub status_message: Option<String>,
 }
 
 /// Represents a UTXO that can be either from the regular BDK wallet or a SNICKER UTXO
@@ -127,6 +130,8 @@ pub struct WalletNode {
     pub fee_estimator: fee::FeeEstimator,
     /// Encrypted in-memory SNICKER database (for flush on UTXO changes)
     snicker_db: crate::encryption::EncryptedMemoryDb,
+    /// Partial UTXO set for trustless proposer UTXO validation
+    partial_utxo_set: Arc<Mutex<PartialUtxoSet>>,
 }
 
 /// Selected UTXOs for spending (hybrid selection result)
@@ -266,7 +271,7 @@ impl WalletNode {
         tracing::info!("💾 Flushed wallet database after initial load/create");
 
         let (requester, update_subscriber) =
-            Self::start_node(&wallet, network, recovery_height, name, peer).await?;
+            Self::start_node(&wallet, network, recovery_height, name, peer, &wallet_dir).await?;
 
         // Derive xprv from mnemonic for SNICKER operations
         let xkey: ExtendedKey = mnemonic.into_extended_key()?;
@@ -290,6 +295,38 @@ impl WalletNode {
         };
         let snicker_conn = Arc::new(std::sync::Mutex::new(snicker_conn_raw));
 
+        // Re-subscribe to all unspent SNICKER scripts BEFORE processing any blocks
+        // This is critical: when wallet restarts, UpdateSubscriber's spk_cache is recreated
+        // from descriptor scripts only. We must restore all SNICKER script subscriptions
+        // or the filter scanner will miss spends of SNICKER UTXOs.
+        let scripts_to_subscribe = {
+            let conn = snicker_conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT script_pubkey FROM snicker_utxos WHERE status = 'unspent' AND block_height IS NOT NULL"
+            )?;
+            let mut rows = stmt.query([])?;
+            let mut scripts = Vec::new();
+            while let Some(row) = rows.next()? {
+                let script_bytes: Vec<u8> = row.get(0)?;
+                scripts.push(bdk_wallet::bitcoin::ScriptBuf::from_bytes(script_bytes));
+            }
+            // Drop all database handles before async operations
+            drop(rows);
+            drop(stmt);
+            drop(conn);
+            scripts
+        }; // Database work complete, all resources dropped
+
+        // Now perform async subscription with the collected scripts
+        if !scripts_to_subscribe.is_empty() {
+            let mut sub = update_subscriber.lock().await;
+            for script in &scripts_to_subscribe {
+                sub.add_script(script.clone());
+            }
+            tracing::info!("✅ Re-subscribed to {} SNICKER scripts on wallet load", scripts_to_subscribe.len());
+            println!("✅ Re-subscribed to {} SNICKER scripts on wallet load", scripts_to_subscribe.len());
+        }
+
         // Keep path for compatibility (DEPRECATED - now using in-memory)
         let snicker_db_path = snicker_db_enc_path.clone();
 
@@ -297,6 +334,25 @@ impl WalletNode {
         let coin_type = if network == Network::Bitcoin { 0 } else { 1 };
         let external_desc = format!("tr({}/86h/{}h/0h/0/*)", xprv, coin_type);
         let internal_desc = format!("tr({}/86h/{}h/0h/1/*)", xprv, coin_type);
+
+        // Initialize fee estimator with default settings (5 min cache, 10s timeout)
+        let fee_estimator = fee::FeeEstimator::new(network, 300, 10);
+
+        // Load config for partial UTXO set settings
+        let config = crate::config::Config::load()?;
+
+        // Initialize partial UTXO set database
+        let partial_utxo_db_path = wallet_dir.join("partial_utxo_set.db");
+        let partial_utxo_set = PartialUtxoSet::new(
+            &partial_utxo_db_path,
+            config.partial_utxo_set.min_utxo_amount_sats,
+            config.partial_utxo_set.scan_window_blocks,
+        )?;
+        let partial_utxo_set = Arc::new(Mutex::new(partial_utxo_set));
+
+        // Note: Initial scan is deferred to background_sync after node syncs
+        // This prevents blocking the GUI and ensures blocks are available
+        tracing::info!("📊 Partial UTXO set will be populated after initial sync completes");
 
         // Create broadcast channel for wallet update events
         // Capacity of 100 means we can buffer up to 100 updates before dropping old ones
@@ -315,6 +371,7 @@ impl WalletNode {
         let external_desc_clone = external_desc.clone();
         let internal_desc_clone = internal_desc.clone();
         let update_tx_clone = update_tx.clone();
+        let partial_utxo_set_clone = partial_utxo_set.clone();
         tokio::spawn(async move {
             Self::background_sync(
                 wallet_clone,
@@ -329,14 +386,12 @@ impl WalletNode {
                 external_desc_clone,
                 internal_desc_clone,
                 update_tx_clone,
+                partial_utxo_set_clone,
             )
             .await;
         });
 
         info!("✅ Wallet loaded. Auto-sync enabled in background.");
-
-        // Initialize fee estimator with default settings (5 min cache, 10s timeout)
-        let fee_estimator = fee::FeeEstimator::new(network, 300, 10);
 
         Ok(Self {
             wallet,
@@ -353,6 +408,7 @@ impl WalletNode {
             wallet_db,
             snicker_db,
             fee_estimator,
+            partial_utxo_set,
         })
     }
 
@@ -567,15 +623,44 @@ impl WalletNode {
         from_height: u32,
         wallet_name: &str,
         peer: Option<String>,
+        wallet_dir: &std::path::Path,
     ) -> Result<(bdk_kyoto::Requester, bdk_kyoto::UpdateSubscriber)> {
         use super::blockchain_data::{BlockchainDataProvider, MempoolSpaceApi};
 
         // Get checkpoint from wallet's local chain if it exists, otherwise use genesis or requested height
         let wallet_tip = wallet.local_chain().tip();
+
+        // Load config to get scan window for partial UTXO set
+        let config = crate::config::Config::load().ok();
+        let scan_window = config
+            .as_ref()
+            .map(|c| c.partial_utxo_set.scan_window_blocks)
+            .unwrap_or(1000);
+
         let (checkpoint_height, checkpoint_hash) = if wallet_tip.height() > 0 {
-            // Wallet has synced before, use its current tip
-            info!("📍 Wallet already synced to height {}, resuming from tip", wallet_tip.height());
-            (wallet_tip.height(), wallet_tip.hash())
+            // EXISTING WALLET - distinguish between normal reload and first-time partial UTXO set
+            let partial_utxo_db_path = wallet_dir.join("partial_utxo_set.db");
+            let needs_initial_scan = !partial_utxo_db_path.exists();
+
+            if needs_initial_scan {
+                // Existing wallet but partial UTXO set is new - need to scan last scan_window blocks
+                // Set checkpoint back to allow Kyoto to have headers for those blocks
+                let lookback_height = wallet_tip.height().saturating_sub(scan_window);
+
+                if let Some(checkpoint) = wallet.local_chain().range(lookback_height..=lookback_height).next() {
+                    info!("📍 Existing wallet at height {} but partial UTXO set is new - checkpoint at {} (scan_window: {})",
+                          wallet_tip.height(), lookback_height, scan_window);
+                    (checkpoint.height(), checkpoint.hash())
+                } else {
+                    // Fallback to tip if we can't get the lookback block
+                    tracing::warn!("⚠️  Could not set checkpoint back {} blocks, using tip", scan_window);
+                    (wallet_tip.height(), wallet_tip.hash())
+                }
+            } else {
+                // Normal reload - partial UTXO set exists, just catch up from tip
+                info!("📍 Wallet already synced to height {}, resuming from tip", wallet_tip.height());
+                (wallet_tip.height(), wallet_tip.hash())
+            }
         } else if from_height == 0 {
             // New wallet starting from genesis
             use bdk_wallet::bitcoin::blockdata::constants::genesis_block;
@@ -713,6 +798,7 @@ impl WalletNode {
         external_descriptor: String,
         internal_descriptor: String,
         update_tx: broadcast::Sender<WalletUpdate>,
+        partial_utxo_set: Arc<Mutex<PartialUtxoSet>>,
     ) {
         loop {
             let mut sub = update_subscriber.lock().await;
@@ -771,6 +857,213 @@ impl WalletNode {
                     drop(wallet_guard);
                     drop(conn_guard);
 
+                    // Real-time partial UTXO set update - scan new blocks
+                    {
+                        let mut utxo_set = partial_utxo_set.lock().await;
+                        let last_scanned = match utxo_set.get_last_scanned_height() {
+                            Ok(h) => h,
+                            Err(e) => {
+                                tracing::error!("Failed to get last scanned height: {e}");
+                                0
+                            }
+                        };
+
+                        if height > last_scanned {
+                            // Determine scan range
+                            let (start_height, end_height) = if last_scanned == 0 {
+                                // First run: only scan last scan_window blocks
+                                let scan_window = utxo_set.scan_window;
+                                let start = height.saturating_sub(scan_window - 1);
+                                tracing::info!(
+                                    "🔧 First run: building partial UTXO set from last {} blocks (heights {}-{})",
+                                    scan_window, start, height
+                                );
+                                println!(
+                                    "🔧 Building partial UTXO set from last {} blocks...",
+                                    scan_window
+                                );
+                                (start, height)
+                            } else {
+                                // Normal: scan blocks since last scan
+                                let num_new = height - last_scanned;
+                                tracing::debug!(
+                                    "📊 Partial UTXO set: scanning {} new blocks ({}-{})",
+                                    num_new, last_scanned + 1, height
+                                );
+                                (last_scanned + 1, height)
+                            };
+
+                            // Download and scan blocks in range
+                            let is_first_run = last_scanned == 0;
+                            let mut blocks_scanned = 0;
+                            let mut consecutive_failures = 0;
+                            let max_consecutive_failures = 20; // Stop if 20 blocks in a row fail
+
+                            // On first run, check if the first block hash matches the wallet's chain
+                            if is_first_run && start_height > 0 {
+                                let wallet_lock = wallet.lock().await;
+                                let wallet_chain = wallet_lock.local_chain();
+
+                                // Try to get the block hash at start_height from wallet's chain view
+                                if let Some(checkpoint) = wallet_chain.range(start_height..=start_height).next() {
+                                    tracing::debug!(
+                                        "Wallet's chain view at height {}: {}",
+                                        start_height, checkpoint.hash()
+                                    );
+                                }
+                                drop(wallet_lock);
+                            }
+
+                            for scan_height in start_height..=end_height {
+                                // Get block hash from wallet database
+                                let block_hash = {
+                                    let conn_guard = conn.lock().await;
+                                    let hash_hex: Option<String> = match conn_guard.query_row(
+                                        "SELECT block_hash FROM bdk_blocks WHERE block_height = ?",
+                                        [scan_height],
+                                        |row| row.get(0),
+                                    ) {
+                                        Ok(h) => Some(h),
+                                        Err(_) => None,
+                                    };
+                                    drop(conn_guard);
+
+                                    if let Some(hex) = hash_hex {
+                                        match hex.parse() {
+                                            Ok(hash) => hash,
+                                            Err(e) => {
+                                                tracing::debug!("Invalid block hash at height {}: {}", scan_height, e);
+                                                consecutive_failures += 1;
+                                                if is_first_run && consecutive_failures >= max_consecutive_failures {
+                                                    tracing::info!("⚠️  Stopping initial scan: too many unavailable blocks");
+                                                    break;
+                                                }
+                                                continue;
+                                            }
+                                        }
+                                    } else {
+                                        tracing::debug!("No block hash found for height {}", scan_height);
+                                        consecutive_failures += 1;
+                                        if is_first_run && consecutive_failures >= max_consecutive_failures {
+                                            tracing::info!("⚠️  Stopping initial scan: too many unavailable blocks");
+                                            break;
+                                        }
+                                        continue;
+                                    }
+                                };
+
+                                // Download block
+                                tracing::trace!("Requesting block at height {}: {}", scan_height, block_hash);
+                                let indexed_block = match requester.get_block(block_hash).await {
+                                    Ok(b) => b,
+                                    Err(e) => {
+                                        // Check if this is a "not in chain" error vs other errors
+                                        let err_msg = e.to_string();
+                                        let is_chain_error = err_msg.contains("not a member of the chain");
+
+                                        if is_chain_error && scan_height == start_height {
+                                            // First block in range failed with chain error - likely reorg or stale hashes
+                                            tracing::warn!(
+                                                "⚠️  Block hash {} at height {} is not in current chain (possible reorg or stale database)",
+                                                block_hash, scan_height
+                                            );
+                                        }
+
+                                        // On first run, blocks may not be available - this is expected
+                                        if is_first_run {
+                                            tracing::debug!("Block {} at height {} not available: {}",
+                                                           block_hash, scan_height, e);
+                                            consecutive_failures += 1;
+                                            if consecutive_failures >= max_consecutive_failures {
+                                                tracing::info!("⚠️  Stopping initial scan at height {}: Kyoto doesn't have older blocks", scan_height);
+                                                break;
+                                            }
+                                        } else {
+                                            tracing::error!("Failed to download block {} at height {}: {}",
+                                                           block_hash, scan_height, e);
+                                        }
+                                        continue;
+                                    }
+                                };
+
+                                // Scan block for partial UTXO set
+                                if let Err(e) = utxo_set.scan_block(scan_height, &indexed_block.block) {
+                                    tracing::error!("Failed to scan block {} for partial UTXO set: {}",
+                                                   scan_height, e);
+                                    continue;
+                                }
+
+                                blocks_scanned += 1;
+                                consecutive_failures = 0; // Reset on success
+
+                                // Report progress periodically during initial scan
+                                if is_first_run && blocks_scanned % 50 == 0 {
+                                    let total = end_height - start_height + 1;
+                                    let percent = (blocks_scanned * 100) / total.max(1);
+                                    tracing::info!("📥 Progress: {}/{} blocks scanned ({}%)", blocks_scanned, total, percent);
+                                    println!("📥 Scanning blocks: {}/{} ({}%)", blocks_scanned, total, percent);
+                                }
+                            }
+
+                            // Prune old UTXOs
+                            let scan_window = utxo_set.scan_window;
+                            let window_start = height.saturating_sub(scan_window);
+                            if let Err(e) = utxo_set.prune_older_than(window_start) {
+                                tracing::error!("Failed to prune partial UTXO set: {}", e);
+                            }
+
+                            // Update last scanned height
+                            if let Err(e) = utxo_set.set_last_scanned_height(height) {
+                                tracing::error!("Failed to update last scanned height: {}", e);
+                            } else {
+                                let count = utxo_set.count().unwrap_or(0);
+                                if is_first_run {
+                                    // First run completion message with coverage info
+                                    let requested_blocks = end_height - start_height + 1;
+                                    tracing::info!(
+                                        "✅ Partial UTXO set initialized: {} UTXOs from {} blocks ({}% coverage)",
+                                        count, blocks_scanned, (blocks_scanned * 100) / requested_blocks.max(1)
+                                    );
+                                    println!(
+                                        "✅ Partial UTXO set initialized: {} UTXOs from {} blocks",
+                                        count, blocks_scanned
+                                    );
+                                    if blocks_scanned < requested_blocks {
+                                        tracing::info!(
+                                            "ℹ️  Partial coverage: {}/{} blocks scanned (Kyoto light client has limited history)",
+                                            blocks_scanned, requested_blocks
+                                        );
+                                        println!(
+                                            "ℹ️  Limited coverage: {}/{} blocks (will expand as new blocks arrive)",
+                                            blocks_scanned, requested_blocks
+                                        );
+                                    }
+                                } else {
+                                    tracing::debug!(
+                                        "✅ Partial UTXO set updated to height {} ({} UTXOs)",
+                                        height, count
+                                    );
+                                }
+                            }
+                        }
+
+                        // Log detailed stats every 10 blocks
+                        if height % 10 == 0 {
+                            if let Ok(stats) = utxo_set.stats() {
+                                tracing::info!(
+                                    "📊 Partial UTXO Set | Height: {} | Total: {} | Unspent: {} | <0.001₿: {} | 0.001-0.01₿: {} | ≥0.01₿: {}",
+                                    stats.last_scanned_height,
+                                    stats.total_utxos,
+                                    stats.unspent_utxos,
+                                    stats.small_utxos,
+                                    stats.medium_utxos,
+                                    stats.large_utxos
+                                );
+                            }
+                        }
+                        drop(utxo_set);
+                    }
+
                     // Check for pending SNICKER UTXOs and insert them if confirmed
                     if let Err(e) = Self::check_pending_snicker_utxos(
                         snicker_conn.clone(),
@@ -798,6 +1091,15 @@ impl WalletNode {
                         tracing::error!("Failed to check spent SNICKER UTXOs: {e}");
                     }
 
+                    // Check for long-pending SNICKER UTXOs and warn
+                    if let Err(e) = Self::check_long_pending_snicker_utxos(
+                        snicker_conn.clone(),
+                    )
+                    .await
+                    {
+                        tracing::error!("Failed to check long-pending SNICKER UTXOs: {e}");
+                    }
+
                     // Calculate total balance and broadcast update event
 
                     // Get SNICKER balance directly from in-memory database
@@ -813,10 +1115,26 @@ impl WalletNode {
 
                     let total_balance = regular_balance + snicker_balance;
 
+                    // Generate status message based on current state
+                    let status_message = {
+                        let utxo_set = partial_utxo_set.lock().await;
+                        let last_scanned = utxo_set.get_last_scanned_height().unwrap_or(0);
+                        drop(utxo_set);
+
+                        if last_scanned == 0 {
+                            Some("Initializing partial UTXO set...".to_string())
+                        } else if last_scanned < height {
+                            Some(format!("Scanning blocks: {}/{}", last_scanned, height))
+                        } else {
+                            None // All caught up
+                        }
+                    };
+
                     // Broadcast update event to subscribers
                     let update_event = WalletUpdate {
                         height,
                         balance_sats: total_balance,
+                        status_message,
                     };
 
                     // send() returns the number of subscribers; we don't care if there are none
@@ -1095,6 +1413,98 @@ impl WalletNode {
         Ok(txid)
     }
 
+    /// Validate a proposer's UTXO for SNICKER proposal acceptance
+    ///
+    /// This provides trustless validation of proposer UTXOs using the partial UTXO set.
+    /// Returns Ok(()) if the UTXO is valid and unspent, Err otherwise.
+    ///
+    /// # Arguments
+    /// * `proposer_outpoint` - The UTXO the proposer is using
+    /// * `proposer_amount` - Expected amount of the proposer UTXO
+    ///
+    /// # Validation Steps
+    /// 1. Check if UTXO exists in partial set
+    /// 2. Verify it's unspent
+    /// 3. Verify amount matches
+    ///
+    /// Note: Age constraints only matter for discovery, not validation.
+    /// If we can validate a UTXO (it's in our partial set), we accept it regardless of age.
+    pub async fn validate_proposer_utxo(
+        &self,
+        proposer_outpoint: &bdk_wallet::bitcoin::OutPoint,
+        proposer_amount: u64,
+    ) -> Result<()> {
+        let utxo_set = self.partial_utxo_set.lock().await;
+
+        match utxo_set.get(proposer_outpoint)? {
+            Some(utxo) if utxo.status == UtxoStatus::Unspent => {
+                // ✅ TRUSTLESS validation (we saw it in our scan)
+                tracing::info!("✅ Proposer UTXO validated via partial UTXO set: {}:{}",
+                              proposer_outpoint.txid, proposer_outpoint.vout);
+
+                // Verify amount matches
+                if utxo.amount != proposer_amount {
+                    return Err(anyhow::anyhow!(
+                        "Proposer UTXO amount mismatch: expected {}, got {}",
+                        proposer_amount, utxo.amount
+                    ));
+                }
+
+                // Age constraint only matters for discovery, not validation
+                // If we can validate it (it's in our partial set), we accept it regardless of age
+
+                Ok(())
+            }
+
+            Some(utxo) if utxo.status == UtxoStatus::Spent => {
+                // ❌ We saw this UTXO spent in our scans
+                tracing::warn!(
+                    "❌ Proposer UTXO already spent at height {}: {}:{}",
+                    utxo.spent_at_height.unwrap_or(0),
+                    proposer_outpoint.txid, proposer_outpoint.vout
+                );
+                Err(anyhow::anyhow!(
+                    "Proposer UTXO already spent at height {}",
+                    utxo.spent_at_height.unwrap_or(0)
+                ))
+            }
+
+            None => {
+                // ⚠️ UTXO not in our partial set
+                tracing::warn!(
+                    "⚠️  Proposer UTXO not found in partial UTXO set: {}:{}",
+                    proposer_outpoint.txid, proposer_outpoint.vout
+                );
+                tracing::warn!("    This could mean:");
+                tracing::warn!("    • UTXO older than our scan window");
+                tracing::warn!("    • UTXO doesn't exist (fake)");
+                tracing::warn!("    • UTXO < 5000 sats (below our filter)");
+
+                let config = crate::config::Config::load()?;
+                match config.partial_utxo_set.validation_mode {
+                    crate::config::ValidationMode::Strict => {
+                        // Reject anything outside scan window
+                        Err(anyhow::anyhow!(
+                            "Proposer UTXO not in partial set (strict mode) - outside scan window or doesn't exist"
+                        ))
+                    }
+                    crate::config::ValidationMode::Fallback => {
+                        // TODO: Implement Tor API fallback validation
+                        tracing::warn!("⚠️  Fallback validation not yet implemented - rejecting");
+                        Err(anyhow::anyhow!(
+                            "Proposer UTXO not in partial set and fallback not implemented"
+                        ))
+                    }
+                }
+            }
+
+            _ => {
+                // Shouldn't happen (covered all enum cases)
+                Err(anyhow::anyhow!("Unexpected UTXO status"))
+            }
+        }
+    }
+
     /// Send funds with automatic fee estimation (6-block target)
     ///
     /// Estimates optimal fee rate from mempool.space (or static defaults for regtest).
@@ -1134,18 +1544,15 @@ impl WalletNode {
 
         // Update database state after successful broadcast
         // Mark SNICKER UTXOs as PENDING (not spent yet - waiting for confirmation)
+        // CRITICAL: This re-subscribes to each UTXO's script before marking as pending
         if !selected.snicker_utxos.is_empty() {
-            let conn = self.snicker_conn.lock().unwrap();
             for (txid_str, vout, _, _, _) in &selected.snicker_utxos {
-                conn.execute(
-                    "UPDATE snicker_utxos SET status = 'pending', spent_in_txid = ? WHERE txid = ? AND vout = ?",
-                    (txid.to_string(), txid_str, vout),
-                )?;
+                self.mark_snicker_utxo_pending(
+                    txid_str,
+                    *vout,
+                    &txid.to_string(),
+                ).await?;
             }
-            drop(conn);
-
-            // Flush to encrypted file after UTXO change
-            self.snicker_db.flush(&*self.snicker_conn.lock().unwrap())?;
             info!("📝 Marked {} SNICKER UTXOs as pending (awaiting confirmation)", selected.snicker_utxos.len());
         }
 
@@ -2295,7 +2702,113 @@ impl WalletNode {
         Ok(())
     }
 
-    /// Mark a SNICKER UTXO as spent
+    /// Check for SNICKER UTXOs that have been pending for >24 hours and log warnings
+    ///
+    /// This only applies to UTXOs we broadcast ourselves (receiver role or manual sends).
+    /// Proposer UTXOs never go to 'pending' status from the proposer's perspective.
+    async fn check_long_pending_snicker_utxos(
+        snicker_conn: Arc<std::sync::Mutex<Connection>>,
+    ) -> Result<()> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64;
+
+        let threshold = 24 * 60 * 60; // 24 hours in seconds
+
+        // Get all pending UTXOs that have been pending for >24 hours
+        let long_pending: Vec<(String, u32, String, i64)> = {
+            let conn = snicker_conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT txid, vout, spent_in_txid, pending_since
+                 FROM snicker_utxos
+                 WHERE status = 'pending'
+                   AND pending_since IS NOT NULL
+                   AND ? - pending_since > ?"
+            )?;
+            let mut rows = stmt.query([now, threshold])?;
+            let mut result = Vec::new();
+            while let Some(row) = rows.next()? {
+                result.push((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?));
+            }
+            result
+        };
+
+        if !long_pending.is_empty() {
+            tracing::warn!(
+                "⚠️  {} SNICKER UTXO(s) have been pending for >24 hours without confirmation:",
+                long_pending.len()
+            );
+            for (txid, vout, spent_in_txid, pending_since) in long_pending {
+                let hours_pending = (now - pending_since) / 3600;
+                tracing::warn!(
+                    "   - {}:{} (spending tx: {}, pending for {} hours)",
+                    txid, vout, spent_in_txid, hours_pending
+                );
+                tracing::warn!(
+                    "     This may indicate the transaction was rejected or not propagated."
+                );
+                tracing::warn!(
+                    "     Check mempool.space or consider manual recovery if needed."
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Mark a SNICKER UTXO as pending (broadcast but not confirmed)
+    ///
+    /// CRITICAL: Re-subscribes to the UTXO's script BEFORE marking as pending.
+    /// This ensures the spend will be detected even if subscription was previously lost.
+    pub async fn mark_snicker_utxo_pending(
+        &self,
+        txid: &str,
+        vout: u32,
+        spent_in_txid: &str,
+    ) -> Result<()> {
+        // First, get the script_pubkey from database
+        let script_bytes: Vec<u8> = {
+            let conn = self.snicker_conn.lock().unwrap();
+            conn.query_row(
+                "SELECT script_pubkey FROM snicker_utxos WHERE txid = ? AND vout = ?",
+                [txid, &vout.to_string()],
+                |row| row.get(0),
+            )?
+        };
+        let script_pubkey = bdk_wallet::bitcoin::ScriptBuf::from_bytes(script_bytes);
+
+        // CRITICAL: Re-subscribe to script BEFORE marking as pending
+        // This ensures spend detection even if subscription was lost
+        {
+            let mut update_subscriber = self.update_subscriber.lock().await;
+            update_subscriber.add_script(script_pubkey);
+            drop(update_subscriber);
+            tracing::info!("✅ Re-subscribed to UTXO script before marking pending: {}:{}", txid, vout);
+        }
+
+        // Now mark as pending in database with timestamp
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64;
+
+        let conn = self.snicker_conn.lock().unwrap();
+        conn.execute(
+            "UPDATE snicker_utxos SET status = 'pending', spent_in_txid = ?, pending_since = ? WHERE txid = ? AND vout = ?",
+            (spent_in_txid, now, txid, vout),
+        )?;
+        drop(conn);
+
+        tracing::info!("✅ Marked SNICKER UTXO {}:{} as PENDING in {} at timestamp {}", txid, vout, spent_in_txid, now);
+
+        // Flush to encrypted file after UTXO change
+        self.snicker_db.flush(&*self.snicker_conn.lock().unwrap())?;
+
+        Ok(())
+    }
+
+    /// Mark a SNICKER UTXO as spent (confirmed)
+    ///
+    /// This is called by background_sync when a pending UTXO is detected as spent.
     pub async fn mark_snicker_utxo_spent(
         &self,
         txid: &str,
