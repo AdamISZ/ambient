@@ -84,7 +84,9 @@ fi
     -daemon \
     -txindex=1 \
     -blockfilterindex=1 \
-    -peerblockfilters=1
+    -peerblockfilters=1 \
+    -debug=rpc \
+    -logips=1
 
 echo "⏳ Waiting for bitcoind to start..."
 

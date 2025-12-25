@@ -29,7 +29,7 @@ pub enum Message {
     WalletPasswordConfirmChanged(String),
     OpenWalletPasswordChanged(String),
     GenerateWalletRequested,
-    WalletGenerated(Result<(String, String), String>), // (wallet_name, mnemonic) or error
+    WalletGenerated(Result<(String, String, ManagerWrapper), String>), // (wallet_name, mnemonic, manager) or error
     WalletGenerationConfirmed,
     LoadWalletRequested(String, String), // (wallet name, password)
     WalletCreated(String), // wallet name

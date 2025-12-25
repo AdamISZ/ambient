@@ -178,14 +178,27 @@ impl PartialUtxoSet {
             for (vout, output) in tx.output.iter().enumerate() {
                 // Filter 1: P2TR only
                 if !output.script_pubkey.is_p2tr() {
+                    tracing::trace!(
+                        "Block {} tx {} output {}: skipping non-P2TR (type: {:?})",
+                        height, txid, vout, output.script_pubkey
+                    );
                     continue;
                 }
 
                 // Filter 2: >= min_amount only
                 let amount = output.value.to_sat();
                 if amount < self.min_amount {
+                    tracing::trace!(
+                        "Block {} tx {} output {}: skipping amount {} < min {}",
+                        height, txid, vout, amount, self.min_amount
+                    );
                     continue;
                 }
+
+                tracing::debug!(
+                    "Block {} tx {} output {}: ADDING P2TR UTXO {} sats",
+                    height, txid, vout, amount
+                );
 
                 // Filter 3: Age is implicit (we're scanning recent blocks)
 

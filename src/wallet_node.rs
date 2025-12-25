@@ -868,6 +868,7 @@ impl WalletNode {
                             }
                         };
 
+                        // Skip if already scanned to this height (prevent re-entry during ongoing scan)
                         if height > last_scanned {
                             // Determine scan range
                             let (start_height, end_height) = if last_scanned == 0 {
@@ -996,12 +997,28 @@ impl WalletNode {
                                 blocks_scanned += 1;
                                 consecutive_failures = 0; // Reset on success
 
+                                // CRITICAL: Update last_scanned incrementally after each block
+                                // This prevents scan restarts when new blocks arrive AND
+                                // ensures we can resume correctly if wallet is closed mid-scan
+                                if let Err(e) = utxo_set.set_last_scanned_height(scan_height) {
+                                    tracing::error!("Failed to update last scanned height: {}", e);
+                                }
+
                                 // Report progress periodically during initial scan
                                 if is_first_run && blocks_scanned % 50 == 0 {
                                     let total = end_height - start_height + 1;
                                     let percent = (blocks_scanned * 100) / total.max(1);
                                     tracing::info!("📥 Progress: {}/{} blocks scanned ({}%)", blocks_scanned, total, percent);
                                     println!("📥 Scanning blocks: {}/{} ({}%)", blocks_scanned, total, percent);
+
+                                    // Broadcast status update to GUI
+                                    let status_msg = format!("Building partial UTXO set: {}/{} blocks ({}%)", blocks_scanned, total, percent);
+                                    let update_event = WalletUpdate {
+                                        height,
+                                        balance_sats: 0, // Balance not relevant during initial scan
+                                        status_message: Some(status_msg),
+                                    };
+                                    let _ = update_tx.send(update_event);
                                 }
                             }
 
@@ -1012,38 +1029,44 @@ impl WalletNode {
                                 tracing::error!("Failed to prune partial UTXO set: {}", e);
                             }
 
-                            // Update last scanned height
-                            if let Err(e) = utxo_set.set_last_scanned_height(height) {
-                                tracing::error!("Failed to update last scanned height: {}", e);
-                            } else {
-                                let count = utxo_set.count().unwrap_or(0);
-                                if is_first_run {
-                                    // First run completion message with coverage info
-                                    let requested_blocks = end_height - start_height + 1;
+                            // Report completion (last_scanned is already updated incrementally)
+                            let count = utxo_set.count().unwrap_or(0);
+                            if is_first_run {
+                                // First run completion message with coverage info
+                                let requested_blocks = end_height - start_height + 1;
+                                tracing::info!(
+                                    "✅ Partial UTXO set initialized: {} UTXOs from {} blocks ({}% coverage)",
+                                    count, blocks_scanned, (blocks_scanned * 100) / requested_blocks.max(1)
+                                );
+                                println!(
+                                    "✅ Partial UTXO set initialized: {} UTXOs from {} blocks",
+                                    count, blocks_scanned
+                                );
+                                if blocks_scanned < requested_blocks {
                                     tracing::info!(
-                                        "✅ Partial UTXO set initialized: {} UTXOs from {} blocks ({}% coverage)",
-                                        count, blocks_scanned, (blocks_scanned * 100) / requested_blocks.max(1)
+                                        "ℹ️  Partial coverage: {}/{} blocks scanned (Kyoto light client has limited history)",
+                                        blocks_scanned, requested_blocks
                                     );
                                     println!(
-                                        "✅ Partial UTXO set initialized: {} UTXOs from {} blocks",
-                                        count, blocks_scanned
-                                    );
-                                    if blocks_scanned < requested_blocks {
-                                        tracing::info!(
-                                            "ℹ️  Partial coverage: {}/{} blocks scanned (Kyoto light client has limited history)",
-                                            blocks_scanned, requested_blocks
-                                        );
-                                        println!(
-                                            "ℹ️  Limited coverage: {}/{} blocks (will expand as new blocks arrive)",
-                                            blocks_scanned, requested_blocks
-                                        );
-                                    }
-                                } else {
-                                    tracing::debug!(
-                                        "✅ Partial UTXO set updated to height {} ({} UTXOs)",
-                                        height, count
+                                        "ℹ️  Limited coverage: {}/{} blocks (will expand as new blocks arrive)",
+                                        blocks_scanned, requested_blocks
                                     );
                                 }
+                            } else {
+                                tracing::debug!(
+                                    "✅ Partial UTXO set updated to height {} ({} UTXOs)",
+                                    height, count
+                                );
+                            }
+
+                            // Broadcast completion update to clear status bar
+                            if is_first_run {
+                                let update_event = WalletUpdate {
+                                    height,
+                                    balance_sats: 0, // Balance will be updated by next blockchain update
+                                    status_message: None, // Clear status message
+                                };
+                                let _ = update_tx.send(update_event);
                             }
                         }
 

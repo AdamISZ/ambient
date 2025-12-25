@@ -336,9 +336,11 @@ impl AmbientApp {
                         async move {
                             rt_handle.spawn(async move {
                                 match crate::manager::Manager::generate(&name, &network, recovery_height, &password).await {
-                                    Ok((_manager, mnemonic)) => {
-                                        // Manager is dropped here, wallet is already saved to disk
-                                        Ok((name.clone(), mnemonic.to_string()))
+                                    Ok((manager, mnemonic)) => {
+                                        // CRITICAL: Return the manager instead of dropping it!
+                                        // Dropping would leak the background_sync task
+                                        let wrapper = ManagerWrapper(Arc::new(Some(manager)));
+                                        Ok((name.clone(), mnemonic.to_string(), wrapper))
                                     }
                                     Err(e) => Err(format!("Failed to generate wallet: {}", e))
                                 }
@@ -352,11 +354,18 @@ impl AmbientApp {
 
             Message::WalletGenerated(result) => {
                 match result {
-                    Ok((wallet_name, mnemonic)) => {
-                        // Update modal to show mnemonic step
+                    Ok((wallet_name, mnemonic, manager_wrapper)) => {
+                        // Extract manager from wrapper
+                        let manager = Arc::try_unwrap(manager_wrapper.0)
+                            .ok()
+                            .and_then(|opt| opt)
+                            .expect("Failed to unwrap manager from wrapper");
+
+                        // Update modal to show mnemonic step AND store manager
                         if let Some(crate::gui::modal::Modal::GenerateWallet { step, data }) = &mut self.active_modal {
                             *step = crate::gui::modal::GenerateWalletStep::DisplayMnemonic;
                             data.mnemonic = Some(mnemonic);
+                            data.generated_manager = Some(manager);
                             println!("✅ Wallet '{}' generated successfully", wallet_name);
                         }
                     }
@@ -374,19 +383,34 @@ impl AmbientApp {
 
             Message::WalletGenerationConfirmed => {
                 // User has confirmed they saved the mnemonic
-                // Load the wallet we just created
-                if let Some(crate::gui::modal::Modal::GenerateWallet { data, .. }) = &self.active_modal {
-                    let name = data.wallet_name.clone();
-                    let password = data.password.clone();
+                // Use the already-generated manager (don't reload!)
+                if let Some(crate::gui::modal::Modal::GenerateWallet { data, .. }) = &mut self.active_modal {
+                    let wallet_name = data.wallet_name.clone();
 
-                    // Close the modal and show loading state
-                    self.active_modal = None;
-                    self.state = crate::gui::state::AppState::LoadingWallet {
-                        wallet_name: name.clone(),
-                    };
+                    if let Some(manager) = data.generated_manager.take() {
+                        // Close modal
+                        self.active_modal = None;
 
-                    println!("Loading generated wallet '{}'...", name);
-                    return Task::done(Message::LoadWalletRequested(name, password));
+                        println!("✅ Wallet '{}' ready", wallet_name);
+
+                        // Wrap manager in Arc<RwLock<>> for shared mutable access
+                        let manager = Arc::new(RwLock::new(manager));
+
+                        // Transition to WalletLoaded state
+                        self.state = AppState::WalletLoaded {
+                            manager,
+                            wallet_data: crate::gui::state::WalletData::default(),
+                        };
+
+                        // Fetch initial balance
+                        return Task::done(Message::SyncRequested);
+                    } else {
+                        eprintln!("❌ No manager found after generation");
+                        self.active_modal = None;
+                        self.state = AppState::Error {
+                            message: "Internal error: manager not found".to_string(),
+                        };
+                    }
                 }
                 Task::none()
             }

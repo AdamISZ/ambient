@@ -1086,7 +1086,7 @@ impl Snicker {
             },
         );
 
-        if !has_pending_since.unwrap_or(true) {
+        if !has_pending_since.unwrap_or(false) {
             conn.execute(
                 "ALTER TABLE snicker_utxos ADD COLUMN pending_since INTEGER",
                 [],

@@ -51,7 +51,6 @@ pub enum GenerateWalletStep {
 }
 
 /// Data carried through the wallet generation wizard
-#[derive(Debug, Clone)]
 pub struct GenerateWalletData {
     pub wallet_name: String,
     pub network: String,
@@ -59,6 +58,35 @@ pub struct GenerateWalletData {
     pub password_confirm: String,
     pub mnemonic: Option<String>,
     pub confirmed_saved: bool,
+    pub generated_manager: Option<crate::manager::Manager>,
+}
+
+impl std::fmt::Debug for GenerateWalletData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GenerateWalletData")
+            .field("wallet_name", &self.wallet_name)
+            .field("network", &self.network)
+            .field("password", &"<redacted>")
+            .field("password_confirm", &"<redacted>")
+            .field("mnemonic", &self.mnemonic.as_ref().map(|_| "<redacted>"))
+            .field("confirmed_saved", &self.confirmed_saved)
+            .field("generated_manager", &self.generated_manager.as_ref().map(|_| "<manager>"))
+            .finish()
+    }
+}
+
+impl Clone for GenerateWalletData {
+    fn clone(&self) -> Self {
+        Self {
+            wallet_name: self.wallet_name.clone(),
+            network: self.network.clone(),
+            password: self.password.clone(),
+            password_confirm: self.password_confirm.clone(),
+            mnemonic: self.mnemonic.clone(),
+            confirmed_saved: self.confirmed_saved,
+            generated_manager: None, // Manager can't be cloned - leave as None
+        }
+    }
 }
 
 impl GenerateWalletData {
@@ -70,6 +98,7 @@ impl GenerateWalletData {
             password_confirm: String::new(),
             mnemonic: None,
             confirmed_saved: false,
+            generated_manager: None,
         }
     }
 }
