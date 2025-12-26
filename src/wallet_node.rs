@@ -295,37 +295,12 @@ impl WalletNode {
         };
         let snicker_conn = Arc::new(std::sync::Mutex::new(snicker_conn_raw));
 
-        // Re-subscribe to all unspent SNICKER scripts BEFORE processing any blocks
-        // This is critical: when wallet restarts, UpdateSubscriber's spk_cache is recreated
-        // from descriptor scripts only. We must restore all SNICKER script subscriptions
-        // or the filter scanner will miss spends of SNICKER UTXOs.
-        let scripts_to_subscribe = {
-            let conn = snicker_conn.lock().unwrap();
-            let mut stmt = conn.prepare(
-                "SELECT script_pubkey FROM snicker_utxos WHERE status = 'unspent' AND block_height IS NOT NULL"
-            )?;
-            let mut rows = stmt.query([])?;
-            let mut scripts = Vec::new();
-            while let Some(row) = rows.next()? {
-                let script_bytes: Vec<u8> = row.get(0)?;
-                scripts.push(bdk_wallet::bitcoin::ScriptBuf::from_bytes(script_bytes));
-            }
-            // Drop all database handles before async operations
-            drop(rows);
-            drop(stmt);
-            drop(conn);
-            scripts
-        }; // Database work complete, all resources dropped
-
-        // Now perform async subscription with the collected scripts
-        if !scripts_to_subscribe.is_empty() {
-            let mut sub = update_subscriber.lock().await;
-            for script in &scripts_to_subscribe {
-                sub.add_script(script.clone());
-            }
-            tracing::info!("✅ Re-subscribed to {} SNICKER scripts on wallet load", scripts_to_subscribe.len());
-            println!("✅ Re-subscribed to {} SNICKER scripts on wallet load", scripts_to_subscribe.len());
-        }
+        // NOTE: We no longer subscribe to SNICKER scripts via Kyoto
+        // SNICKER UTXO spends are detected via block scanning (see background_sync)
+        // This architectural separation means:
+        // - BDK/Kyoto: Handles regular descriptor-based wallet UTXOs
+        // - Block scanning: Handles SNICKER UTXO tracking independently
+        // As a result, the bdk-kyoto patch (which added arbitrary script subscription) is no longer needed
 
         // Keep path for compatibility (DEPRECATED - now using in-memory)
         let snicker_db_path = snicker_db_enc_path.clone();
@@ -987,6 +962,50 @@ impl WalletNode {
                                     }
                                 };
 
+                                // Check if any inputs in this block spend our SNICKER UTXOs
+                                // Do this BEFORE updating partial UTXO set for efficiency
+                                for tx in &indexed_block.block.txdata {
+                                    let spending_txid = tx.compute_txid();
+
+                                    for input in &tx.input {
+                                        let outpoint = input.previous_output;
+
+                                        // Check if this input spends a SNICKER UTXO
+                                        let is_snicker_spend: bool = {
+                                            let conn = snicker_conn.lock().unwrap();
+                                            conn.query_row(
+                                                "SELECT 1 FROM snicker_utxos WHERE txid = ?1 AND vout = ?2 AND status IN ('unspent', 'pending')",
+                                                (&outpoint.txid.to_string(), outpoint.vout),
+                                                |_| Ok(true),
+                                            ).is_ok()
+                                        };
+
+                                        if is_snicker_spend {
+                                            tracing::info!("🔍 SNICKER UTXO {}:{} spent in {} at height {}",
+                                                outpoint.txid, outpoint.vout, spending_txid, scan_height);
+
+                                            // Mark as spent in SNICKER database
+                                            {
+                                                let conn = snicker_conn.lock().unwrap();
+                                                if let Err(e) = conn.execute(
+                                                    "UPDATE snicker_utxos SET status = 'spent', spent_in_txid = ? WHERE txid = ? AND vout = ?",
+                                                    (spending_txid.to_string(), outpoint.txid.to_string(), outpoint.vout),
+                                                ) {
+                                                    tracing::error!("Failed to mark SNICKER UTXO as spent: {}", e);
+                                                } else {
+                                                    tracing::info!("✅ Marked SNICKER UTXO {}:{} as SPENT in {}",
+                                                        outpoint.txid, outpoint.vout, spending_txid);
+
+                                                    // Flush to encrypted file after UTXO status change
+                                                    if let Err(e) = snicker_db.flush(&*conn) {
+                                                        tracing::error!("Failed to flush SNICKER database: {}", e);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
                                 // Scan block for partial UTXO set
                                 if let Err(e) = utxo_set.scan_block(scan_height, &indexed_block.block) {
                                     tracing::error!("Failed to scan block {} for partial UTXO set: {}",
@@ -1103,16 +1122,9 @@ impl WalletNode {
                         tracing::error!("Failed to process pending SNICKER UTXOs: {e}");
                     }
 
-                    // Check for spent SNICKER UTXOs and mark them as spent
-                    if let Err(e) = Self::check_spent_snicker_utxos(
-                        snicker_conn.clone(),
-                        Some(&snicker_db),
-                        conn.clone(),
-                    )
-                    .await
-                    {
-                        tracing::error!("Failed to check spent SNICKER UTXOs: {e}");
-                    }
+                    // NOTE: SNICKER UTXO spend detection now happens during block scanning
+                    // (see SNICKER spend check in partial UTXO set scan loop above)
+                    // The old check_spent_snicker_utxos() method is no longer used.
 
                     // Check for long-pending SNICKER UTXOs and warn
                     if let Err(e) = Self::check_long_pending_snicker_utxos(
@@ -1567,7 +1579,7 @@ impl WalletNode {
 
         // Update database state after successful broadcast
         // Mark SNICKER UTXOs as PENDING (not spent yet - waiting for confirmation)
-        // CRITICAL: This re-subscribes to each UTXO's script before marking as pending
+        // Spend detection happens via block scanning (see background_sync)
         if !selected.snicker_utxos.is_empty() {
             for (txid_str, vout, _, _, _) in &selected.snicker_utxos {
                 self.mark_snicker_utxo_pending(
@@ -2668,10 +2680,12 @@ impl WalletNode {
         wallet_conn: Arc<Mutex<Connection>>,
     ) -> Result<()> {
         // Get all unspent SNICKER UTXOs from database
+        // Check both confirmed (block_height IS NOT NULL) and unconfirmed (block_height IS NULL)
+        // because a UTXO can be spent even before it confirms (if used in a new SNICKER proposal)
         let unspent: Vec<(String, u32)> = {
             let conn = snicker_conn.lock().unwrap();
             let mut stmt = conn.prepare(
-                "SELECT txid, vout FROM snicker_utxos WHERE block_height IS NOT NULL AND status IN ('unspent', 'pending')"
+                "SELECT txid, vout FROM snicker_utxos WHERE status IN ('unspent', 'pending')"
             )?;
             let mut rows = stmt.query([])?;
             let mut result = Vec::new();
@@ -2781,8 +2795,8 @@ impl WalletNode {
 
     /// Mark a SNICKER UTXO as pending (broadcast but not confirmed)
     ///
-    /// CRITICAL: Re-subscribes to the UTXO's script BEFORE marking as pending.
-    /// This ensures the spend will be detected even if subscription was previously lost.
+    /// Spend detection happens via block scanning in background_sync, which checks
+    /// every transaction input against our SNICKER UTXO database.
     pub async fn mark_snicker_utxo_pending(
         &self,
         txid: &str,
@@ -2800,14 +2814,10 @@ impl WalletNode {
         };
         let script_pubkey = bdk_wallet::bitcoin::ScriptBuf::from_bytes(script_bytes);
 
-        // CRITICAL: Re-subscribe to script BEFORE marking as pending
-        // This ensures spend detection even if subscription was lost
-        {
-            let mut update_subscriber = self.update_subscriber.lock().await;
-            update_subscriber.add_script(script_pubkey);
-            drop(update_subscriber);
-            tracing::info!("✅ Re-subscribed to UTXO script before marking pending: {}:{}", txid, vout);
-        }
+        // NOTE: SNICKER UTXOs are NOT tracked via Kyoto subscriptions.
+        // Spend detection happens via block scanning in background_sync, which checks
+        // every transaction input against our SNICKER UTXO database.
+        tracing::debug!("Marking SNICKER UTXO pending (spend detection via block scanning): {}:{}", txid, vout);
 
         // Now mark as pending in database with timestamp
         let now = std::time::SystemTime::now()

@@ -83,6 +83,3 @@ required-features = ["gui"]
 name = "ambient-relay"
 path = "src/bin/ambient-relay.rs"
 required-features = ["test-utils"]
-
-[patch.crates-io]
-bdk_kyoto = { path = "/home/waxwing/code/bdk-kyoto-patched" }

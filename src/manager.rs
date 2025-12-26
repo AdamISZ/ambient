@@ -201,8 +201,8 @@ impl Manager {
 
     /// Wait for wallet to sync to at least the specified height
     ///
-    /// Actively pulls updates from Kyoto and applies them to the wallet until
-    /// it reaches the target height, or times out.
+    /// Waits for blockchain updates from background_sync until the wallet reaches
+    /// the target height, or times out.
     ///
     /// # Arguments
     /// * `target_height` - Minimum height to wait for
@@ -211,39 +211,47 @@ impl Manager {
         let start = std::time::Instant::now();
         let timeout = std::time::Duration::from_secs(timeout_secs);
 
-        loop {
-            // Check if we've reached the expected height
-            {
-                let wallet = self.wallet_node.wallet.lock().await;
-                let current_height = wallet.local_chain().tip().height();
-                if current_height >= target_height {
-                    tracing::info!("✅ Synced to height {}", current_height);
-                    return Ok(current_height);
-                }
+        // Check if we're already at the target height
+        {
+            let wallet = self.wallet_node.wallet.lock().await;
+            let current_height = wallet.local_chain().tip().height();
+            if current_height >= target_height {
+                tracing::info!("✅ Already at height {}", current_height);
+                return Ok(current_height);
             }
+        }
 
-            // Try to get next update with timeout
-            let mut sub = self.wallet_node.update_subscriber.lock().await;
+        // Subscribe to blockchain updates from background_sync
+        // This avoids deadlock by not calling .update() directly
+        let mut update_rx = self.wallet_node.subscribe_to_updates();
+
+        loop {
+            // Wait for next update with timeout
             let update_result = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
-                sub.update()
+                update_rx.recv()
             ).await;
-            drop(sub);
 
             match update_result {
-                Ok(Ok(update)) => {
-                    let mut wallet = self.wallet_node.wallet.lock().await;
-                    let mut conn = self.wallet_node.conn.lock().await;
-
-                    wallet.apply_update(update)?;
-                    wallet.persist(&mut conn)?;
-
-                    let height = wallet.local_chain().tip().height();
-                    tracing::info!("Sync update: height {} / {}", height, target_height);
+                Ok(Ok(_update)) => {
+                    // Check if we've reached target height
+                    let wallet = self.wallet_node.wallet.lock().await;
+                    let current_height = wallet.local_chain().tip().height();
+                    if current_height >= target_height {
+                        tracing::info!("✅ Synced to height {}", current_height);
+                        return Ok(current_height);
+                    }
+                    tracing::info!("Sync update: height {} / {}", current_height, target_height);
                 }
-                Ok(Err(e)) => return Err(anyhow::anyhow!("Sync error: {}", e)),
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(n))) => {
+                    tracing::warn!("Lagged {} blockchain updates, continuing", n);
+                    continue;
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                    return Err(anyhow::anyhow!("Background sync stopped"));
+                }
                 Err(_) => {
-                    // Timeout on this update - check if we've exceeded total timeout
+                    // Timeout - check total elapsed time
                     if start.elapsed() > timeout {
                         let wallet = self.wallet_node.wallet.lock().await;
                         let current_height = wallet.local_chain().tip().height();
@@ -252,8 +260,6 @@ impl Manager {
                             current_height, target_height
                         ));
                     }
-                    // Otherwise continue waiting
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
             }
         }
@@ -1056,7 +1062,7 @@ impl Manager {
 
         println!("🔍 Step 8: Marking pending SNICKER UTXO...");
         // Mark the input SNICKER UTXO as pending (broadcast but not confirmed)
-        // This will re-subscribe to the script before marking as pending
+        // Spend detection happens via block scanning (see wallet_node::background_sync)
         for input in &tx.input {
             if let Some(utxo) = our_utxos.iter().find(|u| u.outpoint() == input.previous_output) {
                 if matches!(utxo, crate::wallet_node::WalletUtxo::Snicker { .. }) {
@@ -1166,18 +1172,14 @@ impl Manager {
             .ok_or_else(|| anyhow::anyhow!("Receiver's tweaked output not found in transaction"))?;
         let txid = tx.compute_txid();
 
-        // CRITICAL: Subscribe to script BEFORE storing in database
-        // This ensures atomicity: if we crash after subscribe but before DB write,
-        // the subscription exists (harmless duplicate on restart) but UTXO not in DB (safe).
-        // If we crash after DB write, restart re-subscription will restore it.
-        {
-            let mut update_subscriber = self.wallet_node.update_subscriber.lock().await;
-            update_subscriber.add_script(tweaked_output.script_pubkey.clone());
-            drop(update_subscriber);
-            println!("✅ Subscribed to SNICKER script before storing UTXO");
-        }
+        // NOTE: SNICKER UTXOs are NOT tracked via Kyoto subscriptions.
+        // Instead, they are detected and marked as spent via block scanning in background_sync.
+        // The block scanner checks every input in every transaction against our SNICKER UTXO database.
+        // This architectural separation means:
+        // - BDK/Kyoto: Handles regular descriptor-based wallet UTXOs
+        // - Block scanning: Handles SNICKER UTXO tracking independently
 
-        // Store in database AFTER subscription
+        // Store in database (spend detection will happen via block scanning)
         self.snicker.store_snicker_utxo(
             txid,
             output_index as u32,
