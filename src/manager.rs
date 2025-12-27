@@ -281,43 +281,35 @@ impl Manager {
     ///
     /// # Returns
     /// Number of candidates found and stored
-    pub async fn scan_for_snicker_candidates(
-        &self,
-        num_blocks: u32,
-        size_min: u64,
-        size_max: u64,
-    ) -> Result<usize> {
-        // Scan blockchain using RPC to find taproot UTXOs in the size range
-        let candidates = self.wallet_node.scan_blocks_for_taproot_utxos(
-            num_blocks,
-            size_min,
-            size_max
-        ).await?;
-
-        // Store candidates in SNICKER database
-        for (block_height, _txid, tx) in &candidates {
-            self.snicker.store_candidate(*block_height, tx).await?;
-        }
-
-        Ok(candidates.len())
-    }
+    // Removed: scan_for_snicker_candidates
+    // Candidates are now queried directly from partial_utxo_set which is automatically
+    // populated during blockchain scanning. No separate scanning or storage needed.
 
     /// Find SNICKER proposal opportunities for our wallet
     ///
     /// # Arguments
-    /// * `min_utxo_sats` - Minimum size of our UTXO to consider
+    /// * `min_candidate_sats` - Minimum size of candidate UTXOs
+    /// * `max_candidate_sats` - Maximum size of candidate UTXOs (default: u64::MAX for no limit)
+    /// * `max_block_age` - Maximum age in blocks from tip (0 = all blocks)
+    /// * `snicker_only` - Only consider SNICKER v1 transaction outputs
     ///
     /// # Returns
     /// List of opportunities sorted by value
     pub async fn find_snicker_opportunities(
         &self,
-        min_utxo_sats: u64,
+        min_candidate_sats: u64,
+        max_candidate_sats: u64,
+        max_block_age: u32,
+        snicker_only: bool,
     ) -> Result<Vec<ProposalOpportunity>> {
         // Get all our UTXOs (both regular wallet and SNICKER UTXOs)
         let our_utxos = self.wallet_node.get_all_wallet_utxos().await?;
 
-        // Find opportunities using Snicker
-        self.snicker.find_opportunities(&our_utxos, min_utxo_sats).await
+        // Query candidates from partial_utxo_set (unspent P2TR UTXOs in size range)
+        let candidates = self.get_snicker_candidates(min_candidate_sats, max_candidate_sats, max_block_age, snicker_only).await?;
+
+        // Find opportunities using Snicker (no longer filtering our UTXOs by size)
+        self.snicker.find_opportunities(&our_utxos, &candidates)
     }
 
     /// Create a SNICKER proposal for a specific opportunity
@@ -540,8 +532,8 @@ impl Manager {
 
         // Create proposal using Snicker (will sign via callback)
         let (proposal, encrypted_proposal) = self.snicker.propose(
-            opportunity.target_tx.clone(),
-            opportunity.target_output_index,
+            opportunity.target_outpoint,
+            opportunity.target_txout.clone(),
             our_utxo.outpoint(),
             our_utxo.txout(),
             our_input_privkey,  // Proposer's input key for SNICKER tweak (enables recovery)
@@ -559,11 +551,7 @@ impl Manager {
 
         // Store decrypted proposal in our database (proposer side)
         let our_utxo_str = format!("{}:{}", opportunity.our_outpoint.txid, opportunity.our_outpoint.vout);
-        let target_utxo_str = self.snicker.extract_receiver_utxo(
-            &proposal,
-            &opportunity.target_tx,
-            opportunity.target_output_index
-        )?;
+        let target_utxo_str = format!("{}:{}", opportunity.target_outpoint.txid, opportunity.target_outpoint.vout);
 
         self.snicker.store_decrypted_proposal(
             &proposal,
@@ -1085,39 +1073,70 @@ impl Manager {
         self.wallet_node.broadcast_transaction(tx).await
     }
 
-    /// Get all stored SNICKER candidates
-    pub async fn get_snicker_candidates(&self) -> Result<Vec<(u32, bdk_wallet::bitcoin::Txid, Transaction)>> {
-        self.snicker.get_snicker_candidates().await
-    }
-
-    /// Filter candidates to only those with SNICKER pattern
+    /// Query SNICKER candidates from partial_utxo_set
     ///
-    /// Returns only transactions that match SNICKER heuristics:
-    /// - At least 2 inputs (all P2TR)
-    /// - Exactly 3 outputs (all P2TR)
-    /// - Exactly 2 outputs equal (privacy), 1 different (change)
-    pub async fn filter_snicker_pattern_candidates(
-        &self
-    ) -> Result<Vec<(u32, bdk_wallet::bitcoin::Txid, bdk_wallet::bitcoin::Transaction)>> {
-        let all_candidates = self.get_snicker_candidates().await?;
+    /// # Arguments
+    /// * `min_amount` - Minimum UTXO amount in satoshis
+    /// * `max_amount` - Maximum UTXO amount in satoshis
+    /// * `max_block_age` - Maximum age in blocks from tip (0 = all blocks)
+    /// * `snicker_only` - Only return UTXOs from SNICKER v1 transactions
+    ///
+    /// # Returns
+    /// Vec of (txid, vout, block_height, amount, script_pubkey) tuples for unspent P2TR UTXOs
+    pub async fn get_snicker_candidates(
+        &self,
+        min_amount: u64,
+        max_amount: u64,
+        max_block_age: u32,
+        snicker_only: bool,
+    ) -> Result<Vec<(bdk_wallet::bitcoin::Txid, u32, u32, u64, bdk_wallet::bitcoin::ScriptBuf)>> {
+        // Get current blockchain height for query range
+        let tip_height = {
+            let wallet = self.wallet_node.wallet.lock().await;
+            wallet.local_chain().tip().height()
+        };
 
-        let filtered: Vec<_> = all_candidates.into_iter()
-            .filter(|(_, _, tx)| crate::snicker::is_likely_snicker_transaction(tx))
+        // Calculate start height based on max_block_age
+        let start_height = if max_block_age == 0 {
+            0  // Show all blocks
+        } else {
+            tip_height.saturating_sub(max_block_age)
+        };
+
+        // Query partial_utxo_set for unspent P2TR UTXOs in the specified range
+        let partial_utxo_set = self.wallet_node.partial_utxo_set.lock().await;
+
+        let transaction_type_filter = if snicker_only { Some("v1") } else { None };
+        let utxos = partial_utxo_set.query_range(
+            start_height,
+            tip_height,
+            min_amount,
+            max_amount,
+            transaction_type_filter,
+        )?;
+
+        // Convert PartialUtxo to tuple format expected by find_opportunities
+        let candidates: Vec<_> = utxos.iter()
+            .map(|utxo| (utxo.txid, utxo.vout, utxo.block_height, utxo.amount, utxo.script_pubkey.clone()))
             .collect();
 
-        tracing::info!("🔍 Filtered to {} candidates with SNICKER pattern", filtered.len());
-        Ok(filtered)
+        tracing::info!("Found {} candidate UTXOs from partial_utxo_set ({}-{} sats, snicker_only={})",
+            candidates.len(), min_amount, max_amount, snicker_only);
+
+        Ok(candidates)
     }
+
+    // NOTE: This function has been removed in the refactor to UTXO-based candidates.
+    // Candidates are now individual UTXOs (not full transactions), so pattern filtering
+    // based on transaction structure is no longer applicable.
 
     /// Get a decrypted proposal by tag
     pub async fn get_decrypted_proposal_by_tag(&self, tag: &[u8; 8]) -> Result<Option<crate::snicker::Proposal>> {
         self.snicker.get_decrypted_proposal_by_tag(tag).await
     }
 
-    /// Clear all SNICKER candidates from database
-    pub async fn clear_snicker_candidates(&self) -> Result<usize> {
-        self.snicker.clear_snicker_candidates().await
-    }
+    // Removed: clear_snicker_candidates
+    // Candidates are now queried from partial_utxo_set on-demand, not stored separately
 
     /// Clear all SNICKER proposals from database
     pub async fn clear_snicker_proposals(&self) -> Result<usize> {
@@ -1479,23 +1498,10 @@ impl Manager {
             return Ok(0);
         }
 
-        // Get candidates - filter by SNICKER pattern if configured
-        let candidates = if config.snicker_pattern_only {
-            tracing::info!("🔍 Filtering candidates to SNICKER patterns only");
-            self.filter_snicker_pattern_candidates().await?
-        } else {
-            self.get_snicker_candidates().await?
-        };
-
-        if candidates.is_empty() {
-            tracing::debug!("No candidates found for proposal creation");
-            return Ok(0);
-        }
-
-        tracing::info!("📊 Found {} candidates for proposal creation", candidates.len());
-
-        // Find opportunities
-        let opportunities = self.find_snicker_opportunities(min_utxo_sats).await?;
+        // Find opportunities (candidates are queried from partial_utxo_set)
+        // Use wide range for candidates (min_utxo_sats to u64::MAX)
+        // Use all blocks (0) and don't filter to SNICKER-only for automation (maximize opportunities)
+        let opportunities = self.find_snicker_opportunities(min_utxo_sats, u64::MAX, 0, false).await?;
 
         if opportunities.is_empty() {
             tracing::debug!("No opportunities found");
@@ -1515,7 +1521,7 @@ impl Manager {
 
             // Check if we already created a proposal for this UTXO pair
             let our_utxo_str = format!("{}:{}", opportunity.our_outpoint.txid, opportunity.our_outpoint.vout);
-            let target_utxo_str = format!("{}:{}", opportunity.target_tx.compute_txid(), opportunity.target_output_index);
+            let target_utxo_str = format!("{}:{}", opportunity.target_outpoint.txid, opportunity.target_outpoint.vout);
 
             if let Some(existing) = self.snicker.get_proposal_for_utxo_pair(
                 &our_utxo_str,

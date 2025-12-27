@@ -63,6 +63,7 @@ pub struct PartialUtxo {
     pub spent_in_txid: Option<Txid>,
     pub spent_at_height: Option<u32>,
     pub created_at: u64, // Unix timestamp
+    pub transaction_type: Option<String>, // e.g., "v1" for SNICKER v1, None for regular
 }
 
 /// Partial UTXO Set manager
@@ -100,6 +101,7 @@ impl PartialUtxoSet {
                 spent_in_txid TEXT,
                 spent_at_height INTEGER,
                 created_at INTEGER NOT NULL,
+                transaction_type TEXT,
                 PRIMARY KEY (txid, vout)
             )",
             [],
@@ -116,6 +118,10 @@ impl PartialUtxoSet {
         )?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_amount ON partial_utxo_set(amount)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_transaction_type ON partial_utxo_set(transaction_type)",
             [],
         )?;
 
@@ -175,6 +181,13 @@ impl PartialUtxoSet {
             // ═══════════════════════════════════════════
             // PHASE 2: Track creations (process outputs)
             // ═══════════════════════════════════════════
+            // Detect if this is a SNICKER transaction
+            let transaction_type = if crate::snicker::is_likely_snicker_transaction(tx) {
+                Some("v1".to_string())
+            } else {
+                None
+            };
+
             for (vout, output) in tx.output.iter().enumerate() {
                 // Filter 1: P2TR only
                 if !output.script_pubkey.is_p2tr() {
@@ -196,8 +209,9 @@ impl PartialUtxoSet {
                 }
 
                 tracing::debug!(
-                    "Block {} tx {} output {}: ADDING P2TR UTXO {} sats",
-                    height, txid, vout, amount
+                    "Block {} tx {} output {}: ADDING P2TR UTXO {} sats{}",
+                    height, txid, vout, amount,
+                    if transaction_type.is_some() { " (SNICKER v1)" } else { "" }
                 );
 
                 // Filter 3: Age is implicit (we're scanning recent blocks)
@@ -216,6 +230,7 @@ impl PartialUtxoSet {
                         .duration_since(UNIX_EPOCH)
                         .unwrap()
                         .as_secs(),
+                    transaction_type: transaction_type.clone(),
                 })?;
 
                 utxos_added += 1;
@@ -237,8 +252,8 @@ impl PartialUtxoSet {
         self.conn.execute(
             "INSERT OR REPLACE INTO partial_utxo_set
              (txid, vout, amount, script_pubkey, block_height, status,
-              spent_in_txid, spent_at_height, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+              spent_in_txid, spent_at_height, created_at, transaction_type)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 utxo.txid.to_string(),
                 utxo.vout,
@@ -249,6 +264,7 @@ impl PartialUtxoSet {
                 utxo.spent_in_txid.map(|t| t.to_string()),
                 utxo.spent_at_height,
                 utxo.created_at as i64,
+                utxo.transaction_type,
             ],
         )?;
         Ok(())
@@ -284,7 +300,7 @@ impl PartialUtxoSet {
     pub fn get(&self, outpoint: &OutPoint) -> Result<Option<PartialUtxo>> {
         let result = self.conn.query_row(
             "SELECT txid, vout, amount, script_pubkey, block_height, status,
-                    spent_in_txid, spent_at_height, created_at
+                    spent_in_txid, spent_at_height, created_at, transaction_type
              FROM partial_utxo_set
              WHERE txid = ? AND vout = ?",
             params![outpoint.txid.to_string(), outpoint.vout],
@@ -298,6 +314,7 @@ impl PartialUtxoSet {
                 let spent_in_str: Option<String> = row.get(6)?;
                 let spent_at_height: Option<u32> = row.get(7)?;
                 let created_at: i64 = row.get(8)?;
+                let transaction_type: Option<String> = row.get(9)?;
 
                 Ok(PartialUtxo {
                     txid: txid_str.parse().unwrap(),
@@ -309,6 +326,7 @@ impl PartialUtxoSet {
                     spent_in_txid: spent_in_str.map(|s| s.parse().unwrap()),
                     spent_at_height,
                     created_at: created_at as u64,
+                    transaction_type,
                 })
             },
         );
@@ -413,6 +431,102 @@ impl PartialUtxoSet {
         self.set_last_scanned_height(0)?;
         tracing::info!("🔧 Partial UTXO set reset");
         Ok(())
+    }
+
+    /// Query UTXOs within a height and amount range
+    ///
+    /// Returns unspent UTXOs matching all filters:
+    /// - Block height between start_height and end_height (inclusive)
+    /// - Amount between min_amount and max_amount (inclusive)
+    /// - Status = unspent
+    /// - Optional: transaction_type filter (e.g., Some("v1") for SNICKER v1 only)
+    ///
+    /// Results are grouped by txid (multiple UTXOs from same tx will be included)
+    pub fn query_range(
+        &self,
+        start_height: u32,
+        end_height: u32,
+        min_amount: u64,
+        max_amount: u64,
+        transaction_type_filter: Option<&str>,
+    ) -> Result<Vec<PartialUtxo>> {
+        // Build query dynamically based on whether we filter by transaction_type
+        let (query, params_vec): (String, Vec<Box<dyn rusqlite::ToSql>>) = if let Some(tx_type) = transaction_type_filter {
+            (
+                "SELECT txid, vout, amount, script_pubkey, block_height, status,
+                        spent_in_txid, spent_at_height, created_at, transaction_type
+                 FROM partial_utxo_set
+                 WHERE status = 'unspent'
+                   AND block_height >= ?
+                   AND block_height <= ?
+                   AND amount >= ?
+                   AND amount <= ?
+                   AND transaction_type = ?
+                 ORDER BY block_height DESC, txid, vout".to_string(),
+                vec![
+                    Box::new(start_height),
+                    Box::new(end_height),
+                    Box::new(min_amount as i64),
+                    Box::new(max_amount as i64),
+                    Box::new(tx_type.to_string()),
+                ]
+            )
+        } else {
+            (
+                "SELECT txid, vout, amount, script_pubkey, block_height, status,
+                        spent_in_txid, spent_at_height, created_at, transaction_type
+                 FROM partial_utxo_set
+                 WHERE status = 'unspent'
+                   AND block_height >= ?
+                   AND block_height <= ?
+                   AND amount >= ?
+                   AND amount <= ?
+                 ORDER BY block_height DESC, txid, vout".to_string(),
+                vec![
+                    Box::new(start_height),
+                    Box::new(end_height),
+                    Box::new(min_amount as i64),
+                    Box::new(max_amount as i64),
+                ]
+            )
+        };
+
+        let mut stmt = self.conn.prepare(&query)?;
+
+        let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+
+        let utxos = stmt.query_map(params_refs.as_slice(), |row| {
+            let txid_str: String = row.get(0)?;
+            let vout: u32 = row.get(1)?;
+            let amount: i64 = row.get(2)?;
+            let script_bytes: Vec<u8> = row.get(3)?;
+            let block_height: u32 = row.get(4)?;
+            let status_str: String = row.get(5)?;
+            let spent_in_str: Option<String> = row.get(6)?;
+            let spent_at_height: Option<u32> = row.get(7)?;
+            let created_at: i64 = row.get(8)?;
+            let transaction_type: Option<String> = row.get(9)?;
+
+            Ok(PartialUtxo {
+                txid: txid_str.parse().unwrap(),
+                vout,
+                amount: amount as u64,
+                script_pubkey: ScriptBuf::from_bytes(script_bytes),
+                block_height,
+                status: UtxoStatus::from_str(&status_str).unwrap(),
+                spent_in_txid: spent_in_str.map(|s| s.parse().unwrap()),
+                spent_at_height,
+                created_at: created_at as u64,
+                transaction_type,
+            })
+        })?;
+
+        let mut result = Vec::new();
+        for utxo in utxos {
+            result.push(utxo?);
+        }
+
+        Ok(result)
     }
 
     /// Get database statistics
@@ -521,6 +635,7 @@ mod tests {
             spent_in_txid: None,
             spent_at_height: None,
             created_at: 0,
+            transaction_type: None,
         };
 
         utxo_set.insert(utxo).unwrap();
@@ -555,6 +670,7 @@ mod tests {
             spent_in_txid: None,
             spent_at_height: None,
             created_at: 0,
+            transaction_type: None,
         };
 
         utxo_set.insert(utxo).unwrap();

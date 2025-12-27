@@ -500,60 +500,43 @@ fn view_snicker(data: &WalletData) -> Element<'static, Message> {
         container(
             column![
                 text("Proposer: Create Proposals").size(24),
-                text("First scan the blockchain for potential candidates, then find matching opportunities with your UTXOs.").size(12),
+                text("Find candidate UTXOs from the blockchain and match them with your UTXOs to create coinjoin proposals.").size(12),
             ].spacing(5)
         )
         .padding(10)
     );
 
-    // Scan for candidates section
-    let scan_blocks = data.snicker_scan_blocks_input.clone();
+    // Find opportunities section with candidate filters
     let scan_min_utxo = data.snicker_scan_min_utxo_input.clone();
     let scan_max_utxo = data.snicker_scan_max_utxo_input.clone();
-
-    content = content.push(
-        container(
-            column![
-                text("Scan for Candidates (stored in database):").size(14),
-                row![
-                    text("Blocks:").size(12),
-                    text_input("100", &scan_blocks)
-                        .on_input(Message::SnickerScanBlocksInputChanged)
-                        .width(Length::Fixed(80.0)),
-                    text("Min:").size(12),
-                    text_input("10000", &scan_min_utxo)
-                        .on_input(Message::SnickerScanMinUtxoInputChanged)
-                        .width(Length::Fixed(100.0)),
-                    text("Max:").size(12),
-                    text_input("100000000", &scan_max_utxo)
-                        .on_input(Message::SnickerScanMaxUtxoInputChanged)
-                        .width(Length::Fixed(120.0)),
-                    button("Scan")
-                        .on_press(Message::SnickerScanRequested)
-                        .padding(8),
-                    button("Clear All")
-                        .on_press(Message::SnickerClearCandidates)
-                        .padding(8),
-                ].spacing(10),
-                text(format!("Found {} candidates (includes all stored)", data.snicker_candidates)).size(12),
-            ].spacing(5)
-        )
-        .padding(10)
-    );
-
-    // Find opportunities section
-    let find_min_utxo = data.snicker_find_min_utxo_input.clone();
+    let scan_block_age = data.snicker_scan_block_age_input.clone();
 
     content = content.push(
         container(
             column![
                 text("Find Opportunities:").size(14),
+                text("Candidate UTXO filters:").size(12),
                 row![
-                    text("Min UTXO:").size(12),
-                    text_input("10000", &find_min_utxo)
-                        .on_input(Message::SnickerFindMinUtxoInputChanged)
+                    text("Min size:").size(12),
+                    text_input("10000", &scan_min_utxo)
+                        .on_input(Message::SnickerScanMinUtxoInputChanged)
                         .width(Length::Fixed(100.0)),
-                    button("Find")
+                    text("sats").size(12),
+                    text("Max size:").size(12),
+                    text_input("100000000", &scan_max_utxo)
+                        .on_input(Message::SnickerScanMaxUtxoInputChanged)
+                        .width(Length::Fixed(120.0)),
+                    text("sats").size(12),
+                ].spacing(10),
+                row![
+                    text("Max block age:").size(12),
+                    text_input("0", &scan_block_age)
+                        .on_input(Message::SnickerScanBlockAgeInputChanged)
+                        .width(Length::Fixed(100.0)),
+                    text("blocks (0 = all)").size(12),
+                ].spacing(10),
+                row![
+                    button("Find Opportunities")
                         .on_press(Message::SnickerFindOpportunities)
                         .padding(8),
                 ].spacing(10),

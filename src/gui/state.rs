@@ -67,10 +67,9 @@ pub struct WalletData {
     pub snicker_proposal_delta_input: String, // Delta input for creating proposals
     pub snicker_scan_min_delta_input: String, // Min delta for scanning incoming
     pub snicker_scan_max_delta_input: String, // Max delta for scanning incoming
-    pub snicker_scan_blocks_input: String, // Number of blocks to scan
-    pub snicker_scan_min_utxo_input: String, // Min UTXO size in sats
-    pub snicker_scan_max_utxo_input: String, // Max UTXO size in sats
-    pub snicker_find_min_utxo_input: String, // Min UTXO size for finding opportunities
+    pub snicker_scan_min_utxo_input: String, // Min candidate UTXO size in sats
+    pub snicker_scan_max_utxo_input: String, // Max candidate UTXO size in sats
+    pub snicker_scan_block_age_input: String, // Max block age for candidates (0 = all)
 
     // Automation state
     pub automation_running: bool,
@@ -105,10 +104,9 @@ impl Default for WalletData {
             snicker_proposal_delta_input: String::from("0"),
             snicker_scan_min_delta_input: String::from("-1000"),
             snicker_scan_max_delta_input: String::from("5000"),
-            snicker_scan_blocks_input: String::from("100"),
             snicker_scan_min_utxo_input: String::from("10000"),
             snicker_scan_max_utxo_input: String::from("100000000"),
-            snicker_find_min_utxo_input: String::from("10000"),
+            snicker_scan_block_age_input: String::from("0"),
             automation_running: false,
             automation_mode: AutomationMode::Disabled,
             automation_max_delta: String::from("10000"),

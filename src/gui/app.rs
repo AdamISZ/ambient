@@ -1061,38 +1061,12 @@ impl AmbientApp {
                 }
             }
 
+            // Removed: SnickerScanRequested
+            // Candidates are now queried directly from partial_utxo_set during find_opportunities
+            // No separate scanning step is needed
             Message::SnickerScanRequested => {
-                if let AppState::WalletLoaded { manager, wallet_data } = &self.state {
-                    let blocks = wallet_data.snicker_scan_blocks_input.parse::<u32>().unwrap_or(100);
-                    let min_utxo = wallet_data.snicker_scan_min_utxo_input.parse::<u64>().unwrap_or(10_000);
-                    let max_utxo = wallet_data.snicker_scan_max_utxo_input.parse::<u64>().unwrap_or(100_000_000);
-
-                    println!("🔍 Scanning for SNICKER candidates (blocks: {}, min: {}, max: {})...",
-                             blocks, min_utxo, max_utxo);
-
-                    let manager_clone = manager.clone();
-                    let rt_handle = self.tokio_runtime.handle().clone();
-
-                    return Task::perform(
-                        async move {
-                            rt_handle.spawn(async move {
-                                let manager = manager_clone.read().await;
-                                manager.scan_for_snicker_candidates(blocks, min_utxo, max_utxo).await
-                            }).await.unwrap()
-                        },
-                        |result| match result {
-                            Ok(count) => Message::SnickerScanCompleted(Ok(count)),
-                            Err(e) => Message::SnickerScanCompleted(Err(e.to_string())),
-                        }
-                    );
-                }
-                Task::none()
-            }
-
-            Message::SnickerScanBlocksInputChanged(value) => {
-                if let AppState::WalletLoaded { wallet_data, .. } = &mut self.state {
-                    wallet_data.snicker_scan_blocks_input = value;
-                }
+                println!("Note: Scan candidates is no longer needed. Use 'Find Opportunities' instead.");
+                println!("Candidates are automatically queried from the partial UTXO set.");
                 Task::none()
             }
 
@@ -1110,9 +1084,9 @@ impl AmbientApp {
                 Task::none()
             }
 
-            Message::SnickerFindMinUtxoInputChanged(value) => {
+            Message::SnickerScanBlockAgeInputChanged(value) => {
                 if let AppState::WalletLoaded { wallet_data, .. } = &mut self.state {
-                    wallet_data.snicker_find_min_utxo_input = value;
+                    wallet_data.snicker_scan_block_age_input = value;
                 }
                 Task::none()
             }
@@ -1134,54 +1108,29 @@ impl AmbientApp {
                 Task::none()
             }
 
+            // Removed: SnickerClearCandidates
+            // Candidates are no longer stored in a separate table
             Message::SnickerClearCandidates => {
-                if let AppState::WalletLoaded { manager, .. } = &self.state {
-                    println!("🗑️  Clearing SNICKER candidates...");
-
-                    let manager_clone = manager.clone();
-                    let rt_handle = self.tokio_runtime.handle().clone();
-
-                    return Task::perform(
-                        async move {
-                            rt_handle.spawn(async move {
-                                let manager = manager_clone.read().await;
-                                manager.clear_snicker_candidates().await
-                            }).await.unwrap()
-                        },
-                        |result| match result {
-                            Ok(count) => Message::SnickerCandidatesCleared(Ok(count)),
-                            Err(e) => Message::SnickerCandidatesCleared(Err(e.to_string())),
-                        }
-                    );
-                }
+                println!("Note: Clearing candidates is no longer needed.");
+                println!("Candidates are queried on-demand from partial UTXO set.");
                 Task::none()
             }
 
-            Message::SnickerCandidatesCleared(result) => {
-                match result {
-                    Ok(count) => {
-                        println!("✅ Cleared {} SNICKER candidates", count);
-
-                        // Reset the candidates count and clear opportunities
-                        if let AppState::WalletLoaded { wallet_data, .. } = &mut self.state {
-                            wallet_data.snicker_candidates = 0;
-                            wallet_data.snicker_opportunities = 0;
-                            wallet_data.snicker_opportunities_list.clear();
-                            wallet_data.snicker_opportunities_data.clear();
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("❌ Failed to clear candidates: {}", e);
-                    }
-                }
+            // Removed: SnickerCandidatesCleared
+            Message::SnickerCandidatesCleared(_result) => {
                 Task::none()
             }
 
             Message::SnickerFindOpportunities => {
                 if let AppState::WalletLoaded { manager, wallet_data } = &self.state {
-                    let min_utxo = wallet_data.snicker_find_min_utxo_input.parse::<u64>().unwrap_or(10_000);
+                    let min_candidate_sats = wallet_data.snicker_scan_min_utxo_input.parse::<u64>().unwrap_or(10_000);
+                    let max_candidate_sats = wallet_data.snicker_scan_max_utxo_input.parse::<u64>().unwrap_or(u64::MAX);
+                    let max_block_age = wallet_data.snicker_scan_block_age_input.parse::<u32>().unwrap_or(0);
+                    // TODO: Add GUI option to enable snicker_only filtering
+                    let snicker_only = false;
 
-                    println!("🔍 Finding SNICKER opportunities (min UTXO: {})...", min_utxo);
+                    println!("🔍 Finding SNICKER opportunities (min: {}, max: {}, block_age: {}, snicker_only: {})...",
+                             min_candidate_sats, max_candidate_sats, max_block_age, snicker_only);
 
                     let manager_clone = manager.clone();
                     let rt_handle = self.tokio_runtime.handle().clone();
@@ -1190,7 +1139,7 @@ impl AmbientApp {
                         async move {
                             rt_handle.spawn(async move {
                                 let manager = manager_clone.read().await;
-                                manager.find_snicker_opportunities(min_utxo).await
+                                manager.find_snicker_opportunities(min_candidate_sats, max_candidate_sats, max_block_age, snicker_only).await
                             }).await.unwrap()
                         },
                         |result| match result {
@@ -1199,9 +1148,9 @@ impl AmbientApp {
                                 let list: Vec<(usize, String)> = opportunities.iter().enumerate()
                                     .map(|(i, opp)| {
                                         let our_sats = opp.our_value.to_sat();
-                                        let target_sats = opp.target_value.to_sat();
-                                        let target_txid = opp.target_tx.compute_txid();
-                                        let target_vout = opp.target_output_index;
+                                        let target_sats = opp.target_txout.value.to_sat();
+                                        let target_txid = opp.target_outpoint.txid;
+                                        let target_vout = opp.target_outpoint.vout;
                                         (i, format!("{}. Our: {} sats → Target: {}:{} ({} sats)",
                                                    i, our_sats, target_txid, target_vout, target_sats))
                                     })

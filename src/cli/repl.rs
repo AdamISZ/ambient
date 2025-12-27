@@ -404,47 +404,9 @@ pub async fn repl(
                 }
             }
 
-            // SNICKER commands
-            "scan_candidates" => {
-                if args.len() != 3 {
-                    println!("Usage: scan_candidates <num_blocks> <min_sats> <max_sats>");
-                    println!("Example: scan_candidates 10 10000 1000000");
-                    continue;
-                }
-                if let Some(arc) = manager_arc.as_ref() {
-                    let num_blocks: u32 = match args[0].parse() {
-                        Ok(n) => n,
-                        Err(_) => {
-                            println!("Invalid num_blocks");
-                            continue;
-                        }
-                    };
-                    let min_sats: u64 = match args[1].parse() {
-                        Ok(m) => m,
-                        Err(_) => {
-                            println!("Invalid min_sats");
-                            continue;
-                        }
-                    };
-                    let max_sats: u64 = match args[2].parse() {
-                        Ok(m) => m,
-                        Err(_) => {
-                            println!("Invalid max_sats");
-                            continue;
-                        }
-                    };
-
-                    println!("🔍 Scanning {} blocks for SNICKER candidates ({}-{} sats)...",
-                             num_blocks, min_sats, max_sats);
-                    let mut mgr = arc.write().await;
-                    match mgr.scan_for_snicker_candidates(num_blocks, min_sats, max_sats).await {
-                        Ok(count) => println!("✅ Found and stored {} candidates", count),
-                        Err(e) => println!("❌ Error: {}", e),
-                    }
-                } else {
-                    println!("No wallet loaded.");
-                }
-            }
+            // Removed: scan_candidates command
+            // Candidates are now queried directly from partial_utxo_set during find_opportunities
+            // No separate scanning step is needed
 
             "test_get_block" => {
                 if args.len() != 1 {
@@ -519,23 +481,55 @@ pub async fn repl(
             }
 
             "find_opportunities" => {
-                if args.len() != 1 {
-                    println!("Usage: find_opportunities <min_utxo_sats>");
-                    println!("Example: find_opportunities 75000");
+                if args.len() < 1 || args.len() > 4 {
+                    println!("Usage: find_opportunities <min_candidate_sats> [max_candidate_sats] [max_block_age] [snicker_only]");
+                    println!("Example: find_opportunities 10000");
+                    println!("Example: find_opportunities 10000 100000");
+                    println!("Example: find_opportunities 10000 100000 1000");
+                    println!("Example: find_opportunities 10000 100000 0 true");
+                    println!("  max_block_age: 0 = all blocks, N = last N blocks from tip");
                     continue;
                 }
                 if let Some(arc) = manager_arc.as_ref() {
-                    let min_utxo_sats: u64 = match args[0].parse() {
+                    let min_candidate_sats: u64 = match args[0].parse() {
                         Ok(m) => m,
                         Err(_) => {
-                            println!("Invalid min_utxo_sats");
+                            println!("Invalid min_candidate_sats");
                             continue;
                         }
                     };
+                    let max_candidate_sats: u64 = if args.len() > 1 {
+                        match args[1].parse() {
+                            Ok(m) => m,
+                            Err(_) => {
+                                println!("Invalid max_candidate_sats");
+                                continue;
+                            }
+                        }
+                    } else {
+                        u64::MAX
+                    };
+                    let max_block_age: u32 = if args.len() > 2 {
+                        match args[2].parse() {
+                            Ok(m) => m,
+                            Err(_) => {
+                                println!("Invalid max_block_age");
+                                continue;
+                            }
+                        }
+                    } else {
+                        0  // All blocks
+                    };
+                    let snicker_only = if args.len() > 3 {
+                        args[3].to_lowercase() == "true"
+                    } else {
+                        false
+                    };
 
-                    println!("🔍 Finding SNICKER opportunities...");
+                    println!("🔍 Finding SNICKER opportunities (candidates: {}-{} sats, block_age: {}, snicker_only={})...",
+                             min_candidate_sats, max_candidate_sats, max_block_age, snicker_only);
                     let mut mgr = arc.write().await;
-                    match mgr.find_snicker_opportunities(min_utxo_sats).await {
+                    match mgr.find_snicker_opportunities(min_candidate_sats, max_candidate_sats, max_block_age, snicker_only).await {
                         Ok(found) => {
                             if found.is_empty() {
                                 println!("No opportunities found.");
@@ -548,9 +542,9 @@ pub async fn repl(
                                              opp.our_outpoint.txid,
                                              opp.our_outpoint.vout,
                                              opp.our_value.to_sat(),
-                                             opp.target_tx.compute_txid(),
-                                             opp.target_output_index,
-                                             opp.target_value.to_sat());
+                                             opp.target_outpoint.txid,
+                                             opp.target_outpoint.vout,
+                                             opp.target_txout.value.to_sat());
                                 }
                                 if found.len() > 10 {
                                     println!("  ... and {} more", found.len() - 10);
@@ -566,46 +560,9 @@ pub async fn repl(
                 }
             }
 
-            "list_candidates" => {
-                if let Some(arc) = manager_arc.as_ref() {
-                    let mgr = arc.read().await;
-                    match mgr.get_snicker_candidates().await {
-                        Ok(candidates) => {
-                            if candidates.is_empty() {
-                                println!("No candidates stored.");
-                            } else {
-                                println!("Stored candidates ({}):", candidates.len());
-                                for (height, txid, tx) in candidates.iter().take(20) {
-                                    println!("  Block {}: {}", height, txid);
-                                    for (vout, output) in tx.output.iter().enumerate() {
-                                        if output.script_pubkey.is_p2tr() {
-                                            println!("    - vout {}: {} sats", vout, output.value.to_sat());
-                                        }
-                                    }
-                                }
-                                if candidates.len() > 20 {
-                                    println!("  ... and {} more", candidates.len() - 20);
-                                }
-                            }
-                        }
-                        Err(e) => println!("❌ Error: {}", e),
-                    }
-                } else {
-                    println!("No wallet loaded.");
-                }
-            }
-
-            "clear_candidates" => {
-                if let Some(arc) = manager_arc.as_ref() {
-                    let mut mgr = arc.write().await;
-                    match mgr.clear_snicker_candidates().await {
-                        Ok(count) => println!("✅ Cleared {} candidates", count),
-                        Err(e) => println!("❌ Error: {}", e),
-                    }
-                } else {
-                    println!("No wallet loaded.");
-                }
-            }
+            // Removed: list_candidates and clear_candidates commands
+            // Candidates are now queried directly from partial_utxo_set on-demand
+            // Use 'find_opportunities' to see available candidates
 
             "clear_proposals" => {
                 if let Some(arc) = manager_arc.as_ref() {
@@ -622,33 +579,30 @@ pub async fn repl(
             "snicker_pattern_check" => {
                 if let Some(arc) = manager_arc.as_ref() {
                     let mgr = arc.read().await;
-                    match mgr.get_snicker_candidates().await {
+                    // Query candidates with reasonable defaults (10k-100M sats, all blocks, all transaction types)
+                    match mgr.get_snicker_candidates(10_000, 100_000_000, 0, false).await {
                         Ok(all_candidates) => {
-                            let mut pattern_matches = 0;
+                            println!("🔍 Listing {} candidate UTXOs...\n", all_candidates.len());
 
-                            println!("🔍 Analyzing {} candidates for SNICKER pattern...\n", all_candidates.len());
+                            // Candidates are now individual UTXOs, not full transactions
+                            // Group by block height for display
+                            use std::collections::BTreeMap;
+                            let mut by_height: BTreeMap<u32, Vec<_>> = BTreeMap::new();
 
-                            for (height, txid, tx) in &all_candidates {
-                                let is_match = crate::snicker::is_likely_snicker_transaction(tx);
+                            for (txid, vout, height, amount, _script_pubkey) in &all_candidates {
+                                by_height.entry(*height).or_insert_with(Vec::new).push((txid, vout, amount));
+                            }
 
-                                if is_match {
-                                    pattern_matches += 1;
-                                    println!("✅ Block {}: {}", height, txid);
-                                    println!("   Inputs: {}, Outputs: {}", tx.input.len(), tx.output.len());
-                                    let mut values: Vec<u64> = tx.output.iter().map(|o| o.value.to_sat()).collect();
-                                    values.sort();
-                                    println!("   Output values: {} / {} / {} sats\n",
-                                        values[0], values[1], values[2]);
+                            for (height, utxos) in by_height.iter().rev().take(20) {
+                                println!("Block {}:", height);
+                                for (txid, vout, amount) in utxos {
+                                    println!("  {}:{} - {} sats", txid, vout, amount);
                                 }
                             }
 
                             println!("\n📊 Summary:");
-                            println!("   Total candidates: {}", all_candidates.len());
-                            println!("   SNICKER pattern matches: {}", pattern_matches);
-                            if all_candidates.len() > 0 {
-                                println!("   Match rate: {:.1}%",
-                                    (pattern_matches as f64 / all_candidates.len() as f64) * 100.0);
-                            }
+                            println!("   Total candidate UTXOs: {}", all_candidates.len());
+                            println!("   Note: Candidates are now individual UTXOs, not full transactions");
                         }
                         Err(e) => println!("❌ Error: {}", e),
                     }
@@ -695,7 +649,7 @@ pub async fn repl(
                              opp.our_outpoint.txid,
                              opp.our_outpoint.vout,
                              opp.our_value.to_sat());
-                    println!("   Target: {} sats, Delta: {} sats", opp.target_value.to_sat(), delta_sats);
+                    println!("   Target: {} sats, Delta: {} sats", opp.target_txout.value.to_sat(), delta_sats);
 
                     let mut mgr = arc.write().await;
                     match mgr.create_snicker_proposal(opp, delta_sats, crate::config::DEFAULT_MIN_CHANGE_OUTPUT_SIZE).await {
@@ -979,11 +933,9 @@ fn print_help() {
     println!("  sync                               - rescan recent blocks");
     println!();
     println!("SNICKER Commands (Proposer side):");
-    println!("  scan_candidates <n> <min> <max>    - scan N blocks for candidates (min-max sats)");
     println!("  test_get_block <hash>              - test: fetch block by hash via Kyoto P2P");
     println!("  test_headers_db <start> <end>      - test: query headers.db for block hashes");
-    println!("  list_candidates                    - list stored candidate transactions");
-    println!("  find_opportunities <min_utxo>      - find proposal opportunities (min UTXO sats)");
+    println!("  find_opportunities <min> [max] [snicker_only] - find proposal opportunities");
     println!("  create_proposal <index> <delta>    - create proposal (use index from find_opportunities)");
     println!("  save_proposal <file>               - save last proposal to file");
     println!();
@@ -998,7 +950,6 @@ fn print_help() {
     println!("  automation_status                  - show automation status and settings");
     println!();
     println!("SNICKER Maintenance:");
-    println!("  clear_candidates                   - clear candidate database");
     println!("  clear_proposals                    - clear proposals database");
     println!("  snicker_pattern_check              - analyze candidates for SNICKER pattern");
     println!();

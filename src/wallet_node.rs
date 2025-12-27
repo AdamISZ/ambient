@@ -131,7 +131,7 @@ pub struct WalletNode {
     /// Encrypted in-memory SNICKER database (for flush on UTXO changes)
     snicker_db: crate::encryption::EncryptedMemoryDb,
     /// Partial UTXO set for trustless proposer UTXO validation
-    partial_utxo_set: Arc<Mutex<PartialUtxoSet>>,
+    pub partial_utxo_set: Arc<Mutex<PartialUtxoSet>>,
 }
 
 /// Selected UTXOs for spending (hybrid selection result)
@@ -2451,80 +2451,23 @@ impl WalletNode {
         Ok(block_hashes)
     }
 
-    /// Scan blocks for taproot UTXOs matching size criteria
+    /// Scan recent blocks for taproot UTXOs within a value range (for SNICKER proposals)
     ///
-    /// Gets block hashes from wallet's bdk_blocks table, fetches blocks via P2P,
-    /// and scans for taproot outputs matching the size range.
+    /// Queries the partial UTXO set database (already populated by background_sync)
+    /// instead of re-scanning blocks. This is much faster and works regardless of
+    /// Kyoto's checkpoint position.
     ///
     /// # Arguments
     /// * `num_blocks` - Number of recent blocks to scan
     /// * `size_min` - Minimum output value in sats
     /// * `size_max` - Maximum output value in sats
+    /// * `snicker_only` - If true, only return UTXOs from SNICKER v1 transactions
     ///
     /// # Returns
-    /// Vector of (block_height, txid, full_transaction) for transactions with matching outputs
-    pub async fn scan_blocks_for_taproot_utxos(
-        &self,
-        num_blocks: u32,
-        size_min: u64,
-        size_max: u64,
-    ) -> Result<Vec<(u32, Txid, Transaction)>> {
-        // Get current tip height from wallet
-        let wallet = self.wallet.lock().await;
-        let tip_height = wallet.local_chain().tip().height();
-        drop(wallet);
-
-        let start_height = tip_height.saturating_sub(num_blocks - 1);
-
-        info!("🔍 Scanning {} blocks via Kyoto P2P (heights {}-{})", num_blocks, start_height, tip_height);
-
-        // Get block hashes from wallet database (bdk_blocks table)
-        let block_hashes = self.get_block_hashes_from_headers_db(start_height, tip_height).await?;
-        info!("📊 Retrieved {} block hashes from wallet database", block_hashes.len());
-
-        let mut results = Vec::new();
-
-        // Fetch and scan each block
-        for (height, block_hash) in block_hashes {
-            match self.requester.get_block(block_hash).await {
-                Ok(indexed_block) => {
-                    let block = &indexed_block.block;
-                    tracing::debug!("📦 Block {} at height {}: {} transactions",
-                                   block_hash, height, block.txdata.len());
-
-                    // Scan each transaction in the block
-                    for tx in &block.txdata {
-                        let txid = tx.compute_txid();
-                        let mut has_match = false;
-
-                        // Check each output for taproot + size match
-                        for (vout, output) in tx.output.iter().enumerate() {
-                            if output.script_pubkey.is_p2tr() {
-                                let amount = output.value.to_sat();
-                                if amount >= size_min && amount <= size_max {
-                                    tracing::info!("✅ Found taproot UTXO: {}:{} ({} sats)",
-                                                 txid, vout, amount);
-                                    has_match = true;
-                                }
-                            }
-                        }
-
-                        if has_match {
-                            results.push((height, txid, tx.clone()));
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("⚠️  Failed to fetch block {} at height {}: {}",
-                                 block_hash, height, e);
-                }
-            }
-        }
-
-        info!("📦 Scanned {} blocks via P2P, found {} transactions with matching taproot outputs",
-              num_blocks, results.len());
-        Ok(results)
-    }
+    /// Vector of (txid, vout, block_height, amount, script_pubkey) for matching UTXOs
+    // Removed: scan_blocks_for_taproot_utxos
+    // Candidates are now queried directly via Manager.get_snicker_candidates()
+    // which queries partial_utxo_set. No separate scanning needed.
 
     // ============================================================
     // PRIVATE KEY DERIVATION (for SNICKER DH operations)

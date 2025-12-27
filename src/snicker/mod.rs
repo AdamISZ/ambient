@@ -288,8 +288,8 @@ impl Snicker {
     /// Tuple of (partially-signed PSBT, encrypted proposal with signed PSBT)
     pub fn propose<F>(
         &self,
-        target_tx: Transaction,
-        output_index: usize,
+        receiver_outpoint: OutPoint,
+        receiver_txout: TxOut,
         proposer_outpoint: OutPoint,
         proposer_utxo_txout: TxOut,
         proposer_input_seckey: bdk_wallet::bitcoin::secp256k1::SecretKey,
@@ -310,17 +310,15 @@ impl Snicker {
         let proposer_input_pubkey = proposer_input_seckey.public_key(&secp);
 
         // 2. Create the tweaked output using proposer's input key
-        let target_output = &target_tx.output.get(output_index)
-            .ok_or_else(|| anyhow::anyhow!("Output index out of bounds"))?;
         let (tweaked_output, snicker_shared_secret) = self.create_tweaked_output(
-            target_output,
+            &receiver_txout,
             &proposer_input_seckey,
         )?;
 
         // 2. Build the PSBT (unsigned)
         let mut psbt = self.build_psbt(
-            &target_tx,
-            output_index,
+            receiver_outpoint,
+            &receiver_txout,
             tweaked_output.clone(),
             proposer_outpoint,
             proposer_utxo_txout.clone(),
@@ -336,7 +334,7 @@ impl Snicker {
 
         // 4. Create the proposal with signed PSBT
         let tweak_info = TweakInfo {
-            original_output: (*target_output).clone(),
+            original_output: receiver_txout.clone(),
             tweaked_output,
             proposer_pubkey: proposer_input_pubkey,
         };
@@ -347,7 +345,7 @@ impl Snicker {
         let ephemeral_pubkey = ephemeral_seckey.public_key(&secp);
 
         // 6. Extract receiver's pubkey from target output
-        let receiver_pubkey_xonly = tweak::extract_taproot_pubkey(target_output)?;
+        let receiver_pubkey_xonly = tweak::extract_taproot_pubkey(&receiver_txout)?;
         // Convert x-only to full pubkey (assume even parity)
         let mut receiver_pubkey_bytes = [0u8; 33];
         receiver_pubkey_bytes[0] = 0x02;
@@ -580,8 +578,8 @@ impl Snicker {
     /// * `min_change_output_size` - Minimum UTXO size to create (change below this bumps fee)
     fn build_psbt(
         &self,
-        target_tx: &Transaction,
-        output_index: usize,
+        receiver_outpoint: OutPoint,
+        receiver_txout: &TxOut,
         tweaked_output: TxOut,
         proposer_outpoint: OutPoint,
         proposer_txout: TxOut,
@@ -594,9 +592,8 @@ impl Snicker {
         use bdk_wallet::bitcoin::{Transaction as BdkTransaction, TxIn, Sequence, Witness};
         use bdk_wallet::bitcoin::transaction::Version;
 
-        // Get receiver's original output
-        let receiver_output = target_tx.output.get(output_index)
-            .ok_or_else(|| anyhow::anyhow!("Output index out of bounds"))?;
+        // Receiver's original output (from candidate UTXO)
+        let receiver_output = receiver_txout;
 
         // Calculate outputs using the "equal outputs + change" structure
         let (outputs, _estimated_fee) = Self::build_equal_outputs_structure(
@@ -611,10 +608,7 @@ impl Snicker {
         )?;
 
         // Build the transaction
-        let receiver_outpoint = OutPoint {
-            txid: target_tx.compute_txid(),
-            vout: output_index as u32,
-        };
+        // (receiver_outpoint is now passed as a parameter)
 
         // Create inputs with associated metadata
         let mut inputs_with_metadata = vec![
@@ -976,23 +970,9 @@ impl Snicker {
 
     /// Initialize all SNICKER database tables (public for wallet generation)
     pub fn init_snicker_db(conn: &mut Connection) -> Result<()> {
-        Self::init_candidates_table(conn)?;
         Self::init_decrypted_proposals_table(conn)?;
         Self::init_snicker_utxos_table(conn)?;
         Self::init_automation_log_table(conn)?;
-        Ok(())
-    }
-
-    /// Initialize the candidates database table
-    fn init_candidates_table(conn: &mut Connection) -> Result<()> {
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS snicker_candidates (
-                block_height INTEGER NOT NULL,
-                txid TEXT NOT NULL PRIMARY KEY,
-                tx_data BLOB NOT NULL
-            )",
-            [],
-        )?;
         Ok(())
     }
 
@@ -1124,58 +1104,8 @@ impl Snicker {
         Ok(())
     }
 
-    /// Store a candidate transaction in the database
-    pub async fn store_candidate(&self, block_height: u32, tx: &Transaction) -> Result<()> {
-        use bdk_wallet::bitcoin::consensus::encode::serialize;
-
-        let conn = self.conn.lock().unwrap();
-        let txid = tx.compute_txid().to_string();
-        let tx_data = serialize(tx);
-
-        conn.execute(
-            "INSERT OR REPLACE INTO snicker_candidates (block_height, txid, tx_data) VALUES (?1, ?2, ?3)",
-            (block_height, txid, tx_data),
-        )?;
-
-        Ok(())
-    }
-
-    /// Retrieve all stored candidate transactions
-    pub async fn get_snicker_candidates(&self) -> Result<Vec<(u32, Txid, Transaction)>> {
-        use bdk_wallet::bitcoin::consensus::encode::deserialize;
-
-        let conn = self.conn.lock().unwrap();
-
-        let mut stmt = conn.prepare(
-            "SELECT block_height, txid, tx_data FROM snicker_candidates ORDER BY block_height DESC"
-        )?;
-
-        let candidates = stmt.query_map([], |row| {
-            let height: u32 = row.get(0)?;
-            let txid_str: String = row.get(1)?;
-            let tx_data: Vec<u8> = row.get(2)?;
-
-            Ok((height, txid_str, tx_data))
-        })?;
-
-        let mut result = Vec::new();
-        for candidate in candidates {
-            let (height, txid_str, tx_data) = candidate?;
-            let txid = Txid::from_str(&txid_str)?;
-            let tx: Transaction = deserialize(&tx_data)?;
-            result.push((height, txid, tx));
-        }
-
-        Ok(result)
-    }
-
-    /// Clear all stored candidates
-    pub async fn clear_snicker_candidates(&self) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
-        let count = conn.execute("DELETE FROM snicker_candidates", [])?;
-        tracing::info!("🗑️  Cleared {} SNICKER candidates from database", count);
-        Ok(count)
-    }
+    // Removed: snicker_candidates table and related methods
+    // Candidates are now queried directly from partial_utxo_set with appropriate filters
 
     /// Store a SNICKER proposal in the database
     /// Store an encrypted proposal (proposer side - for later sharing/export)
@@ -1690,41 +1620,32 @@ impl Snicker {
     /// then by target output value (highest first).
     ///
     /// # Arguments
-    /// * `our_utxos` - Our wallet's UTXOs to use as proposer inputs
-    /// * `min_utxo_sats` - Minimum size of our UTXO to consider (e.g., 75,000 sats)
+    /// * `our_utxos` - Our wallet's UTXOs to use as proposer inputs (all UTXOs considered)
+    /// * `candidates` - Candidate UTXOs from partial_utxo_set (already filtered by size)
     ///
     /// # Algorithm
     /// 1. Sort our UTXOs by value descending
-    /// 2. Filter to only UTXOs >= min_utxo_sats
-    /// 3. For each qualifying UTXO:
+    /// 2. For each UTXO:
     ///    - Filter candidates where output value < our UTXO value
     ///    - Add ALL matches to results list
-    /// 4. Return complete list of opportunities
-    pub async fn find_opportunities(
+    /// 3. Return complete list of opportunities
+    pub fn find_opportunities(
         &self,
         our_utxos: &[crate::wallet_node::WalletUtxo],
-        min_utxo_sats: u64,
+        candidates: &[(Txid, u32, u32, u64, bdk_wallet::bitcoin::ScriptBuf)],
     ) -> Result<Vec<ProposalOpportunity>> {
         // 1. Sort our UTXOs by value descending
         let mut sorted_utxos: Vec<_> = our_utxos.to_vec();
         sorted_utxos.sort_by(|a, b| b.value().cmp(&a.value()));
 
-        // 2. Filter to only UTXOs >= min_utxo_sats
-        let qualifying_utxos: Vec<_> = sorted_utxos
-            .into_iter()
-            .filter(|utxo| utxo.amount() >= min_utxo_sats)
-            .collect();
-
-        if qualifying_utxos.is_empty() {
-            tracing::info!("⚠️  No UTXOs >= {} sats available for SNICKER proposals", min_utxo_sats);
+        if sorted_utxos.is_empty() {
+            tracing::info!("⚠️  No UTXOs available for SNICKER proposals");
             return Ok(Vec::new());
         }
 
-        tracing::info!("🔍 Found {} qualifying UTXOs (>= {} sats) for SNICKER",
-              qualifying_utxos.len(), min_utxo_sats);
+        tracing::info!("🔍 Found {} UTXOs for SNICKER", sorted_utxos.len());
 
-        // 3. Get all snicker_candidates from database
-        let candidates = self.get_snicker_candidates().await?;
+        // 2. Check candidates (now passed as parameter from partial_utxo_set query)
 
         if candidates.is_empty() {
             tracing::info!("⚠️  No SNICKER candidates in database.");
@@ -1732,45 +1653,46 @@ impl Snicker {
         }
 
         tracing::info!("🔍 Scanning {} candidates against {} UTXOs",
-              candidates.len(), qualifying_utxos.len());
+              candidates.len(), sorted_utxos.len());
 
-        // 4. For each qualifying UTXO, find ALL matching candidates
+        // 3. For each UTXO, find ALL matching candidates
         let mut opportunities = Vec::new();
 
-        for our_utxo in &qualifying_utxos {
+        for our_utxo in &sorted_utxos {
             let our_value = our_utxo.value();
             let our_outpoint = our_utxo.outpoint();
             let mut matches_for_this_utxo = 0;
 
             // Find all candidates where output value is in range [min_utxo_sats, our_value)
-            for (_height, txid, target_tx) in &candidates {
-                for (output_index, output) in target_tx.output.iter().enumerate() {
-                    let candidate_sats = output.value.to_sat();
+            // Candidates are now individual UTXOs (not full transactions)
+            for (txid, vout, _height, amount, script_pubkey) in candidates {
+                let candidate_outpoint = OutPoint {
+                    txid: *txid,
+                    vout: *vout,
+                };
 
-                    // Create outpoint for this candidate
-                    let candidate_outpoint = bdk_wallet::bitcoin::OutPoint {
-                        txid: *txid,
-                        vout: output_index as u32,
+                // Skip if this is one of our own UTXOs
+                if our_utxos.iter().any(|u| u.outpoint() == candidate_outpoint) {
+                    continue;
+                }
+
+                let candidate_amount = bdk_wallet::bitcoin::Amount::from_sat(*amount);
+
+                // Only consider candidates smaller than our UTXO
+                // (min amount and P2TR checks already done when querying candidates)
+                if candidate_amount < our_value {
+                    let candidate_txout = TxOut {
+                        value: candidate_amount,
+                        script_pubkey: script_pubkey.clone(),
                     };
 
-                    // Skip if this is one of our own UTXOs
-                    if our_utxos.iter().any(|u| u.outpoint() == candidate_outpoint) {
-                        continue;
-                    }
-
-                    // Only consider P2TR outputs >= min_utxo_sats AND smaller than our UTXO
-                    if output.script_pubkey.is_p2tr()
-                        && candidate_sats >= min_utxo_sats
-                        && output.value < our_value {
-                        opportunities.push(ProposalOpportunity {
-                            our_outpoint,
-                            our_value,
-                            target_tx: target_tx.clone(),
-                            target_output_index: output_index,
-                            target_value: output.value,
-                        });
-                        matches_for_this_utxo += 1;
-                    }
+                    opportunities.push(ProposalOpportunity {
+                        our_outpoint,
+                        our_value,
+                        target_outpoint: candidate_outpoint,
+                        target_txout: candidate_txout,
+                    });
+                    matches_for_this_utxo += 1;
                 }
             }
 
@@ -1784,7 +1706,7 @@ impl Snicker {
         // Sort opportunities by our value (desc), then target value (desc)
         opportunities.sort_by(|a, b| {
             b.our_value.cmp(&a.our_value)
-                .then(b.target_value.cmp(&a.target_value))
+                .then(b.target_txout.value.cmp(&a.target_txout.value))
         });
 
         tracing::info!("🎯 Found {} total SNICKER opportunities", opportunities.len());
@@ -1801,12 +1723,10 @@ pub struct ProposalOpportunity {
     pub our_outpoint: OutPoint,
     /// Our UTXO value
     pub our_value: bdk_wallet::bitcoin::Amount,
-    /// Target transaction containing receiver's UTXO
-    pub target_tx: Transaction,
-    /// Index of target output in target_tx
-    pub target_output_index: usize,
-    /// Value of target output
-    pub target_value: bdk_wallet::bitcoin::Amount,
+    /// Target (receiver's) UTXO outpoint
+    pub target_outpoint: OutPoint,
+    /// Target (receiver's) UTXO TxOut (amount + script)
+    pub target_txout: TxOut,
 }
 
 #[cfg(test)]
@@ -1864,90 +1784,11 @@ mod tests {
     }
 
     // ============================================================
-    // CANDIDATE STORAGE TESTS
+    // CANDIDATE STORAGE TESTS - REMOVED
     // ============================================================
-
-    #[tokio::test]
-    async fn test_store_and_retrieve_candidate() {
-        let snicker = create_test_snicker();
-        let tx = create_test_transaction();
-        let block_height = 100;
-
-        // Store candidate
-        snicker.store_candidate(block_height, &tx).await.unwrap();
-
-        // Retrieve candidates
-        let candidates = snicker.get_snicker_candidates().await.unwrap();
-
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].0, block_height);
-        assert_eq!(candidates[0].1, tx.compute_txid());
-        assert_eq!(candidates[0].2.compute_txid(), tx.compute_txid());
-    }
-
-    #[tokio::test]
-    async fn test_store_multiple_candidates() {
-        let snicker = create_test_snicker();
-
-        // Store 3 candidates at different heights with unique transactions
-        for i in 0..3 {
-            let tx = create_test_transaction_with_seed(i as u64);
-            snicker.store_candidate(100 + i, &tx).await.unwrap();
-        }
-
-        let candidates = snicker.get_snicker_candidates().await.unwrap();
-        assert_eq!(candidates.len(), 3);
-
-        // Should be ordered by height DESC
-        assert!(candidates[0].0 >= candidates[1].0);
-        assert!(candidates[1].0 >= candidates[2].0);
-    }
-
-    #[tokio::test]
-    async fn test_replace_duplicate_candidate() {
-        let snicker = create_test_snicker();
-
-        // Create ONE transaction and store it twice with different heights
-        let tx = create_test_transaction();
-        let txid = tx.compute_txid();
-
-        // Store same transaction twice at different heights
-        snicker.store_candidate(100, &tx).await.unwrap();
-        snicker.store_candidate(101, &tx).await.unwrap(); // Different height, same tx
-
-        let candidates = snicker.get_snicker_candidates().await.unwrap();
-
-        // Should only have one entry (INSERT OR REPLACE based on txid)
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].1, txid);
-        assert_eq!(candidates[0].0, 101); // Should have updated height
-    }
-
-    #[tokio::test]
-    async fn test_clear_candidates() {
-        let snicker = create_test_snicker();
-
-        // Store some candidates with unique transactions
-        for i in 0..5 {
-            let tx = create_test_transaction_with_seed(i as u64);
-            snicker.store_candidate(100 + i, &tx).await.unwrap();
-        }
-
-        // Clear them
-        let count = snicker.clear_snicker_candidates().await.unwrap();
-        assert_eq!(count, 5);
-
-        // Verify empty
-        let candidates = snicker.get_snicker_candidates().await.unwrap();
-        assert_eq!(candidates.len(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_get_candidates_empty_database() {
-        let snicker = create_test_snicker();
-        let candidates = snicker.get_snicker_candidates().await.unwrap();
-        assert_eq!(candidates.len(), 0);
-    }
+    // These tests were removed because candidates are no longer stored in a separate table.
+    // Candidates are now queried directly from partial_utxo_set on-demand via
+    // Manager::get_snicker_candidates() which filters by amount range and transaction type.
 
     // ============================================================
     // PROPOSAL STORAGE TESTS

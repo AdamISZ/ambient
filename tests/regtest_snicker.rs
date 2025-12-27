@@ -151,17 +151,15 @@ async fn test_snicker_end_to_end() -> Result<()> {
     println!("│  Phase 2: Candidate Discovery (Bob)  │");
     println!("└─────────────────────────────────────┘\n");
 
-    println!("🔍 Bob scanning blockchain for SNICKER candidates...");
-    let candidates_found = bob_mgr.scan_for_snicker_candidates(
-        10,        // last 10 blocks
-        10_000,    // min 10k sats
-        150_000,   // max 150k sats
+    // Note: Candidate scanning is no longer a separate step.
+    // Candidates are queried directly from partial_utxo_set during find_opportunities.
+    println!("🎯 Bob finding SNICKER opportunities...");
+    let opportunities = bob_mgr.find_snicker_opportunities(
+        10_000,    // min candidate UTXO size
+        150_000,   // max candidate UTXO size
+        0,         // all blocks (0 = no age limit)
+        false      // don't filter to SNICKER-only
     ).await?;
-    println!("   ✅ Found {} candidate transactions", candidates_found);
-    assert!(candidates_found >= 3, "Should find Alice's 3 UTXOs as candidates");
-
-    println!("\n🎯 Bob finding SNICKER opportunities...");
-    let opportunities = bob_mgr.find_snicker_opportunities(75_000).await?;
     println!("   ✅ Found {} opportunities", opportunities.len());
 
     for (i, opp) in opportunities.iter().enumerate().take(5) {
@@ -170,7 +168,7 @@ async fn test_snicker_end_to_end() -> Result<()> {
                  opp.our_outpoint.txid,
                  opp.our_outpoint.vout,
                  opp.our_value.to_sat(),
-                 opp.target_value.to_sat());
+                 opp.target_txout.value.to_sat());
     }
 
     assert!(!opportunities.is_empty(), "Should find at least one opportunity");
@@ -189,7 +187,7 @@ async fn test_snicker_end_to_end() -> Result<()> {
              opportunity.our_outpoint.txid,
              opportunity.our_outpoint.vout,
              opportunity.our_value.to_sat());
-    println!("   Alice's UTXO: {} sats", opportunity.target_value.to_sat());
+    println!("   Alice's UTXO: {} sats", opportunity.target_txout.value.to_sat());
 
     let delta_sats = 1000; // Alice pays 1000 sats more in fees
     println!("   Delta: {} sats (receiver pays more)", delta_sats);

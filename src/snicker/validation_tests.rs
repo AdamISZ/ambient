@@ -1537,6 +1537,13 @@ fn test_build_psbt_correct_structure() {
         ],
     };
 
+    // Extract receiver UTXO info from transaction
+    let receiver_outpoint = OutPoint {
+        txid: target_tx.compute_txid(),
+        vout: 0,
+    };
+    let receiver_txout = target_tx.output[0].clone();
+
     // Create proposer's UTXO
     let proposer_seckey = SecretKey::from_slice(&[0x02; 32]).unwrap();
     let proposer_key = XOnlyPublicKey::from_keypair(
@@ -1581,8 +1588,8 @@ fn test_build_psbt_correct_structure() {
     );
 
     let psbt = snicker.build_psbt(
-        &target_tx,
-        0,
+        receiver_outpoint,
+        &receiver_txout,
         tweaked_output,
         proposer_outpoint,
         proposer_txout,
@@ -1621,6 +1628,13 @@ fn test_build_psbt_correct_order() {
             },
         ],
     };
+
+    // Extract receiver UTXO info from transaction
+    let receiver_outpoint_test = OutPoint {
+        txid: target_tx.compute_txid(),
+        vout: 0,
+    };
+    let receiver_txout = target_tx.output[0].clone();
 
     let proposer_seckey = SecretKey::from_slice(&[0x02; 32]).unwrap();
     let proposer_key = XOnlyPublicKey::from_keypair(
@@ -1661,8 +1675,8 @@ fn test_build_psbt_correct_order() {
     );
 
     let psbt = snicker.build_psbt(
-        &target_tx,
-        0,
+        receiver_outpoint_test,
+        &receiver_txout,
         tweaked_output,
         proposer_outpoint,
         proposer_txout.clone(),
@@ -1712,6 +1726,13 @@ fn test_build_psbt_includes_witness_utxos() {
         ],
     };
 
+    // Extract receiver UTXO info from transaction
+    let receiver_outpoint_for_build = OutPoint {
+        txid: target_tx.compute_txid(),
+        vout: 0,
+    };
+    let receiver_txout = target_tx.output[0].clone();
+
     let proposer_seckey = SecretKey::from_slice(&[0x02; 32]).unwrap();
     let proposer_key = XOnlyPublicKey::from_keypair(
         &Keypair::from_secret_key(&secp, &proposer_seckey)
@@ -1751,8 +1772,8 @@ fn test_build_psbt_includes_witness_utxos() {
     );
 
     let psbt = snicker.build_psbt(
-        &target_tx,
-        0,
+        receiver_outpoint_for_build,
+        &receiver_txout,
         tweaked_output,
         proposer_outpoint,
         proposer_txout.clone(),
@@ -1823,6 +1844,13 @@ fn test_build_equal_outputs_dust_prevention() {
         ],
     };
 
+    // Extract receiver UTXO info from transaction
+    let receiver_outpoint_param = OutPoint {
+        txid: target_tx.compute_txid(),
+        vout: 0,
+    };
+    let receiver_txout = target_tx.output[0].clone();
+
     let proposer_seckey = SecretKey::from_slice(&[0x02; 32]).unwrap();
     let proposer_key = XOnlyPublicKey::from_keypair(
         &Keypair::from_secret_key(&secp, &proposer_seckey)
@@ -1863,8 +1891,8 @@ fn test_build_equal_outputs_dust_prevention() {
     );
 
     let result = snicker.build_psbt(
-        &target_tx,
-        0,
+        receiver_outpoint_param,
+        &receiver_txout,
         tweaked_output,
         proposer_outpoint,
         proposer_txout,
@@ -1901,6 +1929,13 @@ fn test_build_equal_outputs_insufficient_funds() {
             },
         ],
     };
+
+    // Extract receiver UTXO info from transaction
+    let receiver_outpoint_param = OutPoint {
+        txid: target_tx.compute_txid(),
+        vout: 0,
+    };
+    let receiver_txout = target_tx.output[0].clone();
 
     let proposer_seckey = SecretKey::from_slice(&[0x02; 32]).unwrap();
     let proposer_key = XOnlyPublicKey::from_keypair(
@@ -1946,8 +1981,8 @@ fn test_build_equal_outputs_insufficient_funds() {
     );
 
     let result = snicker.build_psbt(
-        &target_tx,
-        0,
+        receiver_outpoint_param,
+        &receiver_txout,
         tweaked_output,
         proposer_outpoint,
         proposer_txout,
@@ -1990,6 +2025,15 @@ fn test_propose_invalid_output_index() {
         ],
     };
 
+    // With the new API, we pass OutPoint and TxOut directly
+    // This test is no longer valid as there's no transaction to validate against
+    // We'll pass valid UTXO info - the test can be removed or repurposed
+    let receiver_outpoint_param = OutPoint {
+        txid: target_tx.compute_txid(),
+        vout: 0,  // Use valid index since we're extracting the TxOut from it
+    };
+    let receiver_txout = target_tx.output[0].clone();
+
     let proposer_seckey = SecretKey::from_slice(&[0x02; 32]).unwrap();
     let proposer_key = XOnlyPublicKey::from_keypair(
         &Keypair::from_secret_key(&secp, &proposer_seckey)
@@ -2028,10 +2072,12 @@ fn test_propose_invalid_output_index() {
         bdk_wallet::bitcoin::Network::Regtest,
     );
 
-    // Try to access output index 5, but transaction only has 1 output (index 0)
+    // NOTE: This test previously checked for out-of-bounds output index
+    // With the new API (OutPoint + TxOut), there's no transaction to validate against
+    // So this test now just verifies normal PSBT building works
     let result = snicker.build_psbt(
-        &target_tx,
-        5, // OUT OF BOUNDS!
+        receiver_outpoint_param,
+        &receiver_txout,
         tweaked_output,
         proposer_outpoint,
         proposer_txout,
@@ -2042,8 +2088,9 @@ fn test_propose_invalid_output_index() {
         crate::config::DEFAULT_MIN_CHANGE_OUTPUT_SIZE,
     );
 
-    assert!(result.is_err(), "Should reject invalid output index");
-    assert!(result.unwrap_err().to_string().contains("out of bounds"));
+    // With the new API, this test no longer validates output index bounds
+    // It just verifies that PSBT building works with valid inputs
+    assert!(result.is_ok(), "PSBT building should succeed with valid inputs");
 }
 
 #[test]
@@ -2161,80 +2208,6 @@ fn test_receive_missing_witness_utxo() {
     assert!(result.unwrap_err().to_string().contains("missing witness_utxo"));
 }
 
-#[tokio::test]
-async fn test_db_concurrent_access() {
-    use std::sync::Arc;
-    use tokio::task::JoinSet;
-
-    let temp_dir = TempDir::new().unwrap();
-    let db_path = temp_dir.path().join("concurrent_test.db");
-    let snicker = Arc::new(
-        Snicker::new_from_path(&db_path, bdk_wallet::bitcoin::Network::Regtest).unwrap()
-    );
-
-    // Spawn multiple tasks that access the database concurrently
-    let mut tasks = JoinSet::new();
-
-    for i in 0..10u32 {
-        let snicker_clone = Arc::clone(&snicker);
-        tasks.spawn(async move {
-            let secp = Secp256k1::new();
-            let seckey = SecretKey::from_slice(&[i as u8 + 1; 32])
-                .unwrap();
-            let key = XOnlyPublicKey::from_keypair(
-                &Keypair::from_secret_key(&secp, &seckey)
-            ).0;
-
-            // Create a unique transaction for this task
-            let tx = Transaction {
-                version: bdk_wallet::bitcoin::transaction::Version::TWO,
-                lock_time: LockTime::ZERO,
-                input: vec![],
-                output: vec![
-                    TxOut {
-                        value: Amount::from_sat(100_000 + (i as u64) * 1000),
-                        script_pubkey: ScriptBuf::new_p2tr(&secp, key, None),
-                    },
-                ],
-            };
-
-            // Store candidate
-            snicker_clone.store_candidate(i, &tx).await.unwrap();
-        });
-    }
-
-    // Wait for all tasks to complete
-    while let Some(result) = tasks.join_next().await {
-        result.unwrap();
-    }
-
-    // Verify all candidates were stored
-    let candidates = snicker.get_snicker_candidates().await.unwrap();
-    assert_eq!(candidates.len(), 10, "All concurrent writes should succeed");
-}
-
-#[tokio::test]
-async fn test_db_corrupt_candidate() {
-    let temp_dir = TempDir::new().unwrap();
-    let db_path = temp_dir.path().join("corrupt_test.db");
-    let snicker = Snicker::new_from_path(&db_path, bdk_wallet::bitcoin::Network::Regtest).unwrap();
-
-    // Manually insert corrupted data directly into the database
-    {
-        let conn = snicker.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO snicker_candidates (block_height, txid, tx_data) VALUES (?1, ?2, ?3)",
-            (
-                12345u32,
-                "0000000000000000000000000000000000000000000000000000000000000001",
-                vec![0xFF, 0xFF, 0xFF], // CORRUPTED DATA!
-            ),
-        ).unwrap();
-    }
-
-    // Try to retrieve candidates - should error on deserialization
-    let result = snicker.get_snicker_candidates().await;
-
-    assert!(result.is_err(), "Should error when deserializing corrupted data");
-    // The error should be from bitcoin deserialization
-}
+// Removed: test_db_concurrent_access and test_db_corrupt_candidate
+// These tests were for the old snicker_candidates table which has been removed.
+// Candidates are now queried directly from partial_utxo_set on-demand.

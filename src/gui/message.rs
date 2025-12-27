@@ -80,13 +80,12 @@ pub enum Message {
     // SNICKER
     SnickerScanRequested,
     SnickerScanCompleted(Result<usize, String>),
-    SnickerScanBlocksInputChanged(String),
     SnickerScanMinUtxoInputChanged(String),
     SnickerScanMaxUtxoInputChanged(String),
+    SnickerScanBlockAgeInputChanged(String),
     SnickerClearCandidates,
     SnickerCandidatesCleared(Result<usize, String>),
     SnickerFindOpportunities,
-    SnickerFindMinUtxoInputChanged(String),
     SnickerOpportunitiesFound(usize, Vec<(usize, String)>, Vec<crate::snicker::ProposalOpportunity>), // (count, list, data)
     SnickerCreateProposal(usize, u64), // (opportunity_index, delta_sats)
     SnickerProposalCreated(Result<String, String>), // proposal hex or error
