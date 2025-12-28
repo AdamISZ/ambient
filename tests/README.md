@@ -15,9 +15,14 @@ export BITCOIN_BIN_DIR=/path/to/bitcoin-28.0/bin
 
 ## Quick Start
 
-Run all tests:
+Run all tests (excluding Nostr tests):
 ```bash
 cargo test -- --test-threads=1
+```
+
+Run all tests including Nostr/relay tests:
+```bash
+cargo test --features test-utils -- --test-threads=1
 ```
 
 Run a specific test:
@@ -73,29 +78,68 @@ cargo test test_wallet_creation -- --test-threads=1 --nocapture
 
 ## Available Tests
 
-### test_wallet_creation
+### Basic Wallet Tests
+
+#### test_wallet_creation
 Verifies basic wallet creation and address generation:
 - Creates new wallet with BIP39 mnemonic
 - Generates taproot (bc1p...) addresses
 - Confirms wallet structure is valid
 
-### test_connect_to_regtest
+#### test_connect_to_regtest
 Tests Kyoto light client sync:
 - Connects to regtest bitcoind via P2P (port 18444)
 - Syncs using compact block filters (BIP157/158)
 - Verifies wallet reaches current blockchain height
 
-### test_receive_funds
+#### test_receive_funds
 Tests receiving and detecting transactions:
 - Creates wallet and gets receiving address
 - Sends 1.0 BTC from bitcoind's wallet to test wallet
 - Mines block to confirm transaction
 - Verifies wallet detects transaction and updates balance
 
-### test_mine_blocks
+#### test_mine_blocks
 Tests block mining functionality:
 - Mines 6 blocks via RPC
 - Verifies blockchain height increases correctly
+
+### SNICKER Integration Test
+
+#### test_snicker_end_to_end
+Comprehensive SNICKER coinjoin test:
+- Creates two wallets (Alice: receiver, Bob: proposer)
+- Funds both wallets with multiple UTXOs
+- Bob finds opportunities and creates encrypted proposal
+- Alice discovers, validates, and signs the proposal
+- Broadcasts and confirms the coinjoin transaction
+- Verifies privacy (equal-sized outputs) and SNICKER UTXO tracking
+
+Run with:
+```bash
+cargo test --test regtest_snicker -- --test-threads=1 --nocapture
+```
+
+### Nostr Network Tests
+
+Nostr integration tests require the `test-utils` feature which enables relay dependencies:
+
+```bash
+# Run nostr tests
+cargo test --test nostr_integration --features test-utils
+
+# Run specific relay tests
+cargo test network::test_relay --features test-utils
+```
+
+These tests verify:
+- Relay connectivity checking
+- Proposal publishing to Nostr relays
+- Proposal subscription and discovery
+- Embedded relay functionality (zero-setup testing)
+- Proof-of-work verification
+
+**Note**: Without `--features test-utils`, these tests are ignored to avoid hitting relays during regular CI runs.
 
 ## Troubleshooting
 
