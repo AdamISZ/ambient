@@ -100,7 +100,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    #[ignore] // Only run when relay is available
+    #[cfg_attr(not(feature = "test-utils"), ignore)] // Only run with --features=test-utils
     async fn test_check_local_relay() {
         let available = check_relay_available(
             "ws://localhost:7777",
@@ -115,7 +115,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // Don't hit public relays in CI
+    #[cfg_attr(not(feature = "test-utils"), ignore)] // Only run with --features=test-utils (don't hit public relays in CI)
     async fn test_check_public_relay() {
         let available = check_relay_available(
             "wss://relay.damus.io",

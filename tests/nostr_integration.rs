@@ -4,15 +4,17 @@
 //!
 //! Run all tests with embedded relay:
 //! ```bash
-//! cargo test --test nostr_integration --features test-utils -- --ignored --nocapture
+//! cargo test --test nostr_integration --features test-utils
 //! ```
 //!
 //! Or test against an external relay (without embedded relay):
 //! ```bash
-//! NOSTR_RELAY_URL=ws://localhost:7777 cargo test --test nostr_integration -- --ignored
+//! NOSTR_RELAY_URL=ws://localhost:7777 cargo test --test nostr_integration --features test-utils
 //! ```
 //!
-//! Note: The --features test-utils flag is required for embedded relay support
+//! Note: The --features test-utils flag is required for these tests
+
+#![cfg(feature = "test-utils")]
 
 use ambient::network::nostr::NostrNetwork;
 use ambient::network::embedded_relay::EmbeddedRelay;
@@ -30,7 +32,7 @@ fn relay_url() -> String {
 }
 
 #[tokio::test]
-#[ignore] // Only run when relay is available
+#[cfg_attr(not(feature = "test-utils"), ignore)] // Only run with --features=test-utils
 async fn test_relay_available() {
     use ambient::network::test_relay::check_relay_available;
     use std::time::Duration;
@@ -48,7 +50,7 @@ async fn test_relay_available() {
 }
 
 #[tokio::test]
-#[ignore]
+#[cfg_attr(not(feature = "test-utils"), ignore)] // Only run with --features=test-utils
 async fn test_publish_proposal() {
     let url = relay_url();
 
@@ -85,7 +87,7 @@ async fn test_publish_proposal() {
 }
 
 #[tokio::test]
-#[ignore]
+#[cfg_attr(not(feature = "test-utils"), ignore)] // Only run with --features=test-utils
 async fn test_subscribe_proposals() {
     let url = relay_url();
 
@@ -140,7 +142,7 @@ async fn test_subscribe_proposals() {
 }
 
 #[tokio::test]
-#[ignore]
+#[cfg_attr(not(feature = "test-utils"), ignore)] // Only run with --features=test-utils
 async fn test_publish_and_receive() {
     let url = relay_url();
 
@@ -239,7 +241,7 @@ async fn test_publish_and_receive() {
 }
 
 #[tokio::test]
-#[ignore]
+#[cfg_attr(not(feature = "test-utils"), ignore)] // Only run with --features=test-utils
 async fn test_with_embedded_relay() {
     // This test uses an embedded relay - no external infrastructure needed!
     let temp_dir = tempfile::tempdir().unwrap();
@@ -337,7 +339,7 @@ async fn test_with_embedded_relay() {
 }
 
 #[tokio::test]
-#[ignore]
+#[cfg_attr(not(feature = "test-utils"), ignore)] // Only run with --features=test-utils
 async fn test_pow_verification() {
     let url = relay_url();
 

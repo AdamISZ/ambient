@@ -63,13 +63,25 @@ pub fn view(
 
     // Password input (only show if wallet is selected)
     if selected.is_some() {
+        let password_input = if !password_owned.is_empty() {
+            // Enable submit on Enter key when password is not empty
+            text_input("Enter wallet password", &password_owned)
+                .on_input(Message::OpenWalletPasswordChanged)
+                .on_submit(Message::LoadWalletRequested(selected.clone().unwrap(), password_owned.clone()))
+                .secure(true)
+                .width(Length::Fixed(400.0))
+        } else {
+            // No submit action when password is empty
+            text_input("Enter wallet password", &password_owned)
+                .on_input(Message::OpenWalletPasswordChanged)
+                .secure(true)
+                .width(Length::Fixed(400.0))
+        };
+
         scrollable_content = scrollable_content.push(
             column![
                 text("Password").size(16),
-                text_input("Enter wallet password", &password_owned)
-                    .on_input(Message::OpenWalletPasswordChanged)
-                    .secure(true)
-                    .width(Length::Fixed(400.0)),
+                password_input,
             ].spacing(5)
         );
 

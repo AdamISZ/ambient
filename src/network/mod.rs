@@ -11,7 +11,8 @@ pub mod serialization;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_relay;
 
-#[cfg(any(test, feature = "test-utils"))]
+// Embedded relay (only with test-utils feature, needs external dependencies)
+#[cfg(feature = "test-utils")]
 pub mod embedded_relay;
 
 use anyhow::Result;
