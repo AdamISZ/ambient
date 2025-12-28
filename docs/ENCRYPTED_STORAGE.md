@@ -126,32 +126,9 @@ Wallet descriptors for key derivation.
 
 **Purpose:** Stores SNICKER-specific transaction data, proposals, and automation state
 
-This database contains four main tables:
+This database contains three main tables (plus partial_utxo_set managed separately):
 
----
-
-#### Table: `snicker_candidates`
-
-**Purpose:** Stores potential SNICKER transactions discovered during blockchain scanning.
-
-**Schema:**
-```sql
-CREATE TABLE snicker_candidates (
-    block_height INTEGER NOT NULL,
-    txid TEXT NOT NULL PRIMARY KEY,
-    tx_data BLOB NOT NULL
-);
-```
-
-**Columns:**
-- `block_height` - Block where transaction was found
-- `txid` - Transaction ID (unique)
-- `tx_data` - Serialized Bitcoin transaction (BLOB)
-
-**Usage:**
-- Populated by proposer mode scanning
-- Candidates are tested for SNICKER proposals
-- Old candidates may be pruned periodically
+**Note:** Candidate scanning has been eliminated - candidates are now queried on-demand from the `partial_utxo_set` database which is maintained separately from the encrypted SNICKER database.
 
 ---
 
@@ -277,13 +254,78 @@ CREATE INDEX idx_automation_log_action ON automation_log(action_type, timestamp)
 - `success` - Whether action completed successfully (0 or 1)
 
 **Action Types:**
-- `auto_accept` - Automatically accepted a proposal
+- `auto_accept` - Automatically accepted a proposal (Basic mode)
+- `auto_create` - Automatically created and published a proposal (Advanced mode)
 - `auto_broadcast` - Automatically broadcast a transaction
 - `auto_reject` - Automatically rejected a proposal
 
 **Indexes:**
 - `idx_automation_log_timestamp` - Chronological queries
 - `idx_automation_log_action` - Filter by action type
+
+---
+
+### 4. partial_utxo_set (separate database)
+
+**Type:** Unencrypted SQLite database (stored separately from wallet files)
+
+**Purpose:** Maintains a filtered view of blockchain P2TR UTXOs for trustless proposer validation
+
+**Location:** Stored in wallet directory alongside encrypted files (currently unencrypted)
+
+**Schema:**
+```sql
+CREATE TABLE partial_utxo_set (
+    txid TEXT NOT NULL,
+    vout INTEGER NOT NULL,
+    amount INTEGER NOT NULL,
+    script_pubkey BLOB NOT NULL,
+    block_height INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'unspent',
+    spent_in_txid TEXT,
+    spent_at_height INTEGER,
+    created_at INTEGER NOT NULL,
+    transaction_type TEXT,
+    PRIMARY KEY (txid, vout)
+);
+
+CREATE INDEX idx_partial_utxo_status ON partial_utxo_set(status);
+CREATE INDEX idx_partial_utxo_height ON partial_utxo_set(block_height);
+CREATE INDEX idx_partial_utxo_amount ON partial_utxo_set(amount);
+CREATE INDEX idx_partial_utxo_tx_type ON partial_utxo_set(transaction_type);
+```
+
+**Columns:**
+- `txid` - Transaction ID
+- `vout` - Output index
+- `amount` - Amount in satoshis
+- `script_pubkey` - Bitcoin script (P2TR only)
+- `block_height` - Block where UTXO was created
+- `status` - Either "unspent" or "spent"
+- `spent_in_txid` - Transaction that spent this UTXO (NULL if unspent)
+- `spent_at_height` - Block height where spent (NULL if unspent)
+- `created_at` - Unix timestamp when added to set
+- `transaction_type` - "v1" for SNICKER transactions, NULL for regular
+
+**Usage:**
+- Automatically populated during blockchain scanning
+- Filters: P2TR outputs ≥ 5000 sats
+- Tracks spent status in real-time
+- Used for SNICKER candidate discovery (on-demand queries)
+- Provides trustless validation of proposer UTXOs
+
+**Indexes:**
+- `idx_partial_utxo_status` - Fast filtering of unspent UTXOs
+- `idx_partial_utxo_height` - Block height range queries
+- `idx_partial_utxo_amount` - Amount range filtering
+- `idx_partial_utxo_tx_type` - Filter SNICKER vs regular transactions
+
+**Security Note:**
+- Currently unencrypted (contains no spending keys)
+- May be encrypted in future versions for additional privacy
+- Safe to delete - will be rebuilt automatically on next sync
+
+See [`AMBIENT_UTXO_MANAGEMENT.md`](AMBIENT_UTXO_MANAGEMENT.md) for complete design details.
 
 ---
 

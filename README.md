@@ -23,9 +23,13 @@ Ambient is a Bitcoin wallet that implements [SNICKER](https://gist.github.com/Ad
 ### How It Works
 
 1. **Proposer** scans the blockchain for potential coinjoin partners
-2. Creates an encrypted proposal and broadcasts it (via Nostr, bulletin boards, DHT, or any other mechanism - the broadcast is not yet implemented! - so proposals can only be shared manually for now)
-3. **Receiver** discovers proposals meant for them, validates, and signs if acceptable
+2. Creates an encrypted proposal and broadcasts it via Nostr relays
+3. **Receiver** discovers proposals meant for them (via Nostr subscription), validates, and signs if acceptable
 4. Completed coinjoin transaction is broadcast to Bitcoin network
+
+**Automation modes:**
+- **Basic**: Automatically accept incoming proposals within delta range
+- **Advanced**: Auto-accept + auto-create proposals (fully autonomous coinjoining)
 
 ### Trustless Validation
 
@@ -65,6 +69,7 @@ See [`docs/AMBIENT_UTXO_MANAGEMENT.md`](docs/AMBIENT_UTXO_MANAGEMENT.md) for the
 - **[BDK (Bitcoin Dev Kit)](https://bitcoindevkit.org/)** - Bitcoin wallet library
 - **[Kyoto](https://github.com/rustaceanrob/kyoto)** - Compact block filter light client (BIP157/158)
 - **[Iced](https://github.com/iced-rs/iced)** - Cross-platform GUI framework
+- **[Nostr](https://github.com/rust-nostr/nostr)** - Decentralized proposal broadcast/discovery network
 - **Taproot ([BIP341](#bip341-taproot))** - Modern Bitcoin scripting with keypath spending
 - **[BIP86](#bip86-key-derivation)** - Deterministic key derivation for Taproot
 - **[SNICKER](#snicker-bip-draft)** - Non-interactive coinjoin protocol
@@ -84,16 +89,22 @@ See [`docs/AMBIENT_UTXO_MANAGEMENT.md`](docs/AMBIENT_UTXO_MANAGEMENT.md) for the
 - ✅ Recoverable tweaked outputs
 - ✅ Light client sync via Kyoto (BIP157/158)
 - ✅ Partial UTXO set for trustless proposer validation
+- ✅ Nostr network integration (proposal broadcast/discovery)
+- ✅ Automation modes (Basic: auto-accept, Advanced: auto-accept + auto-create)
+- ✅ SNICKER UTXO tracking and management
 - ✅ GUI interface (Iced framework)
 - ✅ Real-time wallet status updates
 - ✅ End-to-end integration tests
 
-**TODO:**
-- [ ] Proposal broadcast/discovery mechanism (Nostr, DHT, etc.)
+**In Progress / TODO:**
+- [ ] "Send All" function for emptying wallet
+- [ ] Improved UTXO selection (prefer single SNICKER UTXO, warn on multiple)
+- [ ] Enhanced status bar (permanent, network status, INFO logs)
+- [ ] Standard OS file picker integration
 - [ ] Fallback validation mode for UTXOs outside scan window
-- [ ] UTXO selection strategies
 - [ ] Fee estimation improvements
 - [ ] Password change functionality
+- [ ] Private key memory zeroization
 - [ ] Comprehensive testing on signet/mainnet
 
 ---
@@ -147,13 +158,21 @@ ambient/
 │   ├── encryption.rs         # Encrypted in-memory database management
 │   ├── snicker/
 │   │   ├── mod.rs            # SNICKER protocol logic
-│   │   └── tweak.rs          # Cryptographic primitives (ECDH, tweaking)
+│   │   ├── tweak.rs          # Cryptographic primitives (ECDH, tweaking)
+│   │   └── automation.rs     # Automation task and rate limiting
+│   ├── network/              # Proposal broadcast/discovery
+│   │   ├── mod.rs            # Network trait and abstraction
+│   │   ├── nostr.rs          # Nostr network implementation
+│   │   ├── file_based.rs     # File-based proposal sharing
+│   │   └── serialization.rs  # Proposal serialization (JSON)
 │   ├── gui/                  # GUI interface (Iced framework)
 │   │   ├── app.rs            # Application state and message handling
 │   │   ├── state.rs          # Application state management
 │   │   ├── views/            # UI views (wallet, settings, modals)
 │   │   └── widgets/          # Custom UI components
-│   ├── main.rs               # CLI interface
+│   ├── cli/                  # CLI interface
+│   │   └── repl.rs           # Interactive REPL commands
+│   ├── main.rs               # CLI entry point
 │   └── gui_main.rs           # GUI entry point
 ├── tests/                    # Integration tests
 └── docs/
@@ -177,24 +196,24 @@ ambient/
 │  ← SQLite :memory: connections                          │
 └─────────────────────┬───────────────────────────────────┘
                       │
-       ┌──────────────┼──────────────┬──────────────┐
-       ↓              ↓              ↓              ↓
-   ┌─────┐      ┌────────┐     ┌────────┐   ┌─────────────┐
-   │ BDK │      │ Kyoto  │     │SNICKER │   │ Partial     │
-   │     │      │(BIP157)│     │        │   │ UTXO Set    │
-   └─────┘      └────────┘     └────────┘   └─────────────┘
-       │              │              │              │
-       │              └──────┬───────┴──────────────┘
+       ┌──────────────┼──────────────┬──────────────┬──────────┐
+       ↓              ↓              ↓              ↓          ↓
+   ┌─────┐      ┌────────┐     ┌────────┐   ┌─────────┐  ┌───────┐
+   │ BDK │      │ Kyoto  │     │SNICKER │   │ Partial │  │ Nostr │
+   │     │      │(BIP157)│     │        │   │UTXO Set │  │Network│
+   └─────┘      └────────┘     └────────┘   └─────────┘  └───────┘
+       │              │              │              │          │
+       │              └──────┬───────┴──────────────┴──────────┘
        │                     ↓
-       │              ┌──────────┐
-       └──────────────> Manager  │
-                      └────┬─────┘
-                           │
-                      ┌────┴─────┐
-                      ↓          ↓
-                  ┌──────┐  ┌──────┐
-                  │ CLI  │  │ GUI  │  ← Real-time updates
-                  └──────┘  └──────┘
+       │              ┌──────────────┐
+       └──────────────> Manager      │ ← Automation Task
+                      └──────┬───────┘
+                             │
+                        ┌────┴─────┐
+                        ↓          ↓
+                    ┌──────┐  ┌──────┐
+                    │ CLI  │  │ GUI  │  ← Real-time updates
+                    └──────┘  └──────┘
 ```
 
 See [`docs/ENCRYPTED_STORAGE.md`](docs/ENCRYPTED_STORAGE.md) for detailed encryption architecture and database schemas.
