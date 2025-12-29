@@ -155,27 +155,38 @@ fn sidebar_button(label: &str, tab: WalletTab, current: WalletTab) -> Element<'s
 }
 
 /// Create a styled menu button with rounded corners
-/// Create status bar at bottom
+/// Create permanent status bar at bottom showing network status and messages
 fn status_bar(data: &WalletData) -> Element<'static, Message> {
-    if let Some(status) = &data.status_message {
-        let status = status.clone();
-        container(
-            text(status).size(14)
-        )
-        .padding(8)
-        .width(Length::Fill)
-        .style(|_theme: &Theme| {
-            container::Style {
-                background: Some(iced::Background::Color(Color::from_rgb(0.2, 0.3, 0.4))),
-                text_color: Some(Color::WHITE),
-                ..Default::default()
-            }
-        })
-        .into()
-    } else {
-        // Empty placeholder when no status
-        container(text("")).height(0).into()
+    // Build status text with network info and messages
+    let mut status_parts = Vec::new();
+
+    // Network status (TODO: get actual Nostr connection status from manager)
+    status_parts.push("Network: Active".to_string());
+
+    // Current status message if any
+    if let Some(msg) = &data.status_message {
+        status_parts.push(msg.clone());
     }
+
+    let status_text = if status_parts.is_empty() {
+        "Ready".to_string()
+    } else {
+        status_parts.join(" | ")
+    };
+
+    container(
+        text(status_text).size(14)
+    )
+    .padding(8)
+    .width(Length::Fill)
+    .style(|_theme: &Theme| {
+        container::Style {
+            background: Some(iced::Background::Color(Color::from_rgb(0.2, 0.3, 0.4))),
+            text_color: Some(Color::WHITE),
+            ..Default::default()
+        }
+    })
+    .into()
 }
 
 fn menu_button(label: &str, message: Message) -> Element<'static, Message> {
@@ -327,9 +338,14 @@ fn view_send(data: &WalletData) -> Element<'static, Message> {
 
         column![
             text("Amount (BTC)").size(16),
-            text_input("0.001", &send_amount)
-                .on_input(Message::SendAmountChanged)
-                .width(Length::Fixed(300.0)),
+            row![
+                text_input("0.001", &send_amount)
+                    .on_input(Message::SendAmountChanged)
+                    .width(Length::Fixed(300.0)),
+                button(text("Send All").size(14))
+                    .on_press(Message::SendAllRequested)
+                    .padding(8)
+            ].spacing(10)
         ].spacing(5),
 
         column![

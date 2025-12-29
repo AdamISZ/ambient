@@ -1676,6 +1676,12 @@ impl Snicker {
                     continue;
                 }
 
+                // Skip if both UTXOs are from the same transaction
+                // They're already in the same anonymity set, so proposing would be wasteful
+                if our_outpoint.txid == candidate_outpoint.txid {
+                    continue;
+                }
+
                 let candidate_amount = bdk_wallet::bitcoin::Amount::from_sat(*amount);
 
                 // Only consider candidates smaller than our UTXO

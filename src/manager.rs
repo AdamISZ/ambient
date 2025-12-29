@@ -177,6 +177,11 @@ impl Manager {
         self.wallet_node.send_to_address(address_str, amount_sats, fee_rate_sat_vb).await
     }
 
+    /// Calculate maximum sendable amount (total balance minus fee)
+    pub async fn calculate_max_sendable(&self, address_str: &str, fee_rate_sat_vb: f32) -> Result<u64> {
+        self.wallet_node.calculate_max_sendable(address_str, fee_rate_sat_vb).await
+    }
+
     /// Build a SNICKER spending transaction WITHOUT broadcasting (for testing)
     ///
     /// Returns the signed transaction hex that can be tested with testmempoolaccept

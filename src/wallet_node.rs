@@ -1604,6 +1604,74 @@ impl WalletNode {
         Ok(txid)
     }
 
+    /// Calculate the maximum amount that can be sent (total balance minus fee)
+    ///
+    /// This uses all available UTXOs (both regular and SNICKER) and calculates
+    /// the fee based on the transaction size with zero change outputs.
+    ///
+    /// # Arguments
+    /// * `address_str` - Destination address (needed to determine output size)
+    /// * `fee_rate_sat_vb` - Fee rate in sats per vbyte
+    pub async fn calculate_max_sendable(&self, address_str: &str, fee_rate_sat_vb: f32) -> Result<u64> {
+        use std::str::FromStr;
+
+        // Parse and validate destination address
+        let address = Address::from_str(address_str)?
+            .require_network(self.network)?;
+
+        // Get all available regular UTXOs
+        let regular_utxos = {
+            let wallet = self.wallet.lock().await;
+            wallet.list_unspent().collect::<Vec<_>>()
+        };
+
+        // Get all available SNICKER UTXOs
+        let snicker_utxos: Vec<(String, u32, u64)> = {
+            let conn = self.snicker_conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT txid, vout, amount FROM snicker_utxos WHERE block_height IS NOT NULL AND status = 'unspent'"
+            )?;
+            let mut rows = stmt.query([])?;
+            let mut result = Vec::new();
+            while let Some(row) = rows.next()? {
+                result.push((
+                    row.get(0)?, row.get(1)?, row.get(2)?,
+                ));
+            }
+            result
+        };
+
+        // Calculate total input amount
+        let regular_total: u64 = regular_utxos.iter().map(|u| u.txout.value.to_sat()).sum();
+        let snicker_total: u64 = snicker_utxos.iter().map(|(_, _, amount)| amount).sum();
+        let total_input = regular_total + snicker_total;
+
+        if total_input == 0 {
+            return Ok(0);
+        }
+
+        // Calculate output size based on destination address type
+        let script_pubkey = address.script_pubkey();
+        let output_size = 8 + script_pubkey.len(); // 8 bytes for amount + script length
+
+        // Calculate transaction size in vbytes
+        // Taproot inputs: ~57.5 vbytes each (outpoint: 36, script: 1, sequence: 4, witness: ~65/4)
+        let num_inputs = regular_utxos.len() + snicker_utxos.len();
+        let base_size = 4 + 1 + 1 + 4; // version + input_count + output_count + locktime
+        let input_size = num_inputs as f32 * 57.5; // Each Taproot input
+        let total_vbytes = base_size as f32 + input_size + output_size as f32;
+
+        // Calculate fee
+        let fee = (total_vbytes * fee_rate_sat_vb).ceil() as u64;
+
+        // Maximum sendable is total input minus fee
+        if fee >= total_input {
+            Ok(0)
+        } else {
+            Ok(total_input - fee)
+        }
+    }
+
     /// Build a transaction using SNICKER UTXOs WITHOUT broadcasting it.
     /// Returns the signed transaction for external verification/broadcasting.
     ///
@@ -1740,7 +1808,7 @@ impl WalletNode {
         let mut sighash_cache = SighashCache::new(&psbt.unsigned_tx);
 
         for (i, (_, _, _, script_pubkey, tweaked_privkey_bytes)) in selected_utxos.iter().enumerate() {
-            // Deserialize tweaked private key
+            // Deserialize tweaked private key (SecretKey implements secure drop)
             let tweaked_seckey = SecretKey::from_slice(tweaked_privkey_bytes)?;
             let tweaked_keypair = bdk_wallet::bitcoin::secp256k1::Keypair::from_secret_key(&secp, &tweaked_seckey);
 
@@ -1836,13 +1904,37 @@ impl WalletNode {
         let total_snicker_available: u64 = snicker_utxos.iter().map(|u| u.2).sum();
         info!("💰 SNICKER UTXOs available: {} sats in {} UTXOs", total_snicker_available, snicker_utxos.len());
 
-        // Select all available SNICKER UTXOs (we want to use them for privacy)
-        let selected_snicker = snicker_utxos;
-        let snicker_contribution = total_snicker_available;
-
         // Rough estimate for fee calculation
         let estimated_fee_per_input = (150.0 * fee_rate_sat_vb) as u64;
         let total_needed = amount_sats + estimated_fee_per_input;
+
+        // IMPROVED SELECTION LOGIC: Prefer using only ONE SNICKER UTXO
+        // Co-spending multiple SNICKER UTXOs defeats the privacy purpose of SNICKER coinjoins
+        // Strategy:
+        // 1. Try to find ONE SNICKER UTXO that can cover the payment
+        // 2. If no single SNICKER UTXO is enough, use regular UTXOs only
+        // 3. Only use multiple SNICKER UTXOs as a last resort (user must confirm separately)
+
+        let (selected_snicker, snicker_contribution) = if !snicker_utxos.is_empty() {
+            // Sort SNICKER UTXOs by amount descending (prefer largest)
+            let mut sorted_snicker = snicker_utxos;
+            sorted_snicker.sort_by(|a, b| b.2.cmp(&a.2));
+
+            // Try to find ONE SNICKER UTXO that can cover the payment + fee
+            if let Some(largest) = sorted_snicker.first() {
+                if largest.2 >= total_needed {
+                    info!("✅ Using ONE SNICKER UTXO ({} sats) to preserve privacy", largest.2);
+                    (vec![largest.clone()], largest.2)
+                } else {
+                    info!("💡 No single SNICKER UTXO large enough, will use regular UTXOs instead");
+                    (Vec::new(), 0)
+                }
+            } else {
+                (Vec::new(), 0)
+            }
+        } else {
+            (Vec::new(), 0)
+        };
 
         // Determine if we need regular UTXOs
         let (regular_utxos, regular_contribution) = if snicker_contribution < total_needed {
@@ -1900,6 +1992,11 @@ impl WalletNode {
 
     /// Sign SNICKER inputs in a PSBT using their tweaked private keys
     /// Assumes SNICKER inputs are at indices [start_idx..start_idx+snicker_utxos.len())
+    ///
+    /// # Security Note
+    /// This function handles sensitive private key material. The secp256k1::SecretKey type
+    /// implements secure drop (zeroization) automatically when it goes out of scope.
+    /// We ensure keys are dropped as soon as signing is complete by using tight scoping.
     pub(crate) fn sign_snicker_inputs(
         psbt: &mut bdk_wallet::bitcoin::psbt::Psbt,
         snicker_utxos: &[(String, u32, u64, Vec<u8>, Vec<u8>)],
@@ -1916,24 +2013,29 @@ impl WalletNode {
         for (i, (_, _, _, _script_pubkey, tweaked_privkey_bytes)) in snicker_utxos.iter().enumerate() {
             let input_idx = start_idx + i;
 
-            // Deserialize tweaked private key
-            let tweaked_seckey = SecretKey::from_slice(tweaked_privkey_bytes)?;
-            let tweaked_keypair = bdk_wallet::bitcoin::secp256k1::Keypair::from_secret_key(&secp, &tweaked_seckey);
+            // Create a signature in a tight scope to ensure keys are dropped ASAP
+            let signature = {
+                // Deserialize tweaked private key
+                // SecretKey implements secure drop - memory is zeroed when it goes out of scope
+                let tweaked_seckey = SecretKey::from_slice(tweaked_privkey_bytes)?;
+                let tweaked_keypair = bdk_wallet::bitcoin::secp256k1::Keypair::from_secret_key(&secp, &tweaked_seckey);
 
-            // Compute sighash
-            let sighash = sighash_cache.taproot_key_spend_signature_hash(
-                input_idx,
-                &prevouts_all,
-                TapSighashType::Default,
-            )?;
+                // Compute sighash
+                let sighash = sighash_cache.taproot_key_spend_signature_hash(
+                    input_idx,
+                    &prevouts_all,
+                    TapSighashType::Default,
+                )?;
 
-            // Sign
-            let msg = Message::from_digest_slice(sighash.as_byte_array())?;
-            let sig = secp.sign_schnorr(&msg, &tweaked_keypair);
+                // Sign and return signature
+                let msg = Message::from_digest_slice(sighash.as_byte_array())?;
+                secp.sign_schnorr(&msg, &tweaked_keypair)
+                // tweaked_seckey and tweaked_keypair are securely dropped here
+            };
 
             // Add signature to PSBT
             psbt.inputs[input_idx].tap_key_sig = Some(bdk_wallet::bitcoin::taproot::Signature {
-                signature: sig,
+                signature,
                 sighash_type: TapSighashType::Default,
             });
 

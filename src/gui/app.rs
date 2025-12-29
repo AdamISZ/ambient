@@ -560,6 +560,24 @@ impl AmbientApp {
                 Task::none()
             }
 
+            Message::BrowseWalletDirectory => {
+                Task::perform(
+                    async {
+                        rfd::AsyncFileDialog::new()
+                            .set_title("Select Wallet Directory")
+                            .pick_folder()
+                            .await
+                    },
+                    |result| {
+                        if let Some(folder) = result {
+                            Message::SettingsWalletDirChanged(folder.path().to_string_lossy().to_string())
+                        } else {
+                            Message::Placeholder
+                        }
+                    }
+                )
+            }
+
             Message::SettingsRecoveryHeightChanged(height_str) => {
                 if let Some(crate::gui::modal::Modal::Settings { edited_config, wallet_loaded: _ }) = &mut self.active_modal {
                     if let Ok(height) = height_str.parse::<u32>() {
@@ -574,6 +592,24 @@ impl AmbientApp {
                     edited_config.proposal_network.file_directory = std::path::PathBuf::from(dir);
                 }
                 Task::none()
+            }
+
+            Message::BrowseProposalsDirectory => {
+                Task::perform(
+                    async {
+                        rfd::AsyncFileDialog::new()
+                            .set_title("Select Proposals Directory")
+                            .pick_folder()
+                            .await
+                    },
+                    |result| {
+                        if let Some(folder) = result {
+                            Message::SettingsProposalsDirChanged(folder.path().to_string_lossy().to_string())
+                        } else {
+                            Message::Placeholder
+                        }
+                    }
+                )
             }
 
             Message::SettingsProposalNetworkBackendChanged(backend_str) => {
@@ -964,6 +1000,47 @@ impl AmbientApp {
             Message::SendFeeRateChanged(fee_rate) => {
                 if let AppState::WalletLoaded { wallet_data, .. } = &mut self.state {
                     wallet_data.send_fee_rate = fee_rate;
+                }
+                Task::none()
+            }
+
+            Message::SendAllRequested => {
+                // Calculate max sendable amount and populate the amount field
+                if let AppState::WalletLoaded { manager, wallet_data } = &mut self.state {
+                    let address = wallet_data.send_address.clone();
+                    let fee_rate_str = wallet_data.send_fee_rate.clone();
+
+                    // Require address to be entered first
+                    if address.is_empty() {
+                        eprintln!("❌ Please enter destination address first");
+                        return Task::none();
+                    }
+
+                    // Parse fee rate (default to 1.0 if empty or invalid)
+                    let fee_rate = fee_rate_str.parse::<f32>().unwrap_or(1.0).max(0.1);
+
+                    let manager_clone = manager.clone();
+                    let rt_handle = self.tokio_runtime.handle().clone();
+
+                    return Task::perform(
+                        async move {
+                            rt_handle.spawn(async move {
+                                let manager = manager_clone.read().await;
+                                manager.calculate_max_sendable(&address, fee_rate).await
+                            }).await.unwrap()
+                        },
+                        |result| match result {
+                            Ok(max_sats) => {
+                                // Convert sats to BTC and update the amount field
+                                let btc_amount = max_sats as f64 / 100_000_000.0;
+                                Message::SendAmountChanged(format!("{:.8}", btc_amount))
+                            }
+                            Err(e) => {
+                                eprintln!("❌ Failed to calculate max sendable: {}", e);
+                                Message::Placeholder
+                            }
+                        }
+                    );
                 }
                 Task::none()
             }

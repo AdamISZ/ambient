@@ -145,12 +145,17 @@ pub fn view(edited_config: &Config, wallet_loaded: bool) -> Element<'static, Mes
                 .width(Length::Fixed(200.0))
         ].spacing(5),
 
-        // Wallet directory input
+        // Wallet directory input with browse button
         column![
             text("Wallet Directory").size(16),
-            text_input("Wallet directory path", &wallet_dir)
-                .on_input(Message::SettingsWalletDirChanged)
-                .width(Length::Fixed(400.0))
+            row![
+                text_input("Wallet directory path", &wallet_dir)
+                    .on_input(Message::SettingsWalletDirChanged)
+                    .width(Length::Fixed(400.0)),
+                button(text("Browse").size(14))
+                    .on_press(Message::BrowseWalletDirectory)
+                    .padding(8)
+            ].spacing(10)
         ].spacing(5),
 
         // Proposal Network Backend selection
@@ -168,9 +173,14 @@ pub fn view(edited_config: &Config, wallet_loaded: bool) -> Element<'static, Mes
             column![
                 text("Proposals Directory").size(16),
                 text("Directory where SNICKER proposal files are stored").size(12),
-                text_input("Proposals directory path", &proposals_dir)
-                    .on_input(Message::SettingsProposalsDirChanged)
-                    .width(Length::Fixed(400.0))
+                row![
+                    text_input("Proposals directory path", &proposals_dir)
+                        .on_input(Message::SettingsProposalsDirChanged)
+                        .width(Length::Fixed(400.0)),
+                    button(text("Browse").size(14))
+                        .on_press(Message::BrowseProposalsDirectory)
+                        .padding(8)
+                ].spacing(10)
             ].spacing(5)
         } else {
             column![

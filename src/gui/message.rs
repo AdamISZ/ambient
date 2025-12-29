@@ -66,6 +66,7 @@ pub enum Message {
     SendAddressChanged(String),
     SendAmountChanged(String),
     SendFeeRateChanged(String),
+    SendAllRequested,
     SendRequested,
     TransactionSent(Result<Txid, String>),
 
@@ -113,8 +114,10 @@ pub enum Message {
     SettingsNetworkChanged(String),
     SettingsPeerChanged(String),
     SettingsWalletDirChanged(String),
+    BrowseWalletDirectory,
     SettingsRecoveryHeightChanged(String),
     SettingsProposalsDirChanged(String),
+    BrowseProposalsDirectory,
     SettingsProposalNetworkBackendChanged(String), // "FileBased" or "Nostr"
     SettingsNostrRelaysChanged(String), // Comma-separated relay URLs
     SettingsNostrPowDifficultyChanged(String), // PoW difficulty (optional)
