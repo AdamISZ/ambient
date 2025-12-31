@@ -21,6 +21,7 @@ rusqlite = { version = "0.31", features = ["backup"] }
 chacha20poly1305 = "0.10"
 argon2 = { version = "0.5", features = ["std"] }
 rand = "0.8"
+zeroize = "1.8"
 
 # CLI password input
 dialoguer = "0.11"

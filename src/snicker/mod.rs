@@ -39,6 +39,7 @@ use std::sync::{Arc, Mutex};
 use std::str::FromStr;
 
 use anyhow::{Result, anyhow};
+use zeroize::Zeroizing;
 use bdk_wallet::{
     bitcoin::{Network, OutPoint, Transaction, TxOut, Txid, psbt::Psbt, secp256k1::PublicKey},
     rusqlite::Connection,
@@ -664,48 +665,9 @@ impl Snicker {
         }
 
         // PHASE 1 DEBUG: Dump PSBT state after manual creation (before adding tap fields)
-        Self::dump_psbt_state(&psbt, "After manual SNICKER PSBT creation - BEFORE adding tap fields");
+        crate::utils::dump_psbt_state(&psbt, "After manual SNICKER PSBT creation - BEFORE adding tap fields");
 
         Ok(psbt)
-    }
-
-    /// Dump complete PSBT state for debugging (same as in wallet_node.rs)
-    fn dump_psbt_state(psbt: &Psbt, label: &str) {
-        tracing::info!("========== PSBT STATE: {} ==========", label);
-        tracing::info!("Transaction inputs: {}", psbt.unsigned_tx.input.len());
-        tracing::info!("Transaction outputs: {}", psbt.unsigned_tx.output.len());
-
-        for (i, input) in psbt.inputs.iter().enumerate() {
-            tracing::info!("--- Input {} ---", i);
-            tracing::info!("  witness_utxo: {}", input.witness_utxo.is_some());
-            if let Some(ref utxo) = input.witness_utxo {
-                tracing::info!("    value: {} sats", utxo.value.to_sat());
-                tracing::info!("    script: {}", utxo.script_pubkey);
-            }
-            tracing::info!("  non_witness_utxo: {}", input.non_witness_utxo.is_some());
-            tracing::info!("  sighash_type: {:?}", input.sighash_type);
-            tracing::info!("  tap_internal_key: {:?}", input.tap_internal_key);
-            tracing::info!("  tap_merkle_root: {:?}", input.tap_merkle_root);
-            tracing::info!("  tap_key_sig: {:?}", input.tap_key_sig);
-            tracing::info!("  tap_script_sigs: {}", input.tap_script_sigs.len());
-            tracing::info!("  tap_key_origins: {}", input.tap_key_origins.len());
-            for (xonly, (leaf_hashes, (fingerprint, path))) in &input.tap_key_origins {
-                tracing::info!("    xonly: {}", xonly);
-                tracing::info!("    fingerprint: {}", fingerprint);
-                tracing::info!("    path: {}", path);
-                tracing::info!("    leaf_hashes: {} entries", leaf_hashes.len());
-            }
-            tracing::info!("  bip32_derivation: {}", input.bip32_derivation.len());
-            tracing::info!("  partial_sigs: {}", input.partial_sigs.len());
-            tracing::info!("  final_script_witness: {}", input.final_script_witness.is_some());
-        }
-
-        for (i, output) in psbt.outputs.iter().enumerate() {
-            tracing::info!("--- Output {} ---", i);
-            tracing::info!("  tap_internal_key: {:?}", output.tap_internal_key);
-            tracing::info!("  tap_key_origins: {}", output.tap_key_origins.len());
-        }
-        tracing::info!("========================================");
     }
 
     /// Create a tweaked output from an original output using the proposer's input key
@@ -1505,8 +1467,12 @@ impl Snicker {
             let txid = bdk_wallet::bitcoin::Txid::from_str(&txid_str)?;
             // ScriptPubKey is stored as raw bytes (not consensus-encoded)
             let script_pubkey = bdk_wallet::bitcoin::ScriptBuf::from_bytes(script_bytes);
+            // Wrap in Zeroizing so intermediate bytes are zeroed after SecretKey is created
+            let privkey_bytes = Zeroizing::new(privkey_bytes);
             let tweaked_privkey = bdk_wallet::bitcoin::secp256k1::SecretKey::from_slice(&privkey_bytes)?;
 
+            // Wrap shared secret bytes in Zeroizing for secure cleanup
+            let secret_bytes = Zeroizing::new(secret_bytes);
             let mut snicker_shared_secret = [0u8; 32];
             snicker_shared_secret.copy_from_slice(&secret_bytes);
 

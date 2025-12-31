@@ -9,6 +9,7 @@ pub mod fee;
 pub mod network;
 pub mod signer;
 pub mod snicker;
+pub mod utils;
 pub mod wallet_node;
 pub mod manager;
 pub mod cli;

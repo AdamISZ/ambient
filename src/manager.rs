@@ -6,6 +6,7 @@
 use anyhow::{Result, Context};
 use bdk_wallet::bitcoin::{Transaction, psbt::Psbt};
 use tracing::info;
+use zeroize::Zeroizing;
 
 use crate::wallet_node::WalletNode;
 use crate::snicker::{Snicker, ProposalOpportunity, EncryptedProposal, Proposal};
@@ -383,15 +384,15 @@ impl Manager {
 
                 // Fetch private key on-demand from database in a tight scope
                 // SecretKey implements secure drop - memory is zeroed when it goes out of scope
-                let privkey_bytes = {
-                    use bdk_wallet::bitcoin::secp256k1::SecretKey;
+                // Wrapped in Zeroizing to ensure the Vec<u8> is also zeroed on drop
+                let privkey_bytes: Zeroizing<Vec<u8>> = {
                     let conn = snicker_conn_clone.lock().unwrap();
                     let bytes: Vec<u8> = conn.query_row(
                         "SELECT tweaked_privkey FROM snicker_utxos WHERE txid = ? AND vout = ?",
                         [outpoint.txid.to_string(), outpoint.vout.to_string()],
                         |row| row.get(0),
                     )?;
-                    bytes
+                    Zeroizing::new(bytes)
                 };
 
                 // Prepare data in format expected by sign_snicker_inputs helper
