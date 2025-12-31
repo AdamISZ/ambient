@@ -67,6 +67,7 @@ pub enum Message {
     SendAmountChanged(String),
     SendFeeRateChanged(String),
     SendAllRequested,
+    SendAllAmountCalculated(String), // Internal: updates amount without clearing send_all_mode
     SendRequested,
     TransactionSent(Result<Txid, String>),
 

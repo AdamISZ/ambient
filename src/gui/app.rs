@@ -993,13 +993,50 @@ impl AmbientApp {
             Message::SendAmountChanged(amount) => {
                 if let AppState::WalletLoaded { wallet_data, .. } = &mut self.state {
                     wallet_data.send_amount = amount;
+                    // User manually edited amount - exit send-all mode
+                    wallet_data.send_all_mode = false;
                 }
                 Task::none()
             }
 
             Message::SendFeeRateChanged(fee_rate) => {
+                if let AppState::WalletLoaded { manager, wallet_data } = &mut self.state {
+                    wallet_data.send_fee_rate = fee_rate.clone();
+
+                    // If in send-all mode, recalculate the amount with new fee rate
+                    if wallet_data.send_all_mode && !wallet_data.send_address.is_empty() {
+                        let address = wallet_data.send_address.clone();
+                        let fee_rate_val = fee_rate.parse::<f32>().unwrap_or(1.0).max(0.1);
+                        let manager_clone = manager.clone();
+                        let rt_handle = self.tokio_runtime.handle().clone();
+
+                        return Task::perform(
+                            async move {
+                                rt_handle.spawn(async move {
+                                    let manager = manager_clone.read().await;
+                                    manager.calculate_max_sendable(&address, fee_rate_val).await
+                                }).await.unwrap()
+                            },
+                            |result| match result {
+                                Ok(max_sats) => {
+                                    let btc_amount = max_sats as f64 / 100_000_000.0;
+                                    Message::SendAllAmountCalculated(format!("{:.8}", btc_amount))
+                                }
+                                Err(e) => {
+                                    eprintln!("❌ Failed to recalculate max sendable: {}", e);
+                                    Message::Placeholder
+                                }
+                            }
+                        );
+                    }
+                }
+                Task::none()
+            }
+
+            Message::SendAllAmountCalculated(amount) => {
+                // Update amount without clearing send_all_mode
                 if let AppState::WalletLoaded { wallet_data, .. } = &mut self.state {
-                    wallet_data.send_fee_rate = fee_rate;
+                    wallet_data.send_amount = amount;
                 }
                 Task::none()
             }
@@ -1015,6 +1052,9 @@ impl AmbientApp {
                         eprintln!("❌ Please enter destination address first");
                         return Task::none();
                     }
+
+                    // Enable send-all mode - will recalculate on fee rate changes
+                    wallet_data.send_all_mode = true;
 
                     // Parse fee rate (default to 1.0 if empty or invalid)
                     let fee_rate = fee_rate_str.parse::<f32>().unwrap_or(1.0).max(0.1);
@@ -1033,7 +1073,7 @@ impl AmbientApp {
                             Ok(max_sats) => {
                                 // Convert sats to BTC and update the amount field
                                 let btc_amount = max_sats as f64 / 100_000_000.0;
-                                Message::SendAmountChanged(format!("{:.8}", btc_amount))
+                                Message::SendAllAmountCalculated(format!("{:.8}", btc_amount))
                             }
                             Err(e) => {
                                 eprintln!("❌ Failed to calculate max sendable: {}", e);

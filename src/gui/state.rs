@@ -55,6 +55,7 @@ pub struct WalletData {
     pub send_address: String,
     pub send_amount: String,
     pub send_fee_rate: String,
+    pub send_all_mode: bool, // True when "Send All" was clicked - recalculate on fee rate change
 
     // SNICKER state
     pub snicker_candidates: usize,
@@ -94,6 +95,7 @@ impl Default for WalletData {
             send_address: String::new(),
             send_amount: String::new(),
             send_fee_rate: String::from("1.0"),
+            send_all_mode: false,
             snicker_candidates: 0,
             snicker_opportunities: 0,
             snicker_opportunities_list: Vec::new(),
