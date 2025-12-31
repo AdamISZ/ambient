@@ -63,10 +63,10 @@ pub fn view_mnemonic(wallet_name: &str, mnemonic: &str) -> Element<'static, Mess
 
     let content = column![
         text(format!("Wallet '{}' Created!", wallet_name.clone())).size(32),
-        text("⚠️  SAVE YOUR MNEMONIC SEED PHRASE").size(20),
+        text("SAVE YOUR MNEMONIC SEED PHRASE").size(20),
         text("Write down these words in order. You will need them to recover your wallet.").size(14),
         mnemonic_display,
-        text("⚠️  Store this in a safe place. Anyone with this mnemonic can access your funds.").size(12),
+        text("Store this in a safe place. Anyone with this mnemonic can access your funds.").size(12),
         confirm_button,
     ]
     .spacing(20)

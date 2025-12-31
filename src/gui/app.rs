@@ -75,6 +75,31 @@ impl AmbientApp {
             iced::Subscription::none()
         };
 
+        // Status bar subscription - polls the tracing status channel
+        let status_sub = iced::Subscription::run_with_id(
+            "status_updates",
+            iced::futures::stream::unfold(
+                crate::gui::take_status_receiver(),
+                |receiver_opt| async move {
+                    let receiver = receiver_opt?;
+
+                    // Poll at 100ms intervals
+                    async_std::task::sleep(Duration::from_millis(100)).await;
+
+                    // Try to get the latest message (drain older ones)
+                    let mut latest_msg = None;
+                    while let Ok(msg) = receiver.try_recv() {
+                        latest_msg = Some(msg);
+                    }
+
+                    match latest_msg {
+                        Some(msg) => Some((Message::StatusUpdate(msg), Some(receiver))),
+                        None => Some((Message::Placeholder, Some(receiver))),
+                    }
+                }
+            )
+        );
+
         // Only subscribe to events when wallet is loaded
         match &self.state {
             AppState::WalletLoaded { manager, wallet_data, .. } => {
@@ -138,9 +163,9 @@ impl AmbientApp {
                 };
 
                 // Combine subscriptions
-                iced::Subscription::batch([balance_sub, automation_sub, keyboard_sub])
+                iced::Subscription::batch([balance_sub, automation_sub, keyboard_sub, status_sub])
             }
-            _ => keyboard_sub
+            _ => iced::Subscription::batch([keyboard_sub, status_sub])
         }
     }
 
@@ -181,30 +206,68 @@ impl AmbientApp {
             }
 
             Message::MenuOpenWallet => {
-                // Show custom scrollable wallet list modal
-                println!("Menu: Open Wallet clicked");
-
-                // Scan wallet directory for existing wallets
+                // Launch native folder picker to select wallet
                 let wallet_dir = self.config.network_wallet_dir();
-                let available_wallets = std::fs::read_dir(&wallet_dir)
-                    .ok()
-                    .map(|entries| {
-                        entries
-                            .filter_map(|e| e.ok())
-                            .filter(|e| e.file_type().ok().map(|t| t.is_dir()).unwrap_or(false))
-                            .filter(|e| is_wallet_directory(&e.path()))
-                            .filter_map(|e| e.file_name().into_string().ok())
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
 
-                self.active_modal = Some(crate::gui::modal::Modal::OpenWallet {
-                    available_wallets,
-                    selected: None,
-                    password: String::new(),
-                    error_message: None,
-                });
+                // Ensure directory exists and get canonical path
+                // rfd on Linux can be finicky with set_directory() if path doesn't exist
+                // or isn't canonicalized
+                let canonical_dir = if wallet_dir.exists() {
+                    wallet_dir.canonicalize().unwrap_or(wallet_dir)
+                } else {
+                    // Create directory if it doesn't exist
+                    if let Err(e) = std::fs::create_dir_all(&wallet_dir) {
+                        tracing::warn!("Failed to create wallet directory: {}", e);
+                    }
+                    wallet_dir
+                };
 
+                tracing::info!("Opening folder picker at: {}", canonical_dir.display());
+
+                Task::perform(
+                    async move {
+                        rfd::AsyncFileDialog::new()
+                            .set_title("Select Wallet Folder")
+                            .set_directory(&canonical_dir)
+                            .pick_folder()
+                            .await
+                            .map(|h| h.path().to_path_buf())
+                    },
+                    Message::WalletFolderPicked
+                )
+            }
+
+            Message::WalletFolderPicked(path_opt) => {
+                match path_opt {
+                    Some(path) => {
+                        // Validate it's a wallet directory
+                        if is_wallet_directory(&path) {
+                            let wallet_name = path.file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("unknown")
+                                .to_string();
+
+                            // Show password modal with this wallet pre-selected
+                            self.active_modal = Some(crate::gui::modal::Modal::OpenWallet {
+                                available_wallets: vec![wallet_name.clone()],
+                                selected: Some(wallet_name),
+                                password: String::new(),
+                                error_message: None,
+                            });
+                        } else {
+                            // Not a valid wallet folder - show error in modal
+                            self.active_modal = Some(crate::gui::modal::Modal::OpenWallet {
+                                available_wallets: vec![],
+                                selected: None,
+                                password: String::new(),
+                                error_message: Some("Selected folder is not a valid wallet".to_string()),
+                            });
+                        }
+                    }
+                    None => {
+                        // User cancelled - do nothing
+                    }
+                }
                 Task::none()
             }
 
@@ -1632,6 +1695,14 @@ impl AmbientApp {
             Message::AutomationStatusUpdate => {
                 // This is triggered by subscription to update status
                 // For now, just refresh the view
+                Task::none()
+            }
+
+            Message::StatusUpdate(msg) => {
+                // Update status bar with latest tracing message
+                if let AppState::WalletLoaded { wallet_data, .. } = &mut self.state {
+                    wallet_data.status_message = Some(msg);
+                }
                 Task::none()
             }
 

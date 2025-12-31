@@ -22,6 +22,7 @@ pub enum Message {
     CloseModal,
 
     // Wallet management
+    WalletFolderPicked(Option<std::path::PathBuf>),
     WalletSelected(String),
     CreateWalletRequested,
     WalletNameChanged(String),
@@ -136,6 +137,9 @@ pub enum Message {
     AutomationMaxPerDayChanged(String),
     AutomationIntervalChanged(String),
     AutomationStatusUpdate,
+
+    // Status bar updates (from tracing INFO messages)
+    StatusUpdate(String),
 
     // Placeholder for unimplemented actions
     Placeholder,

@@ -102,9 +102,9 @@ fn view_enter_password(password: &str, password_confirm: &str) -> Element<'stati
                 .width(Length::Fixed(500.0))
                 .id(iced::widget::text_input::Id::new("password_confirm_field")),
             if !password_confirm.is_empty() && !passwords_match {
-                text("❌ Passwords do not match").size(12)
+                text("X Passwords do not match").size(12)
             } else if passwords_match {
-                text("✅ Passwords match").size(12)
+                text("OK - Passwords match").size(12)
             } else {
                 text("").size(12)
             }
@@ -112,7 +112,7 @@ fn view_enter_password(password: &str, password_confirm: &str) -> Element<'stati
 
         container(
             column![
-                text("⚠️ Password Security").size(16),
+                text("Password Security").size(16),
                 text("• Use a strong, unique password").size(14),
                 text("• Password cannot be recovered if lost").size(14),
                 text("• Wallet files will be encrypted with this password").size(14),
@@ -157,7 +157,7 @@ fn view_review_and_generate(wallet_name: &str, network: &str) -> Element<'static
 
         container(
             column![
-                text("⚠️ Important Information").size(18),
+                text("Important Information").size(18),
                 text("• A recovery seed (mnemonic) will be generated").size(14),
                 text("• You MUST save this seed in a secure location").size(14),
                 text("• This seed is the ONLY way to recover your wallet").size(14),
@@ -190,7 +190,7 @@ fn view_generating(wallet_name: &str) -> Element<'static, Message> {
         text("Generating Wallet...").size(20),
 
         column![
-            text("🔐 Encrypting wallet files").size(16),
+            text("Encrypting wallet files...").size(16),
             text(format!("Wallet: {}", wallet_name)).size(14),
         ].spacing(5),
 
@@ -242,12 +242,12 @@ fn view_display_mnemonic(wallet_name: &str, mnemonic: Option<&str>) -> Element<'
         }
 
         column![
-            text("✅ Wallet Generated Successfully!").size(20),
+            text("Wallet Generated Successfully!").size(20),
             text(format!("Wallet: {}", wallet_name)).size(14),
 
             container(
                 column![
-                    text("🔑 Your Recovery Seed").size(18),
+                    text("Your Recovery Seed").size(18),
                     text("Write down these words in order and store them safely").size(12),
                     word_grid,
                 ].spacing(10)
@@ -256,7 +256,7 @@ fn view_display_mnemonic(wallet_name: &str, mnemonic: Option<&str>) -> Element<'
 
             container(
                 column![
-                    text("⚠️ CRITICAL WARNING").size(18),
+                    text("CRITICAL WARNING").size(18),
                     text("• Write this seed on paper and store it securely").size(14),
                     text("• Do NOT store it digitally (no screenshots, no files)").size(14),
                     text("• Anyone with this seed can access your funds").size(14),

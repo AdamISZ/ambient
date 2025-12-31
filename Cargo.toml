@@ -55,7 +55,9 @@ nostr-sdk = "0.37"
 # GUI dependencies (optional)
 iced = { version = "0.13.1", optional = true }
 async-std = { version = "1.12", optional = true }
-rfd = { version = "0.15", optional = true }
+# Note: We use gtk3 backend instead of default xdg-portal because
+# xdg-portal doesn't respect set_directory() on some Linux systems
+rfd = { version = "0.15", optional = true, default-features = false, features = ["gtk3", "async-std"] }
 
 # Test utilities (optional, for embedded relay)
 nostr-relay-builder = { git = "https://github.com/rust-nostr/nostr", package = "nostr-relay-builder", optional = true }

@@ -40,7 +40,10 @@ async fn main() -> iced::Result {
         .open(&log_path)
         .expect("Failed to open log file");
 
-    // Initialize tracing with file output
+    // Initialize the status layer for GUI status bar updates
+    let status_layer = gui::init_status_layer();
+
+    // Initialize tracing with file output and status layer
     // Respects RUST_LOG environment variable, defaults to INFO level
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info"))
@@ -50,6 +53,7 @@ async fn main() -> iced::Result {
         .with(tracing_subscriber::fmt::layer()
             .with_writer(log_file)
             .with_ansi(false))
+        .with(status_layer)
         .with(filter)
         .init();
 

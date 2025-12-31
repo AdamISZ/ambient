@@ -67,7 +67,7 @@ pub fn view(
     if delta > 10000 {
         content = content.push(
             container(
-                text(format!("⚠ Warning: You will lose {} sats in this transaction!", delta))
+                text(format!("Warning: You will lose {} sats in this transaction!", delta))
                     .size(14)
                     .color(Color::from_rgb(0.9, 0.5, 0.0))
             )

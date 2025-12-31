@@ -155,24 +155,12 @@ fn sidebar_button(label: &str, tab: WalletTab, current: WalletTab) -> Element<'s
 }
 
 /// Create a styled menu button with rounded corners
-/// Create permanent status bar at bottom showing network status and messages
+/// Create permanent status bar at bottom showing status messages
 fn status_bar(data: &WalletData) -> Element<'static, Message> {
-    // Build status text with network info and messages
-    let mut status_parts = Vec::new();
-
-    // Network status (TODO: get actual Nostr connection status from manager)
-    status_parts.push("Network: Active".to_string());
-
-    // Current status message if any
-    if let Some(msg) = &data.status_message {
-        status_parts.push(msg.clone());
-    }
-
-    let status_text = if status_parts.is_empty() {
-        "Ready".to_string()
-    } else {
-        status_parts.join(" | ")
-    };
+    let status_text = data.status_message
+        .as_ref()
+        .cloned()
+        .unwrap_or_else(|| "Ready".to_string());
 
     container(
         text(status_text).size(14)
@@ -460,7 +448,7 @@ fn view_automation_section(data: &WalletData) -> Element<'static, Message> {
 
     container(
         column![
-            text("⚡ AUTOMATION").size(24),
+            text("AUTOMATION").size(24),
             text("Automatically accept and/or create SNICKER proposals").size(12),
             row![
                 text("Mode:").size(14),
@@ -611,130 +599,10 @@ fn view_snicker(data: &WalletData) -> Element<'static, Message> {
         content = content.push(
             container(
                 column![
-                    text("✅ Last Created Proposal:").size(14),
+                    text("Last Created Proposal:").size(14),
                     text(format!("Tag: {}", tag)).size(12),
                     text("File: Saved to proposals directory (see Settings)").size(11),
                 ].spacing(3)
-            )
-            .padding(10)
-        );
-    }
-
-    content = content.push(text("─".repeat(80)).size(12));
-
-    // ========== RECEIVER SECTION ==========
-    content = content.push(
-        container(
-            column![
-                text("Receiver: Accept Proposals").size(24),
-                text("Scan for incoming proposals or load a specific proposal file by tag.").size(12),
-            ].spacing(5)
-        )
-        .padding(10)
-    );
-
-    // Scan for incoming proposals with delta range inputs
-    let min_delta = data.snicker_scan_min_delta_input.clone();
-    let max_delta = data.snicker_scan_max_delta_input.clone();
-    let min_val = min_delta.parse::<i64>().unwrap_or(-1000);
-    let max_val = max_delta.parse::<i64>().unwrap_or(5000);
-
-    content = content.push(
-        container(
-            column![
-                text("Scan for Incoming Proposals:").size(14),
-                row![
-                    text("Min Δ:").size(12),
-                    text_input("-1000", &min_delta)
-                        .on_input(Message::SnickerScanMinDeltaInputChanged)
-                        .width(Length::Fixed(80.0)),
-                    text("Max Δ:").size(12),
-                    text_input("5000", &max_delta)
-                        .on_input(Message::SnickerScanMaxDeltaInputChanged)
-                        .width(Length::Fixed(80.0)),
-                    button("Scan")
-                        .on_press(Message::SnickerScanIncomingProposals(min_val, max_val))
-                        .padding(8),
-                ].spacing(10),
-            ].spacing(5)
-        )
-        .padding(10)
-    );
-
-    // Show scanned proposals list
-    if !data.snicker_scanned_proposals.is_empty() {
-        let mut proposals_list = column![
-            text(format!("Found {} matching proposal(s):", data.snicker_scanned_proposals.len())).size(16),
-        ].spacing(10);
-
-        for (idx, result) in data.snicker_scanned_proposals.iter().enumerate() {
-            // Truncate tag for display
-            let display_tag = if result.tag_hex.len() > 16 {
-                format!("{}...{}", &result.tag_hex[..8], &result.tag_hex[result.tag_hex.len()-8..])
-            } else {
-                result.tag_hex.clone()
-            };
-
-            // Color code delta
-            // Positive delta = receiver loses (contributes), negative = receiver gains
-            let (delta_text, delta_color) = if result.delta > 0 {
-                (format!("+{}", result.delta), Color::from_rgb(0.9, 0.2, 0.2)) // RED = loss
-            } else if result.delta < 0 {
-                (format!("{}", result.delta), Color::from_rgb(0.2, 0.8, 0.2)) // GREEN = gain
-            } else {
-                (format!("{}", result.delta), Color::from_rgb(0.7, 0.7, 0.7)) // GRAY = neutral
-            };
-
-            proposals_list = proposals_list.push(
-                button(
-                    container(
-                        column![
-                            text(format!("Tag: {}", display_tag)).size(12),
-                            text(format!("Proposer: {} ({} sats)", result.proposer_input, result.proposer_value)).size(11),
-                            text(format!("Your output: {} sats", result.receiver_output_value)).size(11),
-                            text(format!("Δ: {} sats", delta_text)).size(11).color(delta_color),
-                        ].spacing(3)
-                    )
-                    .padding(8)
-                )
-                .on_press(Message::SnickerShowAcceptDialog(idx))
-                .width(Length::Fixed(500.0))
-                .style(|_theme: &Theme, status| {
-                    match status {
-                        button::Status::Hovered => Style {
-                            background: Some(iced::Background::Color(Color::from_rgb(0.25, 0.35, 0.65))),
-                            text_color: Color::WHITE,
-                            border: Border {
-                                color: Color::from_rgb(0.35, 0.45, 0.75),
-                                width: 1.5,
-                                radius: 6.0.into(),
-                            },
-                            shadow: iced::Shadow::default(),
-                        },
-                        _ => Style {
-                            background: Some(iced::Background::Color(Color::from_rgb(0.18, 0.28, 0.55))),
-                            text_color: Color::WHITE,
-                            border: Border {
-                                color: Color::from_rgb(0.28, 0.38, 0.65),
-                                width: 1.5,
-                                radius: 6.0.into(),
-                            },
-                            shadow: iced::Shadow::default(),
-                        },
-                    }
-                })
-            );
-        }
-
-        content = content.push(
-            container(
-                scrollable(proposals_list)
-                    .direction(Direction::Vertical(
-                        Scrollbar::new()
-                            .width(0)
-                            .scroller_width(0)
-                    ))
-                    .height(Length::Fixed(300.0))
             )
             .padding(10)
         );

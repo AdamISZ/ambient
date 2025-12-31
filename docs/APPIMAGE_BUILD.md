@@ -1,9 +1,9 @@
 # AppImage Build Process for Ambient Wallet
 
 **Date Created:** 2025-12-05
-**Last Updated:** 2025-12-05
+**Last Updated:** 2025-12-31
 **AppImage Version:** ambient-gui-x86_64.AppImage
-**Binary Size:** 6.8 MB
+**Binary Size:** ~16 MB
 
 ---
 
@@ -63,7 +63,7 @@ cargo build --bin ambient-gui --features gui --release
 
 # Verify binary was created
 ls -lh target/release/ambient-gui
-# Expected: ~6.5 MB stripped binary
+# Expected: ~15 MB (includes GTK3 dependencies)
 ```
 
 **Build flags used:**
@@ -308,8 +308,8 @@ appimagetool <source-appdir> <output-file>
 
 ```bash
 # Check file properties
-ls -lh /home/waxwing/ambient-gui-x86_64.AppImage
-# Expected: ~6.8 MB, executable
+ls -lh ambient-gui-x86_64.AppImage
+# Expected: ~16 MB, executable
 
 # Check file type
 file /home/waxwing/ambient-gui-x86_64.AppImage
@@ -582,11 +582,10 @@ For verification and reproducibility tracking:
 
 ```
 Binary: target/release/ambient-gui
-Size: ~6.5 MB (stripped)
-Build date: 2025-12-05
+Size: ~15 MB (includes GTK3 dependencies)
 
 AppImage: ambient-gui-x86_64.AppImage
-Size: 6.8 MB
+Size: ~16 MB
 SHA256: (run: sha256sum ambient-gui-x86_64.AppImage)
 ```
 
@@ -617,4 +616,5 @@ SHA256: (run: sha256sum ambient-gui-x86_64.AppImage)
 
 ## Changelog
 
+**2025-12-31:** Updated size estimates (~16 MB) after switching to GTK3 file dialog backend
 **2025-12-05:** Initial documentation of AppImage build process
