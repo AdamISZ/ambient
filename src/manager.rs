@@ -359,18 +359,9 @@ impl Manager {
         let fee_rate = self.wallet_node.get_fee_rate().await;
 
         // Create signing callback that signs the proposer's input
-        // Use block_in_place to allow blocking operations in async context
-        let wallet_clone = self.wallet_node.wallet.clone();
         let our_utxo_clone = our_utxo.clone();
         let snicker_conn_clone = self.wallet_node.get_snicker_conn();
-        let our_input_privkey_clone = our_input_privkey; // Already tweaked, ready for signing
         let sign_callback = move |psbt: &mut Psbt| -> Result<()> {
-            use bdk_wallet::KeychainKind;
-
-            let wallet = tokio::task::block_in_place(|| {
-                wallet_clone.blocking_lock()
-            });
-
             tracing::info!("🔨 Proposer signing PSBT with {} inputs", psbt.inputs.len());
 
             // Check if proposer's input is a SNICKER UTXO - if so, sign it manually
@@ -428,38 +419,17 @@ impl Manager {
                     input.previous_output == local_utxo.outpoint
                 }).ok_or_else(|| anyhow::anyhow!("Proposer's regular input not found in PSBT"))?;
 
-                // Sign using the pre-derived tweaked private key
-                use bdk_wallet::bitcoin::sighash::{SighashCache, TapSighashType, Prevouts};
-                use bdk_wallet::bitcoin::secp256k1::{Message, Secp256k1};
-
-                let secp = Secp256k1::new();
-
                 // Collect prevouts for sighash calculation
                 let prevouts: Vec<_> = psbt.inputs.iter()
                     .map(|input| input.witness_utxo.clone()
                         .ok_or_else(|| anyhow::anyhow!("Missing witness_utxo")))
                     .collect::<Result<Vec<_>>>()?;
 
-                let prevouts_refs: Vec<_> = prevouts.iter().collect();
-                let prevouts_all = Prevouts::All(&prevouts_refs);
-                let mut sighash_cache = SighashCache::new(&psbt.unsigned_tx);
-
-                // Compute taproot sighash
-                let sighash = sighash_cache.taproot_key_spend_signature_hash(
-                    our_input_idx,
-                    &prevouts_all,
-                    TapSighashType::Default,
-                )?;
-
-                // Sign with the tweaked private key
-                let msg = Message::from_digest_slice(sighash.as_ref())?;
-                let signature = secp.sign_schnorr(&msg, &our_input_privkey_clone.keypair(&secp));
-
-                // Store signature in PSBT
-                psbt.inputs[our_input_idx].tap_key_sig = Some(bdk_wallet::bitcoin::taproot::Signature {
-                    signature,
-                    sighash_type: TapSighashType::Default,
-                });
+                // Sign using the unified signing function
+                use bdk_wallet::bitcoin::secp256k1::Secp256k1;
+                let secp = Secp256k1::new();
+                let keypair = our_input_privkey.keypair(&secp);
+                crate::signer::sign_taproot_input(psbt, our_input_idx, &keypair, &prevouts)?;
 
                 tracing::info!("✅ Signed regular input {} with tweaked privkey", our_input_idx);
             }

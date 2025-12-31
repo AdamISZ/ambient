@@ -66,8 +66,7 @@ impl WalletNode {
     /// Sign a PSBT with the wallet's keys.
     /// Returns true if the PSBT is fully signed after this operation.
     pub async fn sign_psbt(&mut self, psbt: &mut Psbt) -> Result<bool> {
-        use bdk_wallet::bitcoin::sighash::{SighashCache, TapSighashType, Prevouts};
-        use bdk_wallet::bitcoin::secp256k1::{Message, Secp256k1};
+        use bdk_wallet::bitcoin::secp256k1::{Keypair, Secp256k1};
 
         info!("✍️  Signing PSBT with {} inputs", psbt.inputs.len());
 
@@ -82,56 +81,40 @@ impl WalletNode {
                 .ok_or_else(|| anyhow!("Missing witness_utxo")))
             .collect::<Result<Vec<_>>>()?;
 
-        let prevouts_all = Prevouts::All(&prevouts);
-        let mut sighash_cache = SighashCache::new(&psbt.unsigned_tx);
+        // Collect (input_idx, keypair) for all inputs we can sign
+        let mut inputs_to_sign: Vec<(usize, Keypair)> = Vec::new();
 
-        // Sign each input that belongs to us (both Regular and SNICKER UTXOs)
-        for (input_idx, input) in psbt.inputs.iter_mut().enumerate() {
+        for (input_idx, input) in psbt.inputs.iter().enumerate() {
+            // Skip if already signed
+            if input.tap_key_sig.is_some() {
+                continue;
+            }
+
             let outpoint = psbt.unsigned_tx.input[input_idx].previous_output;
 
             // Check if this input is one of our UTXOs
             if let Some(utxo) = all_utxos.iter().find(|u| u.outpoint() == outpoint) {
-                // Skip if already signed
-                if input.tap_key_sig.is_some() {
-                    continue;
-                }
-
-                // Compute taproot sighash
-                let sighash = sighash_cache.taproot_key_spend_signature_hash(
-                    input_idx,
-                    &prevouts_all,
-                    TapSighashType::Default,
-                )?;
-
-                // Sign in a tight scope - key is zeroized immediately after
-                let signature = {
-                    // Derive private key (works for both Regular and Snicker UTXOs)
-                    let privkey = match utxo {
-                        super::WalletUtxo::Regular(_) => {
-                            // Derive from signer using BIP32 path
-                            self.derive_utxo_privkey(utxo).await?
-                        }
-                        super::WalletUtxo::Snicker { outpoint, .. } => {
-                            // Fetch from database
-                            self.fetch_snicker_key(*outpoint).await?
-                        }
-                    };
-
-                    // Create signature
-                    let msg = Message::from_digest_slice(sighash.as_byte_array())?;
-                    secp.sign_schnorr(&msg, &privkey.keypair(&secp))
-                    // privkey is zeroized HERE when scope ends
+                // Derive private key (works for both Regular and Snicker UTXOs)
+                let privkey = match utxo {
+                    super::WalletUtxo::Regular(_) => {
+                        self.derive_utxo_privkey(utxo).await?
+                    }
+                    super::WalletUtxo::Snicker { outpoint, .. } => {
+                        self.fetch_snicker_key(*outpoint).await?
+                    }
                 };
 
-                // Store signature in PSBT
-                input.tap_key_sig = Some(bdk_wallet::bitcoin::taproot::Signature {
-                    signature,
-                    sighash_type: TapSighashType::Default,
-                });
-
-                info!("    ✅ Signed input {}", input_idx);
+                inputs_to_sign.push((input_idx, privkey.keypair(&secp)));
+                info!("    ✅ Prepared input {} for signing", input_idx);
             }
         }
+
+        // Sign all collected inputs using the unified signing function
+        let inputs_refs: Vec<(usize, &Keypair)> = inputs_to_sign
+            .iter()
+            .map(|(idx, kp)| (*idx, kp))
+            .collect();
+        crate::signer::sign_taproot_inputs(psbt, &inputs_refs, &prevouts)?;
 
         let signed_count = psbt.inputs.iter().filter(|i| i.tap_key_sig.is_some()).count();
         info!("✅ Signed {} of {} inputs", signed_count, psbt.inputs.len());
@@ -471,17 +454,18 @@ impl WalletNode {
         }
 
         // Sign each SNICKER input with its tweaked private key
+        use bdk_wallet::bitcoin::secp256k1::{Keypair, PublicKey, XOnlyPublicKey};
         let secp = Secp256k1::new();
-        let prevouts = Prevouts::All(&prevouts_for_sighash);
-        let mut sighash_cache = SighashCache::new(&psbt.unsigned_tx);
+
+        // Collect keypairs and run sanity checks
+        let mut inputs_to_sign: Vec<(usize, Keypair)> = Vec::new();
 
         for (i, (_, _, _, script_pubkey, tweaked_privkey_bytes)) in selected_utxos.iter().enumerate() {
             // Deserialize tweaked private key (SecretKey implements secure drop)
             let tweaked_seckey = SecretKey::from_slice(tweaked_privkey_bytes)?;
-            let tweaked_keypair = bdk_wallet::bitcoin::secp256k1::Keypair::from_secret_key(&secp, &tweaked_seckey);
+            let tweaked_keypair = Keypair::from_secret_key(&secp, &tweaked_seckey);
 
             // SANITY CHECK: Verify that tweaked_seckey * G = expected_pubkey
-            use bdk_wallet::bitcoin::secp256k1::{PublicKey, XOnlyPublicKey};
             let derived_pubkey = PublicKey::from_secret_key(&secp, &tweaked_seckey);
             let derived_xonly = XOnlyPublicKey::from(derived_pubkey);
 
@@ -507,24 +491,17 @@ impl WalletNode {
             }
 
             info!("✅ Input {}: Sanity check passed (privkey * G = pubkey)", i);
+            inputs_to_sign.push((i, tweaked_keypair));
+        }
 
-            // Compute sighash
-            let sighash = sighash_cache.taproot_key_spend_signature_hash(
-                i,
-                &prevouts,
-                TapSighashType::Default,
-            )?;
+        // Sign all inputs using the unified signing function
+        let inputs_refs: Vec<(usize, &Keypair)> = inputs_to_sign
+            .iter()
+            .map(|(idx, kp)| (*idx, kp))
+            .collect();
+        crate::signer::sign_taproot_inputs(&mut psbt, &inputs_refs, &prevouts_for_sighash)?;
 
-            // Sign
-            let msg = Message::from_digest_slice(sighash.as_byte_array())?;
-            let sig = secp.sign_schnorr(&msg, &tweaked_keypair);
-
-            // Add signature to PSBT
-            psbt.inputs[i].tap_key_sig = Some(bdk_wallet::bitcoin::taproot::Signature {
-                signature: sig,
-                sighash_type: TapSighashType::Default,
-            });
-
+        for i in 0..inputs_to_sign.len() {
             info!("✍️  Signed SNICKER input {}", i);
         }
 
@@ -558,42 +535,28 @@ impl WalletNode {
         prevouts: &[bdk_wallet::bitcoin::TxOut],
         start_idx: usize,
     ) -> Result<()> {
-        use bdk_wallet::bitcoin::secp256k1::{Secp256k1, SecretKey, Message};
-        use bdk_wallet::bitcoin::sighash::{SighashCache, TapSighashType, Prevouts};
+        use bdk_wallet::bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey};
 
         let secp = Secp256k1::new();
-        let prevouts_all = Prevouts::All(prevouts);
-        let mut sighash_cache = SighashCache::new(&psbt.unsigned_tx);
+
+        // Collect keypairs for all SNICKER inputs
+        let mut inputs_to_sign: Vec<(usize, Keypair)> = Vec::new();
 
         for (i, (_, _, _, _script_pubkey, tweaked_privkey_bytes)) in snicker_utxos.iter().enumerate() {
             let input_idx = start_idx + i;
+            let tweaked_seckey = SecretKey::from_slice(tweaked_privkey_bytes)?;
+            let tweaked_keypair = Keypair::from_secret_key(&secp, &tweaked_seckey);
+            inputs_to_sign.push((input_idx, tweaked_keypair));
+        }
 
-            // Create a signature in a tight scope to ensure keys are dropped ASAP
-            let signature = {
-                // Deserialize tweaked private key
-                // SecretKey implements secure drop - memory is zeroed when it goes out of scope
-                let tweaked_seckey = SecretKey::from_slice(tweaked_privkey_bytes)?;
-                let tweaked_keypair = bdk_wallet::bitcoin::secp256k1::Keypair::from_secret_key(&secp, &tweaked_seckey);
+        // Sign all inputs using the unified signing function
+        let inputs_refs: Vec<(usize, &Keypair)> = inputs_to_sign
+            .iter()
+            .map(|(idx, kp)| (*idx, kp))
+            .collect();
+        crate::signer::sign_taproot_inputs(psbt, &inputs_refs, prevouts)?;
 
-                // Compute sighash
-                let sighash = sighash_cache.taproot_key_spend_signature_hash(
-                    input_idx,
-                    &prevouts_all,
-                    TapSighashType::Default,
-                )?;
-
-                // Sign and return signature
-                let msg = Message::from_digest_slice(sighash.as_byte_array())?;
-                secp.sign_schnorr(&msg, &tweaked_keypair)
-                // tweaked_seckey and tweaked_keypair are securely dropped here
-            };
-
-            // Add signature to PSBT
-            psbt.inputs[input_idx].tap_key_sig = Some(bdk_wallet::bitcoin::taproot::Signature {
-                signature,
-                sighash_type: TapSighashType::Default,
-            });
-
+        for (input_idx, _) in &inputs_to_sign {
             info!("✍️  Signed SNICKER input {}", input_idx);
         }
 

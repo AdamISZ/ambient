@@ -2,15 +2,88 @@
 //!
 //! This module provides a trait-based abstraction for signing operations,
 //! allowing different implementations (in-memory, remote, HSM-backed, etc.)
+//!
+//! It also provides low-level taproot signing utilities that are used by
+//! all signing code paths in the application.
 
 use anyhow::Result;
 use async_trait::async_trait;
 use bdk_wallet::bitcoin::{
     bip32::{DerivationPath, Xpriv, Xpub},
     psbt::Psbt,
-    secp256k1::SecretKey,
-    Network,
+    secp256k1::{Keypair, SecretKey},
+    Network, TxOut,
 };
+
+// ============================================================
+// TAPROOT SIGNING UTILITIES
+// ============================================================
+
+/// Sign a single PSBT input with a pre-computed taproot keypair.
+///
+/// This is a convenience wrapper around `sign_taproot_inputs` for signing
+/// a single input. The caller is responsible for:
+/// - Computing/deriving the correct keypair (with BIP341 tweak applied)
+/// - Ensuring the keypair corresponds to the UTXO being signed
+/// - Zeroizing the keypair after use
+///
+/// # Arguments
+/// * `psbt` - The PSBT to sign (modified in place)
+/// * `input_idx` - Index of the input to sign
+/// * `keypair` - The tweaked keypair for signing
+/// * `prevouts` - All prevouts for the transaction (required for taproot sighash)
+pub fn sign_taproot_input(
+    psbt: &mut Psbt,
+    input_idx: usize,
+    keypair: &Keypair,
+    prevouts: &[TxOut],
+) -> Result<()> {
+    sign_taproot_inputs(psbt, &[(input_idx, keypair)], prevouts)
+}
+
+/// Sign multiple PSBT inputs with their respective keypairs.
+///
+/// More efficient than calling `sign_taproot_input` repeatedly as it reuses
+/// the SighashCache across all inputs.
+///
+/// # Arguments
+/// * `psbt` - The PSBT to sign (modified in place)
+/// * `inputs_to_sign` - Pairs of (input_idx, keypair) for each input to sign
+/// * `prevouts` - All prevouts for the transaction (required for taproot sighash)
+pub fn sign_taproot_inputs(
+    psbt: &mut Psbt,
+    inputs_to_sign: &[(usize, &Keypair)],
+    prevouts: &[TxOut],
+) -> Result<()> {
+    use bdk_wallet::bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
+    use bdk_wallet::bitcoin::secp256k1::{Message, Secp256k1};
+
+    let secp = Secp256k1::new();
+    let prevouts_all = Prevouts::All(prevouts);
+    let mut sighash_cache = SighashCache::new(&psbt.unsigned_tx);
+
+    for &(input_idx, keypair) in inputs_to_sign {
+        let sighash = sighash_cache
+            .taproot_key_spend_signature_hash(input_idx, &prevouts_all, TapSighashType::Default)
+            .map_err(|e| anyhow::anyhow!("Failed to compute sighash for input {}: {}", input_idx, e))?;
+
+        let msg = Message::from_digest_slice(sighash.as_ref())
+            .map_err(|e| anyhow::anyhow!("Invalid sighash message: {}", e))?;
+
+        let signature = secp.sign_schnorr(&msg, keypair);
+
+        psbt.inputs[input_idx].tap_key_sig = Some(bdk_wallet::bitcoin::taproot::Signature {
+            signature,
+            sighash_type: TapSighashType::Default,
+        });
+    }
+
+    Ok(())
+}
+
+// ============================================================
+// SIGNER TRAIT
+// ============================================================
 
 /// Abstraction for signing operations
 ///
@@ -127,9 +200,7 @@ impl InMemorySigner {
 #[async_trait]
 impl Signer for InMemorySigner {
     async fn sign_psbt(&self, psbt: &mut Psbt) -> Result<()> {
-        use bdk_wallet::bitcoin::sighash::{SighashCache, TapSighashType, Prevouts};
-        use bdk_wallet::bitcoin::secp256k1::{Message, Secp256k1};
-        use bdk_wallet::bitcoin::TapSighash;
+        use bdk_wallet::bitcoin::secp256k1::Secp256k1;
         use std::str::FromStr;
 
         let secp = Secp256k1::new();
@@ -139,37 +210,20 @@ impl Signer for InMemorySigner {
 
         // Build prevouts for sighash computation
         let prevouts: Vec<_> = psbt
-            .unsigned_tx
-            .input
+            .inputs
             .iter()
-            .enumerate()
-            .filter_map(|(i, _)| {
-                psbt.inputs.get(i).and_then(|input| {
-                    input.witness_utxo.as_ref().map(|utxo| utxo.clone())
-                })
+            .map(|input| {
+                input.witness_utxo.clone()
+                    .ok_or_else(|| anyhow::anyhow!("Missing witness_utxo"))
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
-        if prevouts.len() != psbt.unsigned_tx.input.len() {
-            return Err(anyhow::anyhow!(
-                "Missing witness_utxo for some inputs ({}/{})",
-                prevouts.len(),
-                psbt.unsigned_tx.input.len()
-            ));
-        }
+        // Collect (input_idx, keypair) for all inputs we can sign
+        let mut inputs_to_sign: Vec<(usize, Keypair)> = Vec::new();
 
-        let prevouts_refs: Vec<_> = prevouts.iter().collect();
-        let prevouts = Prevouts::All(&prevouts_refs);
-
-        // Create sighash cache
-        let mut sighash_cache = SighashCache::new(&psbt.unsigned_tx);
-
-        // Sign each input that belongs to us
-        for (i, input) in psbt.inputs.iter_mut().enumerate() {
+        for (i, input) in psbt.inputs.iter().enumerate() {
             // Check if we can sign this input (has our derivation path)
             // Try tap_key_origins first (Taproot-specific), then bip32_derivation
-            // tap_key_origins: BTreeMap<XOnlyPublicKey, (Vec<TapLeafHash>, (Fingerprint, DerivationPath))>
-            // bip32_derivation: BTreeMap<PublicKey, (Fingerprint, DerivationPath)>
             let derivation_path: Option<DerivationPath> =
                 if let Some((_, (_, (_, path)))) = input.tap_key_origins.iter().next() {
                     Some(path.clone())
@@ -185,16 +239,8 @@ impl Signer for InMemorySigner {
             };
 
             // Derive the signing key for this specific input
-            // The derivation_path from PSBT is typically the full path from master
-            // We need to derive from our account xpriv
             let signing_key = {
                 // Extract the relative path after the account path (m/86h/<cointype>h/0h)
-                // The derivation path in PSBT might be either:
-                // 1. Full path from master: m/86h/0h/0h/0/5
-                // 2. Relative path from account: 0/5
-
-                // For now, derive from account_xpriv using the last two components (change/index)
-                // This assumes the derivation path is structured correctly
                 let path_str = derivation_path.to_string();
                 let parts: Vec<&str> = path_str.split('/').collect();
 
@@ -217,7 +263,6 @@ impl Signer for InMemorySigner {
                 use bdk_wallet::bitcoin::hashes::Hash;
 
                 // BIP341 requires the internal key to have even parity before computing the tweak
-                // If the internal pubkey has odd parity, negate the internal private key
                 let internal_pubkey_full = internal_key.public_key(&secp);
                 let has_odd_y = internal_pubkey_full.serialize()[0] == 0x03;
                 if has_odd_y {
@@ -228,43 +273,28 @@ impl Signer for InMemorySigner {
                 let internal_pubkey = internal_key.public_key(&secp);
                 let internal_xonly = XOnlyPublicKey::from(internal_pubkey);
 
-                // Calculate BIP341 taproot tweak: t = hash_TapTweak(internal_key || merkle_root)
-                // For BIP86 (no script tree), merkle_root is None
+                // Calculate BIP341 taproot tweak (no script tree for BIP86)
                 let tweak_hash = TapTweakHash::from_key_and_tweak(internal_xonly, None);
                 let tweak_bytes: [u8; 32] = tweak_hash.to_byte_array();
 
-                // Add tweak to internal private key: tweaked_key = internal_key + t
+                // Add tweak to internal private key
                 let tweak_scalar = bdk_wallet::bitcoin::secp256k1::Scalar::from_be_bytes(tweak_bytes)
                     .map_err(|_| anyhow::anyhow!("Invalid tweak scalar"))?;
                 internal_key.add_tweak(&tweak_scalar)
                     .map_err(|_| anyhow::anyhow!("Failed to apply tweak"))?
             };
 
-            // Compute sighash for this input
-            let sighash: TapSighash = sighash_cache
-                .taproot_key_spend_signature_hash(
-                    i,
-                    &prevouts,
-                    TapSighashType::Default,
-                )
-                .map_err(|e| anyhow::anyhow!("Failed to compute sighash: {}", e))?;
-
-            // Sign the sighash
-            let signature = {
-                let msg = Message::from_digest_slice(sighash.as_ref())
-                    .map_err(|e| anyhow::anyhow!("Invalid sighash message: {}", e))?;
-                secp.sign_schnorr(&msg, &signing_key.keypair(&secp))
-                // signing_key is zeroized here
-            };
-
-            // Store signature in PSBT
-            input.tap_key_sig = Some(bdk_wallet::bitcoin::taproot::Signature {
-                signature,
-                sighash_type: TapSighashType::Default,
-            });
+            inputs_to_sign.push((i, signing_key.keypair(&secp)));
         }
 
-        // account_xpriv is zeroized here
+        // Sign all collected inputs using the unified signing function
+        let inputs_refs: Vec<(usize, &Keypair)> = inputs_to_sign
+            .iter()
+            .map(|(idx, kp)| (*idx, kp))
+            .collect();
+        sign_taproot_inputs(psbt, &inputs_refs, &prevouts)?;
+
+        // account_xpriv and all keypairs are zeroized here
         Ok(())
     }
 
