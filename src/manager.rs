@@ -352,7 +352,7 @@ impl Manager {
         drop(conn);
 
         // Derive our input private key (the proposer's input key used for SNICKER tweak)
-        let our_input_privkey = self.wallet_node.derive_utxo_privkey(&our_utxo)?;
+        let our_input_privkey = self.wallet_node.derive_utxo_privkey(&our_utxo).await?;
 
         // Get fee rate from wallet (uses real-time fee estimation)
         let fee_rate = self.wallet_node.get_fee_rate().await;
@@ -361,6 +361,8 @@ impl Manager {
         // Use block_in_place to allow blocking operations in async context
         let wallet_clone = self.wallet_node.wallet.clone();
         let our_utxo_clone = our_utxo.clone();
+        let snicker_conn_clone = self.wallet_node.get_snicker_conn();
+        let our_input_privkey_clone = our_input_privkey; // Already tweaked, ready for signing
         let sign_callback = move |psbt: &mut Psbt| -> Result<()> {
             use bdk_wallet::KeychainKind;
 
@@ -371,7 +373,7 @@ impl Manager {
             tracing::info!("🔨 Proposer signing PSBT with {} inputs", psbt.inputs.len());
 
             // Check if proposer's input is a SNICKER UTXO - if so, sign it manually
-            if let crate::wallet_node::WalletUtxo::Snicker { outpoint, amount, script_pubkey, tweaked_privkey } = &our_utxo_clone {
+            if let crate::wallet_node::WalletUtxo::Snicker { outpoint, amount, script_pubkey } = &our_utxo_clone {
                 tracing::info!("🔑 Proposer's input is a SNICKER UTXO, signing with existing helper");
 
                 // Find which input index corresponds to our SNICKER UTXO
@@ -379,13 +381,26 @@ impl Manager {
                     input.previous_output == *outpoint
                 }).ok_or_else(|| anyhow::anyhow!("Proposer's SNICKER input not found in PSBT"))?;
 
+                // Fetch private key on-demand from database in a tight scope
+                // SecretKey implements secure drop - memory is zeroed when it goes out of scope
+                let privkey_bytes = {
+                    use bdk_wallet::bitcoin::secp256k1::SecretKey;
+                    let conn = snicker_conn_clone.lock().unwrap();
+                    let bytes: Vec<u8> = conn.query_row(
+                        "SELECT tweaked_privkey FROM snicker_utxos WHERE txid = ? AND vout = ?",
+                        [outpoint.txid.to_string(), outpoint.vout.to_string()],
+                        |row| row.get(0),
+                    )?;
+                    bytes
+                };
+
                 // Prepare data in format expected by sign_snicker_inputs helper
                 let snicker_utxo_data = vec![(
                     outpoint.txid.to_string(),
                     outpoint.vout,
                     *amount,
                     script_pubkey.to_bytes(),
-                    tweaked_privkey.secret_bytes().to_vec(),
+                    privkey_bytes,
                 )];
 
                 // Collect prevouts
@@ -403,134 +418,53 @@ impl Manager {
                 )?;
 
                 tracing::info!("✅ Signed SNICKER input {} with tweaked privkey", our_input_idx);
+            } else if let crate::wallet_node::WalletUtxo::Regular(local_utxo) = &our_utxo_clone {
+                // Regular wallet UTXO - sign directly using the pre-derived tweaked key
+                tracing::info!("🔑 Proposer's input is a Regular UTXO, signing with tweaked privkey");
+
+                // Find which input index corresponds to our UTXO
+                let our_input_idx = psbt.unsigned_tx.input.iter().position(|input| {
+                    input.previous_output == local_utxo.outpoint
+                }).ok_or_else(|| anyhow::anyhow!("Proposer's regular input not found in PSBT"))?;
+
+                // Sign using the pre-derived tweaked private key
+                use bdk_wallet::bitcoin::sighash::{SighashCache, TapSighashType, Prevouts};
+                use bdk_wallet::bitcoin::secp256k1::{Message, Secp256k1};
+
+                let secp = Secp256k1::new();
+
+                // Collect prevouts for sighash calculation
+                let prevouts: Vec<_> = psbt.inputs.iter()
+                    .map(|input| input.witness_utxo.clone()
+                        .ok_or_else(|| anyhow::anyhow!("Missing witness_utxo")))
+                    .collect::<Result<Vec<_>>>()?;
+
+                let prevouts_refs: Vec<_> = prevouts.iter().collect();
+                let prevouts_all = Prevouts::All(&prevouts_refs);
+                let mut sighash_cache = SighashCache::new(&psbt.unsigned_tx);
+
+                // Compute taproot sighash
+                let sighash = sighash_cache.taproot_key_spend_signature_hash(
+                    our_input_idx,
+                    &prevouts_all,
+                    TapSighashType::Default,
+                )?;
+
+                // Sign with the tweaked private key
+                let msg = Message::from_digest_slice(sighash.as_ref())?;
+                let signature = secp.sign_schnorr(&msg, &our_input_privkey_clone.keypair(&secp));
+
+                // Store signature in PSBT
+                psbt.inputs[our_input_idx].tap_key_sig = Some(bdk_wallet::bitcoin::taproot::Signature {
+                    signature,
+                    sighash_type: TapSighashType::Default,
+                });
+
+                tracing::info!("✅ Signed regular input {} with tweaked privkey", our_input_idx);
             }
 
-            // Get wallet descriptor for comparison
-            let ext_descriptor = wallet.public_descriptor(KeychainKind::External);
-            let int_descriptor = wallet.public_descriptor(KeychainKind::Internal);
-            tracing::info!("🔨 Wallet External descriptor: {}", ext_descriptor);
-            tracing::info!("🔨 Wallet Internal descriptor: {}", int_descriptor);
-
-            // Log PSBT state before signing
-            for (i, input) in psbt.inputs.iter().enumerate() {
-                tracing::info!("🔨 Input {} BEFORE proposer sign:", i);
-                tracing::info!("    - witness_utxo: {}", input.witness_utxo.is_some());
-                tracing::info!("    - tap_internal_key: {:?}", input.tap_internal_key);
-                tracing::info!("    - tap_key_sig: {:?}", input.tap_key_sig);
-                tracing::info!("    - tap_key_origins: {}", input.tap_key_origins.len());
-
-                if let Some(ref witness_utxo) = input.witness_utxo {
-                    tracing::info!("    - script_pubkey: {}", witness_utxo.script_pubkey);
-                    let is_mine = wallet.is_mine(witness_utxo.script_pubkey.clone());
-                    tracing::info!("    - Wallet recognizes as mine: {}", is_mine);
-
-                    // Check if wallet has a UTXO with matching script_pubkey
-                    let matching_utxo = wallet.list_unspent()
-                        .find(|u| u.txout.script_pubkey == witness_utxo.script_pubkey);
-                    tracing::info!("    - Wallet has UTXO with matching script: {}", matching_utxo.is_some());
-                    if let Some(utxo) = matching_utxo {
-                        tracing::info!("      UTXO: {:?}, keychain: {:?}, index: {}",
-                            utxo.outpoint, utxo.keychain, utxo.derivation_index);
-                    }
-                }
-            }
-
-            // CRITICAL: Check if wallet can derive the exact address for our UTXO
-            tracing::info!("🔑 Checking if wallet can derive UTXO addresses...");
-
-            // For each PSBT input, check if wallet can derive its address
-            for (i, input) in psbt.inputs.iter().enumerate() {
-                if let Some(ref witness_utxo) = input.witness_utxo {
-                    let script = &witness_utxo.script_pubkey;
-                    tracing::info!("🔑 Input {} script: {}", i, script);
-
-                    // Check if wallet has a matching UTXO and get its derivation info
-                    if let Some(utxo) = wallet.list_unspent()
-                        .find(|u| &u.txout.script_pubkey == script)
-                    {
-                        tracing::info!("🔑 Input {} is in wallet: {:?}/{}", i, utxo.keychain, utxo.derivation_index);
-
-                        // Manually derive the address at this index
-                        let derived_addr = wallet.peek_address(utxo.keychain, utxo.derivation_index);
-                        tracing::info!("🔑 Wallet derives at {:?}/{}: {}",
-                            utxo.keychain, utxo.derivation_index, derived_addr.address);
-                        tracing::info!("🔑 Derived script: {}", derived_addr.address.script_pubkey());
-                        tracing::info!("🔑 Scripts match: {}", derived_addr.address.script_pubkey() == *script);
-                    }
-                }
-            }
-
-            // CRITICAL: Manually update PSBT with descriptor since automatic update isn't working
-            use bdk_wallet::miniscript::psbt::PsbtInputExt;
-
-            for input_idx in 0..psbt.inputs.len() {
-                if let Some(ref witness_utxo) = psbt.inputs[input_idx].witness_utxo {
-                    // Find matching UTXO in wallet
-                    if let Some(utxo) = wallet.list_unspent()
-                        .find(|u| u.txout.script_pubkey == witness_utxo.script_pubkey)
-                    {
-                        tracing::info!("🔧 Manually updating PSBT input {} with descriptor at {:?}/{}",
-                            input_idx, utxo.keychain, utxo.derivation_index);
-
-                        // Get descriptor and derive to the specific index
-                        let descriptor = wallet.public_descriptor(utxo.keychain);
-                        let derived_desc = descriptor.at_derivation_index(utxo.derivation_index)
-                            .expect("valid derivation index");
-
-                        // Use miniscript's PsbtInputExt trait to update the input
-                        let input = &mut psbt.inputs[input_idx];
-                        if let Err(e) = input.update_with_descriptor_unchecked(&derived_desc) {
-                            tracing::error!("❌ Failed to update input {}: {:?}", input_idx, e);
-                        } else {
-                            tracing::info!("✅ Updated input {} - tap_internal_key: {:?}, tap_key_origins: {}",
-                                input_idx, input.tap_internal_key, input.tap_key_origins.len());
-                        }
-                    }
-                }
-            }
-
-            // Check PSBT state RIGHT BEFORE calling wallet.sign()
-            tracing::info!("🔨 PSBT state BEFORE wallet.sign():");
-            for (i, input) in psbt.inputs.iter().enumerate() {
-                tracing::info!("  Input {}: tap_internal_key={:?}, tap_key_origins={}",
-                    i, input.tap_internal_key.is_some(), input.tap_key_origins.len());
-            }
-
-            let sign_options = bdk_wallet::SignOptions {
-                trust_witness_utxo: true,
-                try_finalize: false,  // Don't finalize - SNICKER requires partial signing!
-                ..Default::default()
-            };
-
-            let finalized = wallet.sign(psbt, sign_options)?;
-
-            // Check PSBT state RIGHT AFTER calling wallet.sign()
-            tracing::info!("🔨 PSBT state AFTER wallet.sign():");
-            for (i, input) in psbt.inputs.iter().enumerate() {
-                tracing::info!("  Input {}: tap_internal_key={:?}, tap_key_origins={}",
-                    i, input.tap_internal_key.is_some(), input.tap_key_origins.len());
-            }
-            tracing::info!("🔨 Proposer sign result - finalized: {}", finalized);
-
-            // Log PSBT state after signing
-            for (i, input) in psbt.inputs.iter().enumerate() {
-                tracing::info!("🔨 Input {} AFTER proposer sign:", i);
-                tracing::info!("    - tap_internal_key: {:?}", input.tap_internal_key);
-                tracing::info!("    - tap_key_sig: {:?}", input.tap_key_sig);
-                tracing::info!("    - tap_key_origins: {}", input.tap_key_origins.len());
-
-                // Log detailed tap_key_origins data to understand why signing fails
-                for (pubkey, (leaf_hashes, (fingerprint, derivation_path))) in &input.tap_key_origins {
-                    tracing::info!("      * pubkey: {}", pubkey);
-                    tracing::info!("        fingerprint: {}", fingerprint);
-                    tracing::info!("        derivation_path: {}", derivation_path);
-                    tracing::info!("        leaf_hashes: {} entries", leaf_hashes.len());
-                }
-
-                if input.tap_key_sig.is_none() {
-                    tracing::warn!("    ⚠️  No signature added!");
-                }
-            }
+            // Note: We only sign OUR input (the proposer's input)
+            // The other input belongs to the receiver and will be signed by them
 
             Ok(())
         };
@@ -590,10 +524,13 @@ impl Manager {
 
         // Try to decrypt the proposal for each UTXO
         for utxo in &our_utxos {
+            // Derive the private key for this UTXO
+            let privkey = self.wallet_node.derive_utxo_privkey(utxo).await?;
+
             let decrypt_result = self.snicker.try_decrypt_for_utxo(
                 proposal,
                 utxo,
-                |u| self.wallet_node.derive_utxo_privkey(u),
+                |_u| Ok(privkey),
             );
 
             if let Ok(decrypted) = decrypt_result {
@@ -955,12 +892,25 @@ impl Manager {
         // Get all our UTXOs (both regular wallet and SNICKER UTXOs)
         let our_utxos = self.wallet_node.get_all_wallet_utxos().await?;
 
+        // Pre-derive private keys for all UTXOs (needed for SNICKER receive)
+        use std::collections::HashMap;
+        let mut utxo_keys = HashMap::new();
+        for utxo in &our_utxos {
+            let key = self.wallet_node.derive_utxo_privkey(utxo).await?;
+            utxo_keys.insert(utxo.outpoint(), key);
+        }
+
         // Validate and get PSBT from Snicker (already has proposer's signature)
         let mut psbt = self.snicker.receive(
             proposal,
             &our_utxos,
             acceptable_delta_range,
-            |utxo| self.wallet_node.derive_utxo_privkey(utxo),
+            |utxo| {
+                utxo_keys
+                    .get(&utxo.outpoint())
+                    .copied()
+                    .ok_or_else(|| anyhow::anyhow!("Missing key for UTXO"))
+            },
         )?;
 
         // Sign with wallet (adds receiver's signature)
@@ -1174,7 +1124,7 @@ impl Manager {
             .ok_or_else(|| anyhow::anyhow!("Original output not found in our wallet"))?;
 
         // Derive our private key using unified method
-        let receiver_seckey = self.wallet_node.derive_utxo_privkey(our_utxo)?;
+        let receiver_seckey = self.wallet_node.derive_utxo_privkey(our_utxo).await?;
 
         // Calculate the SNICKER shared secret
         let snicker_shared_secret = crate::snicker::tweak::calculate_dh_shared_secret(
@@ -1226,10 +1176,6 @@ impl Manager {
         self.wallet_node.set_rpc_client(url, auth)
     }
 
-    /// Sync recent blocks
-    pub async fn sync_recent(&mut self) -> Result<()> {
-        self.wallet_node.sync_recent().await
-    }
 
     /// Peek at next N addresses without registering them
     pub async fn peek_addresses(&self, count: u32) -> Result<Vec<String>> {

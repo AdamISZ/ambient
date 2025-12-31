@@ -10,6 +10,10 @@ use tokio::select;
 use tokio::sync::{Mutex, broadcast};
 use tracing::info;
 
+// Import signer module
+// Note: Using ambient::signer instead of crate::signer due to Cargo compilation quirk
+use crate::signer::{Signer, InMemorySigner};
+
 use bdk_wallet::{
     PersistedWallet,
     bitcoin::{Network, Address, Amount, FeeRate, Transaction, Txid, psbt::Psbt, hashes::Hash},
@@ -19,7 +23,7 @@ use bdk_wallet::{
     },
     rusqlite::Connection,
     miniscript::Tap,
-    KeychainKind, Wallet, SignOptions,
+    KeychainKind, Wallet,
 };
 
 use bdk_kyoto::builder::{Builder, BuilderExt};
@@ -31,7 +35,6 @@ use crate::partial_utxo_set::{PartialUtxoSet, UtxoStatus};
 
 const RECOVERY_LOOKAHEAD: u32 = 50;
 const NUM_CONNECTIONS: u8 = 1;
-const SYNC_LOOKBACK: u32 = 5_000; // blocks to rescan on `sync`
 
 /// Event emitted when the wallet state changes due to blockchain updates
 #[derive(Debug, Clone)]
@@ -49,12 +52,11 @@ pub struct WalletUpdate {
 pub enum WalletUtxo {
     /// Regular wallet UTXO with derivation path
     Regular(bdk_wallet::LocalOutput),
-    /// SNICKER UTXO with tweaked private key
+    /// SNICKER UTXO (private key fetched on-demand for signing)
     Snicker {
         outpoint: bdk_wallet::bitcoin::OutPoint,
         amount: u64,
         script_pubkey: bdk_wallet::bitcoin::ScriptBuf,
-        tweaked_privkey: bdk_wallet::bitcoin::secp256k1::SecretKey,
     },
 }
 
@@ -112,16 +114,15 @@ pub struct WalletNode {
     pub requester: bdk_kyoto::Requester,
     pub(crate) update_subscriber: Arc<Mutex<bdk_kyoto::UpdateSubscriber>>,
     pub network: Network,
-    /// Master extended private key (needed for SNICKER DH operations)
-    pub(crate) xprv: bdk_wallet::bitcoin::bip32::Xpriv,
+    /// Signing abstraction for PSBT signing and SNICKER DH operations
+    /// Encapsulates private key access with encryption at rest
+    signer: Arc<dyn Signer>,
     /// Optional Bitcoin Core RPC client (required for proposer mode scanning)
     pub(crate) rpc_client: Option<Arc<bdk_bitcoind_rpc::bitcoincore_rpc::Client>>,
     /// Wallet name (for locating correct headers.db)
     wallet_name: String,
     /// Shared in-memory SNICKER database connection (uses std::sync::Mutex for sync access)
     snicker_conn: Arc<std::sync::Mutex<Connection>>,
-    /// Path to SNICKER database for checking pending UTXOs (DEPRECATED - using in-memory)
-    snicker_db_path: std::path::PathBuf,
     /// Broadcast channel for wallet update events
     update_tx: broadcast::Sender<WalletUpdate>,
     /// Encrypted in-memory wallet database (for flush on shutdown)
@@ -302,13 +303,19 @@ impl WalletNode {
         // - Block scanning: Handles SNICKER UTXO tracking independently
         // As a result, the bdk-kyoto patch (which added arbitrary script subscription) is no longer needed
 
-        // Keep path for compatibility (DEPRECATED - now using in-memory)
-        let snicker_db_path = snicker_db_enc_path.clone();
+        // Create InMemorySigner with encrypted xprv
+        // This encapsulates private key access with encryption at rest in memory
+        let signer = InMemorySigner::new(xprv, password, network)?;
+        let signer = Arc::new(signer) as Arc<dyn Signer>;
 
-        // Derive descriptors for SNICKER UTXO detection
-        let coin_type = if network == Network::Bitcoin { 0 } else { 1 };
-        let external_desc = format!("tr({}/86h/{}h/0h/0/*)", xprv, coin_type);
-        let internal_desc = format!("tr({}/86h/{}h/0h/1/*)", xprv, coin_type);
+        // Get account-level xpub from signer for creating public descriptors
+        let account_xpub = signer.get_account_xpub()?;
+
+        // Create PUBLIC descriptors using xpub (safe to store/leak)
+        // The last two levels (0 or 1 for change, and * for address index) are unhardened,
+        // so all addresses can be derived from the account xpub without exposing private keys
+        let external_desc = format!("tr({}/0/*)", account_xpub);
+        let internal_desc = format!("tr({}/1/*)", account_xpub);
 
         // Initialize fee estimator with default settings (5 min cache, 10s timeout)
         let fee_estimator = fee::FeeEstimator::new(network, 300, 10);
@@ -374,11 +381,10 @@ impl WalletNode {
             requester,
             update_subscriber,
             network,
-            xprv,
+            signer,
             rpc_client: None,
             wallet_name: name.to_string(),
             snicker_conn,
-            snicker_db_path,
             update_tx,
             wallet_db,
             snicker_db,
@@ -459,21 +465,30 @@ impl WalletNode {
             .into_xprv(network)
             .ok_or_else(|| anyhow!("Unable to derive xprv from mnemonic"))?;
 
-        // Create BIP86 descriptors manually
-        // BIP86 uses m/86'/cointype'/0' as the account path
+        // Derive account-level keys for wallet operations
+        // BIP86 uses m/86h/cointype/h/0h as the account path
         let coin_type = if network == Network::Bitcoin { 0 } else { 1 };
+        let secp = bdk_wallet::bitcoin::secp256k1::Secp256k1::new();
+        let account_path = bdk_wallet::bitcoin::bip32::DerivationPath::from_str(
+            &format!("m/86h/{}h/0h", coin_type)
+        )?;
+        let account_xpriv = xprv.derive_priv(&secp, &account_path)?;
+        let account_xpub = bdk_wallet::bitcoin::bip32::Xpub::from_priv(&secp, &account_xpriv);
 
-        // Format: tr(xprv/86h/{cointype}h/0h/{change}/*)
-        let external_desc = format!("tr({}/86h/{}h/0h/0/*)", xprv, coin_type);
-        let internal_desc = format!("tr({}/86h/{}h/0h/1/*)", xprv, coin_type);
+        // Create PUBLIC descriptors using xpub (safe to store/leak)
+        // Format: tr(xpub/{change}/*) where change is 0 (external) or 1 (internal)
+        let external_desc = format!("tr({}/0/*)", account_xpub);
+        let internal_desc = format!("tr({}/1/*)", account_xpub);
 
         tracing::debug!("Descriptor contains private key: {}", external_desc.contains("prv"));
+        tracing::info!("📝 Using PUBLIC descriptors with xpub (private keys not in descriptors)");
 
         info!("💾 Wallet database: in-memory (encrypted)");
 
         // Check if wallet already exists by trying to load it
-        // CRITICAL: When loading from DB, we must call .descriptor().extract_keys() to restore signers
-        // Use Box::leak to convert String to &'static str (acceptable for descriptor strings)
+        // NOTE: We do NOT call .extract_keys() because descriptors don't contain private keys
+        // Signing will be done manually using account_xpriv
+        // Descriptors are public (xpub) so Box::leak is safe (no sensitive data)
         let external_desc_static: &'static str = Box::leak(external_desc.clone().into_boxed_str());
         let internal_desc_static: &'static str = Box::leak(internal_desc.clone().into_boxed_str());
 
@@ -506,7 +521,8 @@ impl WalletNode {
         let maybe_wallet = Wallet::load()
             .descriptor(KeychainKind::External, Some(external_desc_static))
             .descriptor(KeychainKind::Internal, Some(internal_desc_static))
-            .extract_keys()  // Re-extract private keys from descriptors to create signers!
+            // .extract_keys() NOT called - descriptors are public (xpub), no keys to extract
+            // Signing will be done manually using account_xpriv
             .check_network(network)
             .load_wallet(&mut conn)?;
 
@@ -1277,106 +1293,78 @@ impl WalletNode {
     /// Sign a PSBT with the wallet's keys.
     /// Returns true if the PSBT is fully signed after this operation.
     pub async fn sign_psbt(&mut self, psbt: &mut Psbt) -> Result<bool> {
+        use bdk_wallet::bitcoin::sighash::{SighashCache, TapSighashType, Prevouts};
+        use bdk_wallet::bitcoin::secp256k1::{Message, Secp256k1};
+
         info!("✍️  Signing PSBT with {} inputs", psbt.inputs.len());
 
-        // Get all our UTXOs (including SNICKER UTXOs)
+        let secp = Secp256k1::new();
+
+        // Get all our UTXOs to identify which inputs are ours
         let all_utxos = self.get_all_wallet_utxos().await?;
 
-        // First, populate witness_utxo for SNICKER inputs and collect prevouts for signing
-        let mut prevouts = Vec::new();
+        // Collect prevouts for sighash calculation
+        let prevouts: Vec<_> = psbt.inputs.iter()
+            .map(|input| input.witness_utxo.clone()
+                .ok_or_else(|| anyhow!("Missing witness_utxo")))
+            .collect::<Result<Vec<_>>>()?;
+
+        let prevouts_all = Prevouts::All(&prevouts);
+        let mut sighash_cache = SighashCache::new(&psbt.unsigned_tx);
+
+        // Sign each input that belongs to us (both Regular and SNICKER UTXOs)
         for (input_idx, input) in psbt.inputs.iter_mut().enumerate() {
-            let outpoint = psbt.unsigned_tx.input.get(input_idx)
-                .ok_or_else(|| anyhow::anyhow!("PSBT input mismatch"))?
-                .previous_output;
+            let outpoint = psbt.unsigned_tx.input[input_idx].previous_output;
 
-            // Check if this input is a SNICKER UTXO
+            // Check if this input is one of our UTXOs
             if let Some(utxo) = all_utxos.iter().find(|u| u.outpoint() == outpoint) {
-                if let WalletUtxo::Snicker { .. } = utxo {
-                    // Populate witness_utxo if missing
-                    if input.witness_utxo.is_none() {
-                        input.witness_utxo = Some(utxo.txout());
-                        info!("    Added witness_utxo for SNICKER input {}", input_idx);
-                    }
+                // Skip if already signed
+                if input.tap_key_sig.is_some() {
+                    continue;
                 }
-            }
 
-            // Collect prevouts for sighash calculation
-            if let Some(witness_utxo) = &input.witness_utxo {
-                prevouts.push(witness_utxo.clone());
-            } else {
-                return Err(anyhow::anyhow!("Missing witness_utxo for input {}", input_idx));
+                // Compute taproot sighash
+                let sighash = sighash_cache.taproot_key_spend_signature_hash(
+                    input_idx,
+                    &prevouts_all,
+                    TapSighashType::Default,
+                )?;
+
+                // Sign in a tight scope - key is zeroized immediately after
+                let signature = {
+                    // Derive private key (works for both Regular and Snicker UTXOs)
+                    let privkey = match utxo {
+                        WalletUtxo::Regular(_) => {
+                            // Derive from signer using BIP32 path
+                            self.derive_utxo_privkey(utxo).await?
+                        }
+                        WalletUtxo::Snicker { outpoint, .. } => {
+                            // Fetch from database
+                            self.fetch_snicker_key(*outpoint).await?
+                        }
+                    };
+
+                    // Create signature
+                    let msg = Message::from_digest_slice(sighash.as_byte_array())?;
+                    secp.sign_schnorr(&msg, &privkey.keypair(&secp))
+                    // privkey is zeroized HERE when scope ends
+                };
+
+                // Store signature in PSBT
+                input.tap_key_sig = Some(bdk_wallet::bitcoin::taproot::Signature {
+                    signature,
+                    sighash_type: TapSighashType::Default,
+                });
+
+                info!("    ✅ Signed input {}", input_idx);
             }
         }
-
-        // Now sign SNICKER UTXO inputs with their tweaked keys
-        for (input_idx, input) in psbt.inputs.iter_mut().enumerate() {
-            let outpoint = psbt.unsigned_tx.input.get(input_idx).unwrap().previous_output;
-
-            // Check if this input is a SNICKER UTXO
-            if let Some(utxo) = all_utxos.iter().find(|u| u.outpoint() == outpoint) {
-                if let WalletUtxo::Snicker { tweaked_privkey, .. } = utxo {
-                    // Sign manually with the tweaked private key
-                    if input.tap_key_sig.is_none() {
-                        use bdk_wallet::bitcoin::sighash::{SighashCache, TapSighashType};
-                        use bdk_wallet::bitcoin::secp256k1::{Message, Secp256k1};
-
-                        let secp = Secp256k1::new();
-                        let mut sighash_cache = SighashCache::new(&psbt.unsigned_tx);
-
-                        // Compute taproot key-path sighash
-                        let sighash = sighash_cache.taproot_key_spend_signature_hash(
-                            input_idx,
-                            &bdk_wallet::bitcoin::sighash::Prevouts::All(&prevouts),
-                            TapSighashType::Default,
-                        )?;
-
-                        let msg = Message::from_digest_slice(sighash.as_byte_array())?;
-                        let sig = secp.sign_schnorr(&msg, &tweaked_privkey.keypair(&secp));
-
-                        // Store signature in PSBT
-                        input.tap_key_sig = Some(bdk_wallet::bitcoin::taproot::Signature {
-                            signature: sig,
-                            sighash_type: TapSighashType::Default,
-                        });
-
-                        info!("    Signed SNICKER input {} with tweaked key", input_idx);
-                    }
-                }
-            }
-        }
-
-        // Check if there are any regular wallet inputs that need signing
-        let mut has_regular_wallet_inputs = false;
-        for (input_idx, _input) in psbt.inputs.iter().enumerate() {
-            let outpoint = psbt.unsigned_tx.input.get(input_idx).unwrap().previous_output;
-
-            // Check if this input is a regular wallet UTXO (not a SNICKER UTXO)
-            if let Some(utxo) = all_utxos.iter().find(|u| u.outpoint() == outpoint) {
-                if matches!(utxo, WalletUtxo::Regular(_)) {
-                    has_regular_wallet_inputs = true;
-                    break;
-                }
-            }
-        }
-
-        // Only call wallet.sign() if there are regular wallet inputs to sign
-        let finalized = if has_regular_wallet_inputs {
-            let wallet = self.wallet.lock().await;
-            // Use trust_witness_utxo to avoid errors on inputs not in our wallet (e.g., proposer's SNICKER input)
-            let sign_options = SignOptions {
-                trust_witness_utxo: true,
-                ..Default::default()
-            };
-            wallet.sign(psbt, sign_options)?
-        } else {
-            // All our inputs are SNICKER UTXOs, already signed manually
-            false
-        };
 
         let signed_count = psbt.inputs.iter().filter(|i| i.tap_key_sig.is_some()).count();
-        info!("✅ Signed {} of {} inputs (finalized: {})", signed_count, psbt.inputs.len(), finalized);
+        info!("✅ Signed {} of {} inputs", signed_count, psbt.inputs.len());
 
-        Ok(finalized)
+        // Return false for finalized - we're doing partial signing for multi-party PSBTs
+        Ok(false)
     }
 
     /// Finalize a fully-signed PSBT into a transaction ready for broadcast.
@@ -2145,22 +2133,53 @@ impl WalletNode {
             psbt.inputs[i].witness_utxo = Some(prevout.clone());
         }
 
+        // Step 3b: Fill in tap_key_origins for regular inputs so Signer can derive keys
+        // Regular inputs start after SNICKER inputs
+        let regular_start_idx = selected.snicker_utxos.len();
+        let coin_type = if self.network == Network::Bitcoin { 0 } else { 1 };
+
+        for (i, utxo) in selected.regular_utxos.iter().enumerate() {
+            let input_idx = regular_start_idx + i;
+
+            // Build full derivation path: m/86h/<cointype>h/0h/<change>/<index>
+            let change = match utxo.keychain {
+                KeychainKind::External => 0,
+                KeychainKind::Internal => 1,
+            };
+            let full_path_str = format!("m/86h/{}h/0h/{}/{}", coin_type, change, utxo.derivation_index);
+            let full_path = bdk_wallet::bitcoin::bip32::DerivationPath::from_str(&full_path_str)?;
+
+            // Extract x-only public key from P2TR script_pubkey
+            // P2TR script is: OP_1 <32-byte-xonly-pubkey>
+            let script_bytes = utxo.txout.script_pubkey.as_bytes();
+            if script_bytes.len() == 34 && script_bytes[0] == 0x51 && script_bytes[1] == 0x20 {
+                let xonly_bytes: [u8; 32] = script_bytes[2..34].try_into()?;
+                let xonly_pubkey = bdk_wallet::bitcoin::secp256k1::XOnlyPublicKey::from_slice(&xonly_bytes)?;
+
+                // Use dummy fingerprint - signer only needs the path
+                let fingerprint = bdk_wallet::bitcoin::bip32::Fingerprint::default();
+
+                psbt.inputs[input_idx].tap_key_origins.insert(
+                    xonly_pubkey,
+                    (vec![], (fingerprint, full_path)),
+                );
+            }
+        }
+
         // Step 4: Sign SNICKER inputs using helper function
         if !selected.snicker_utxos.is_empty() {
             Self::sign_snicker_inputs(&mut psbt, &selected.snicker_utxos, &prevouts_for_sighash, 0)?;
         }
 
-        // Step 5: Sign regular inputs with BDK's wallet (if any)
+        // Step 5: Sign regular inputs using Signer abstraction
+        // (tap_key_origins were populated above so signer can derive keys)
         if !selected.regular_utxos.is_empty() {
-            let mut wallet = self.wallet.lock().await;
-            info!("✍️  Signing {} regular inputs with BDK...", selected.regular_utxos.len());
-            let sign_options = SignOptions::default();
-            wallet.sign(&mut psbt, sign_options)?;
-            drop(wallet);
+            info!("✍️  Signing {} regular inputs with Signer...", selected.regular_utxos.len());
+            self.signer.sign_psbt(&mut psbt).await?;
             info!("✅ Regular inputs signed");
         }
 
-        // Finalize all inputs
+        // Step 6: Finalize all inputs (move tap_key_sig to final_script_witness)
         for i in 0..psbt.inputs.len() {
             if let Some(sig) = &psbt.inputs[i].tap_key_sig {
                 psbt.inputs[i].final_script_witness = Some(Witness::from_slice(&[sig.to_vec()]));
@@ -2168,14 +2187,12 @@ impl WalletNode {
             }
         }
 
-        // Step 6: Finalize PSBT
-        if !selected.regular_utxos.is_empty() {
-            let mut wallet = self.wallet.lock().await;
-            let finalize_result = wallet.finalize_psbt(&mut psbt, SignOptions::default())?;
-            drop(wallet);
-            if !finalize_result {
-                return Err(anyhow!("Failed to finalize PSBT - some inputs not fully signed"));
-            }
+        // Verify all inputs are finalized
+        let unsigned_count = psbt.inputs.iter()
+            .filter(|input| input.final_script_witness.is_none())
+            .count();
+        if unsigned_count > 0 {
+            return Err(anyhow!("Failed to finalize PSBT - {} inputs not fully signed", unsigned_count));
         }
 
         // Extract transaction
@@ -2192,29 +2209,6 @@ impl WalletNode {
     // PUBLIC WALLET/STATE HELPERS (used by UI)
     // ============================================================
 
-    pub async fn sync_recent(&mut self) -> Result<()> {
-      // Auto-sync is always running in background, just report current state
-      let wallet = self.wallet.lock().await;
-      let height = wallet.local_chain().tip().height();
-      info!("ℹ️  Auto-sync is running in background. Current tip: {height}");
-      Ok(())
-  }
-    /*
-    pub async fn sync_recent(&mut self) -> Result<()> {
-        // shut down current node
-        self.requester.shutdown()?;
-
-        let tip = self.wallet.local_chain().tip().height();
-        let from_height = tip.saturating_sub(SYNC_LOOKBACK);
-
-        let (requester, update_subscriber) =
-            Self::start_node(&self.wallet, self.network, from_height)?;
-
-        self.requester = requester;
-        self.update_subscriber = update_subscriber;
-
-        self.apply_one_update().await
-    }*/
 
     pub async fn debug_transactions(&self) -> Result<String> {
       let wallet = self.wallet.lock().await;
@@ -2394,9 +2388,35 @@ impl WalletNode {
         Ok(result)
     }
 
+    /// Fetch a single SNICKER private key on-demand for signing
+    /// Returns the tweaked private key for the given outpoint
+    ///
+    /// # Security Note
+    /// This function loads private key material from the encrypted database.
+    /// The returned SecretKey implements secure drop (zeroization) automatically.
+    /// Callers should ensure the key is used in a tight scope and dropped ASAP.
+    pub async fn fetch_snicker_key(&self, outpoint: bdk_wallet::bitcoin::OutPoint) -> Result<bdk_wallet::bitcoin::secp256k1::SecretKey> {
+        use bdk_wallet::bitcoin::secp256k1::SecretKey;
+
+        let conn = self.snicker_conn.lock().unwrap();
+        let privkey_bytes: Vec<u8> = conn.query_row(
+            "SELECT tweaked_privkey FROM snicker_utxos WHERE txid = ? AND vout = ?",
+            [outpoint.txid.to_string(), outpoint.vout.to_string()],
+            |row| row.get(0),
+        )?;
+
+        SecretKey::from_slice(&privkey_bytes).map_err(|e| anyhow::anyhow!("Invalid private key: {}", e))
+    }
+
     /// Get all wallet UTXOs (regular + SNICKER) as unified WalletUtxo enum
     /// This is the single source of truth for all UTXOs in the wallet
+    ///
+    /// # Security Note
+    /// This function does NOT load private keys into memory. SNICKER private keys
+    /// are fetched on-demand when needed for signing using fetch_snicker_key().
     pub async fn get_all_wallet_utxos(&self) -> Result<Vec<WalletUtxo>> {
+        use std::str::FromStr;
+
         let mut result = Vec::new();
 
         // Regular wallet UTXOs
@@ -2406,23 +2426,27 @@ impl WalletNode {
         }
         drop(wallet);
 
-        // SNICKER UTXOs with their tweaked keys
-        let snicker_utxos = self.get_snicker_utxos_with_keys().await?;
-        for (outpoint, amount, tweaked_privkey) in snicker_utxos {
-            // Get script_pubkey from database
-            let conn = self.snicker_conn.lock().unwrap();
-            let script_bytes: Vec<u8> = conn.query_row(
-                "SELECT script_pubkey FROM snicker_utxos WHERE txid = ? AND vout = ?",
-                [outpoint.txid.to_string(), outpoint.vout.to_string()],
-                |row| row.get(0),
-            )?;
+        // SNICKER UTXOs (without loading private keys)
+        let conn = self.snicker_conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT txid, vout, amount, script_pubkey FROM snicker_utxos WHERE block_height IS NOT NULL AND status = 'unspent'"
+        )?;
+        let mut rows = stmt.query([])?;
+
+        while let Some(row) = rows.next()? {
+            let txid_str: String = row.get(0)?;
+            let vout: u32 = row.get(1)?;
+            let amount: u64 = row.get(2)?;
+            let script_bytes: Vec<u8> = row.get(3)?;
+
+            let txid = bdk_wallet::bitcoin::Txid::from_str(&txid_str)?;
+            let outpoint = bdk_wallet::bitcoin::OutPoint { txid, vout };
             let script_pubkey = bdk_wallet::bitcoin::ScriptBuf::from_bytes(script_bytes);
 
             result.push(WalletUtxo::Snicker {
                 outpoint,
                 amount,
                 script_pubkey,
-                tweaked_privkey,
             });
         }
 
@@ -2681,7 +2705,7 @@ impl WalletNode {
                             let mut wallet = bdk_wallet::Wallet::load()
                                 .descriptor(bdk_wallet::KeychainKind::External, Some(external_desc_static))
                                 .descriptor(bdk_wallet::KeychainKind::Internal, Some(internal_desc_static))
-                                .extract_keys()
+                                // .extract_keys() NOT called - descriptors are public (xpub)
                                 .check_network(network)
                                 .load_wallet(&mut *wallet_write_conn)?
                                 .ok_or_else(|| anyhow::anyhow!("Wallet not found"))?;
@@ -2974,7 +2998,7 @@ impl WalletNode {
     ///
     /// # Returns
     /// The secp256k1 private key for this UTXO
-    pub fn derive_utxo_privkey(
+    pub async fn derive_utxo_privkey(
         &self,
         utxo: &WalletUtxo,
     ) -> Result<bdk_wallet::bitcoin::secp256k1::SecretKey> {
@@ -2987,20 +3011,20 @@ impl WalletNode {
                 use bdk_wallet::bitcoin::bip32::DerivationPath;
                 use std::str::FromStr;
 
-                // Derive using BIP86 path: m/86'/cointype'/0'/change/index
-                let coin_type = if self.network == Network::Bitcoin { 0 } else { 1 };
+                // Derive from account level (m/86h/<cointype>h/0h) using unhardened path: change/index
                 let change = match keychain {
                     KeychainKind::External => 0,
                     KeychainKind::Internal => 1,
                 };
 
-                let path_str = format!("m/86h/{}h/0h/{}/{}", coin_type, change, derivation_index);
-                let derivation_path = DerivationPath::from_str(&path_str)?;
+                // Build full derivation path from account level: m/86h/<cointype>h/0h/<change>/<index>
+                let coin_type = if self.network == Network::Bitcoin { 0 } else { 1 };
+                let full_path_str = format!("m/86h/{}h/0h/{}/{}", coin_type, change, derivation_index);
+                let full_path = DerivationPath::from_str(&full_path_str)?;
 
-                // Derive the internal private key
+                // Derive the internal private key from signer
                 let secp = bdk_wallet::bitcoin::secp256k1::Secp256k1::new();
-                let derived = self.xprv.derive_priv(&secp, &derivation_path)?;
-                let mut internal_key = derived.private_key;
+                let mut internal_key = self.signer.derive_key(&full_path).await?;
 
                 // For BIP86 Taproot, we need to return the TWEAKED private key
                 // This matches the output key that appears in the P2TR script
@@ -3047,9 +3071,16 @@ impl WalletNode {
 
                 Ok(tweaked_seckey)
             }
-            WalletUtxo::Snicker { tweaked_privkey, .. } => {
-                // Return the stored tweaked privkey directly for SNICKER UTXOs
-                Ok(*tweaked_privkey)
+            WalletUtxo::Snicker { outpoint, .. } => {
+                // Fetch tweaked privkey from database on-demand for SNICKER UTXOs
+                use bdk_wallet::bitcoin::secp256k1::SecretKey;
+                let conn = self.snicker_conn.lock().unwrap();
+                let privkey_bytes: Vec<u8> = conn.query_row(
+                    "SELECT tweaked_privkey FROM snicker_utxos WHERE txid = ? AND vout = ?",
+                    [outpoint.txid.to_string(), outpoint.vout.to_string()],
+                    |row| row.get(0),
+                )?;
+                SecretKey::from_slice(&privkey_bytes).map_err(|e| anyhow::anyhow!("Invalid private key: {}", e))
             }
         }
     }

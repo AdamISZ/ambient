@@ -1,14 +1,9 @@
-mod blockchain_data;
-mod manager;
-mod network;
-mod snicker;
-mod cli;
-mod wallet_node;
-mod config;
-mod automation;
-mod encryption;
-mod fee;
-mod partial_utxo_set;
+// Use modules from the ambient library instead of redeclaring them
+use ambient::{
+    blockchain_data, manager, network, snicker, cli, signer,
+    wallet_node, config, automation, encryption, fee,
+    partial_utxo_set,
+};
 
 use anyhow::Result;
 use clap::{Parser, ValueEnum};

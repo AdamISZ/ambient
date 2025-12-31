@@ -321,6 +321,89 @@ impl EncryptedMemoryDb {
     }
 }
 
+/// In-memory encryption key for encrypting sensitive data in RAM
+///
+/// This is used for encrypting xprv in memory. Unlike file encryption,
+/// this doesn't include version bytes or embed the salt in each ciphertext.
+/// The salt is stored in the struct for key derivation consistency.
+pub struct EncryptionKey {
+    /// Derived encryption key (32 bytes for ChaCha20-Poly1305)
+    key: [u8; ARGON2_OUTPUT_LEN],
+    /// Salt used for key derivation (kept for potential serialization)
+    #[allow(dead_code)]
+    salt: [u8; SALT_LEN],
+}
+
+impl EncryptionKey {
+    /// Derive an encryption key from a password
+    ///
+    /// Uses Argon2id with a random salt. The derived key can be used
+    /// for multiple encrypt/decrypt operations.
+    pub fn derive_from_password(password: &str) -> Result<Self> {
+        // Generate random salt
+        let mut salt = [0u8; SALT_LEN];
+        OsRng.fill_bytes(&mut salt);
+
+        // Derive key using existing infrastructure
+        let key = WalletEncryption::derive_key(password, &salt)?;
+
+        Ok(Self { key, salt })
+    }
+
+    /// Encrypt data with this key
+    ///
+    /// Format: [Nonce(12) | Ciphertext+Tag]
+    ///
+    /// Each encryption generates a fresh random nonce.
+    pub fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
+        // Generate random nonce
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        OsRng.fill_bytes(&mut nonce_bytes);
+        let nonce = Nonce::from_slice(&nonce_bytes);
+
+        // Create cipher
+        let cipher = ChaCha20Poly1305::new_from_slice(&self.key)
+            .map_err(|e| anyhow!("Failed to create cipher: {}", e))?;
+
+        // Encrypt
+        let ciphertext = cipher
+            .encrypt(nonce, plaintext)
+            .map_err(|e| anyhow!("Encryption failed: {}", e))?;
+
+        // Build output: [nonce | ciphertext+tag]
+        let mut output = Vec::with_capacity(NONCE_LEN + ciphertext.len());
+        output.extend_from_slice(&nonce_bytes);
+        output.extend_from_slice(&ciphertext);
+
+        Ok(output)
+    }
+
+    /// Decrypt data with this key
+    ///
+    /// Expects format: [Nonce(12) | Ciphertext+Tag]
+    pub fn decrypt(&self, encrypted: &[u8]) -> Result<Vec<u8>> {
+        if encrypted.len() < NONCE_LEN + TAG_LEN {
+            return Err(anyhow!("Encrypted data too small"));
+        }
+
+        let nonce_bytes: [u8; NONCE_LEN] = encrypted[0..NONCE_LEN]
+            .try_into()
+            .map_err(|_| anyhow!("Failed to parse nonce"))?;
+
+        let ciphertext = &encrypted[NONCE_LEN..];
+
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        let cipher = ChaCha20Poly1305::new_from_slice(&self.key)
+            .map_err(|e| anyhow!("Failed to create cipher: {}", e))?;
+
+        let plaintext = cipher
+            .decrypt(nonce, ciphertext)
+            .map_err(|_| anyhow!("Decryption failed (wrong key or corrupted data)"))?;
+
+        Ok(plaintext)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

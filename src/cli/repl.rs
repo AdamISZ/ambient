@@ -253,17 +253,6 @@ pub async fn repl(
                 }
             }
 
-            "sync" => {
-                if let Some(arc) = manager_arc.as_ref() {
-                    println!("Syncing (recent blocks)...");
-                    let mut mgr = arc.write().await;
-                    mgr.sync_recent().await?;
-                    println!("Done.");
-                } else {
-                    println!("No wallet loaded.");
-                }
-            }
-
             "peek" => {
                 if let Some(arc) = manager_arc.as_ref() {
                     let mut mgr = arc.write().await;
@@ -930,7 +919,6 @@ fn print_help() {
     println!("  summary                            - show wallet summary");
     println!("  send <addr> <amt> <fee>            - send transaction (addr, sats, sat/vB)");
     println!("  build_snicker_tx <addr> <amt> <f>  - build SNICKER tx without broadcasting (testing)");
-    println!("  sync                               - rescan recent blocks");
     println!();
     println!("SNICKER Commands (Proposer side):");
     println!("  test_get_block <hash>              - test: fetch block by hash via Kyoto P2P");

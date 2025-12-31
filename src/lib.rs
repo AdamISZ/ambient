@@ -7,6 +7,7 @@ pub mod blockchain_data;
 pub mod encryption;
 pub mod fee;
 pub mod network;
+pub mod signer;
 pub mod snicker;
 pub mod wallet_node;
 pub mod manager;
