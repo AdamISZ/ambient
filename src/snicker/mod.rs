@@ -217,7 +217,7 @@ pub struct SnickerUtxo {
 pub struct Snicker {
     conn: Arc<Mutex<Connection>>,
     db_manager: Option<crate::encryption::EncryptedMemoryDb>,
-    network: Network,
+    _network: Network,
 }
 
 impl Snicker {
@@ -235,7 +235,7 @@ impl Snicker {
         Ok(Self {
             conn,
             db_manager,
-            network,
+            _network: network,
         })
     }
 
@@ -311,7 +311,7 @@ impl Snicker {
         let proposer_input_pubkey = proposer_input_seckey.public_key(&secp);
 
         // 2. Create the tweaked output using proposer's input key
-        let (tweaked_output, snicker_shared_secret) = self.create_tweaked_output(
+        let (tweaked_output, _snicker_shared_secret) = self.create_tweaked_output(
             &receiver_txout,
             &proposer_input_seckey,
         )?;
@@ -1443,7 +1443,7 @@ impl Snicker {
     }
 
     /// Extract receiver's UTXO from a proposal's tweak info
-    pub fn extract_receiver_utxo(&self, proposal: &Proposal, target_tx: &Transaction, output_index: usize) -> Result<String> {
+    pub fn extract_receiver_utxo(&self, _proposal: &Proposal, target_tx: &Transaction, output_index: usize) -> Result<String> {
         let txid = target_tx.compute_txid();
         Ok(format!("{}:{}", txid, output_index))
     }

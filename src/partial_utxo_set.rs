@@ -17,7 +17,7 @@
 //! from full node observers - paradoxically better privacy than selective downloads.
 
 use anyhow::{Context, Result};
-use bdk_wallet::bitcoin::{Block, OutPoint, ScriptBuf, Transaction, Txid};
+use bdk_wallet::bitcoin::{Block, OutPoint, ScriptBuf, Txid};
 use rusqlite::{Connection, params};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};

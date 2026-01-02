@@ -3,15 +3,13 @@
 //! Coordinates between WalletNode (blockchain/wallet operations) and Snicker (protocol operations).
 //! Provides high-level business logic operations that the UI layer can call.
 
-use anyhow::{Result, Context};
+use anyhow::Result;
 use bdk_wallet::bitcoin::{Transaction, psbt::Psbt};
-use tracing::info;
 use zeroize::Zeroizing;
 
 use crate::wallet_node::WalletNode;
 use crate::snicker::{Snicker, ProposalOpportunity, EncryptedProposal, Proposal};
 use crate::network::{ProposalNetwork, ProposalFilter};
-use std::path::Path;
 use std::sync::Arc;
 
 /// High-level application manager that coordinates wallet and SNICKER operations
@@ -1259,7 +1257,7 @@ impl Manager {
     /// Get block information by hash (for testing/debugging)
     /// Returns: (version, prev_blockhash, num_txs, num_p2tr_outputs)
     pub async fn get_block_info(&self, block_hash: bdk_wallet::bitcoin::BlockHash) -> Result<(bdk_wallet::bitcoin::block::Version, bdk_wallet::bitcoin::BlockHash, usize, usize)> {
-        use bdk_wallet::bitcoin::ScriptBuf;
+        
 
         let indexed_block = self.wallet_node.requester.get_block(block_hash).await
             .map_err(|e| anyhow::anyhow!("Failed to fetch block: {:?}", e))?;

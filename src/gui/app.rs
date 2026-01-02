@@ -56,7 +56,7 @@ impl AmbientApp {
         self.handle_message(message)
     }
 
-    pub fn view(&self) -> Element<Message> {
+    pub fn view(&self) -> Element<'_, Message> {
         self.render_view()
     }
 
@@ -66,7 +66,6 @@ impl AmbientApp {
 
     pub fn subscription(&self) -> iced::Subscription<Message> {
         use std::time::{Duration, Instant};
-        use iced::futures::StreamExt;
 
         // Keyboard subscription - only when a modal is open that needs it
         let keyboard_sub = if self.active_modal.is_some() {
@@ -1715,7 +1714,7 @@ impl AmbientApp {
         }
     }
 
-    fn render_view(&self) -> Element<Message> {
+    fn render_view(&self) -> Element<'_, Message> {
         use widget::{column, container, text, button};
         use iced::Length;
 

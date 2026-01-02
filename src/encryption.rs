@@ -263,7 +263,7 @@ impl EncryptedMemoryDb {
         std::fs::write(temp_file.path(), &decrypted_data)?;
 
         // Open the temporary database and backup to :memory:
-        let mut temp_conn = rusqlite::Connection::open(temp_file.path())?;
+        let temp_conn = rusqlite::Connection::open(temp_file.path())?;
         let mut memory_conn = rusqlite::Connection::open_in_memory()?;
 
         // Use backup API to copy temp DB → memory DB

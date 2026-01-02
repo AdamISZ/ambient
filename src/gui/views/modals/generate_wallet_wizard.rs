@@ -32,7 +32,7 @@ pub fn view(step: &GenerateWalletStep, data: &GenerateWalletData) -> Element<'st
 
 /// Step 1: Enter wallet name
 fn view_enter_name(wallet_name: &str, network: &str) -> Element<'static, Message> {
-    let wallet_name_owned = wallet_name.to_string();
+    let _wallet_name_owned = wallet_name.to_string();
     let network_owned = network.to_string();
 
     column![

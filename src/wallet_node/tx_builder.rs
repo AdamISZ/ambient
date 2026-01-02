@@ -8,7 +8,7 @@ use tracing::info;
 use zeroize::Zeroizing;
 
 use bdk_wallet::{
-    bitcoin::{Address, Amount, FeeRate, Transaction, Txid, psbt::Psbt, hashes::Hash},
+    bitcoin::{Address, Amount, FeeRate, Transaction, Txid, psbt::Psbt},
     KeychainKind,
 };
 use bdk_kyoto::{TxBroadcast, TxBroadcastPolicy};
@@ -367,8 +367,8 @@ impl WalletNode {
             psbt::Psbt, transaction::Version, ScriptBuf, Sequence, TxIn, TxOut,
             OutPoint, Witness, absolute::LockTime,
         };
-        use bdk_wallet::bitcoin::secp256k1::{Secp256k1, SecretKey, Message};
-        use bdk_wallet::bitcoin::sighash::{SighashCache, TapSighashType, Prevouts};
+        use bdk_wallet::bitcoin::secp256k1::{Secp256k1, SecretKey};
+        
         use std::str::FromStr;
 
         // Parse address

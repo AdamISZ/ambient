@@ -13,7 +13,7 @@ use super::{NetworkStatus, ProposalFilter, ProposalNetwork, PublishReceipt};
 use super::serialization::{serialize_proposal_json_pretty, deserialize_proposal_json};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use futures::stream::{self, BoxStream, StreamExt};
+use futures::stream::BoxStream;
 use notify::{Watcher, RecursiveMode, Event, EventKind};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};

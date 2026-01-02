@@ -255,7 +255,7 @@ pub async fn repl(
 
             "peek" => {
                 if let Some(arc) = manager_arc.as_ref() {
-                    let mut mgr = arc.write().await;
+                    let mgr = arc.write().await;
                     let addresses = mgr.peek_addresses(10).await?;
                     for addr in addresses {
                         println!("{}", addr);
@@ -408,7 +408,7 @@ pub async fn repl(
                     match hash_str.parse::<bdk_wallet::bitcoin::BlockHash>() {
                         Ok(block_hash) => {
                             println!("🔍 Fetching block {} via Kyoto P2P...", block_hash);
-                            let mut mgr = arc.write().await;
+                            let mgr = arc.write().await;
                             match mgr.get_block_info(block_hash).await {
                                 Ok((version, prev_blockhash, num_txs, p2tr_count)) => {
                                     println!("✅ Successfully fetched block:");
@@ -517,7 +517,7 @@ pub async fn repl(
 
                     println!("🔍 Finding SNICKER opportunities (candidates: {}-{} sats, block_age: {}, snicker_only={})...",
                              min_candidate_sats, max_candidate_sats, max_block_age, snicker_only);
-                    let mut mgr = arc.write().await;
+                    let mgr = arc.write().await;
                     match mgr.find_snicker_opportunities(min_candidate_sats, max_candidate_sats, max_block_age, snicker_only).await {
                         Ok(found) => {
                             if found.is_empty() {
@@ -555,7 +555,7 @@ pub async fn repl(
 
             "clear_proposals" => {
                 if let Some(arc) = manager_arc.as_ref() {
-                    let mut mgr = arc.write().await;
+                    let mgr = arc.write().await;
                     match mgr.clear_snicker_proposals().await {
                         Ok(count) => println!("✅ Cleared {} proposals", count),
                         Err(e) => println!("❌ Error: {}", e),
@@ -685,7 +685,7 @@ pub async fn repl(
                     // Store delta range for later use in accept_proposal
                     last_scan_delta_range = Some((min_delta, max_delta));
 
-                    let mut mgr = arc.write().await;
+                    let mgr = arc.write().await;
                     match mgr.scan_for_our_proposals((min_delta, max_delta)).await {
                         Ok(found) => {
                             if found.is_empty() {

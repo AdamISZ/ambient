@@ -1,7 +1,7 @@
 //! WalletLoaded main view with tabs
 
 use iced::{Element, Length, Border, Color, Theme};
-use iced::widget::{column, container, text, button, row, text_input, scrollable, Scrollable};
+use iced::widget::{column, container, text, button, row, text_input, scrollable};
 use iced::widget::scrollable::{Direction, Scrollbar};
 use iced::widget::button::Style;
 use std::sync::Arc;
@@ -444,7 +444,7 @@ fn view_automation_section(data: &WalletData) -> Element<'static, Message> {
         AutomationMode::Basic,
         AutomationMode::Advanced,
     ];
-    let mode_label = match data.automation_mode {
+    let _mode_label = match data.automation_mode {
         AutomationMode::Disabled => "Disabled",
         AutomationMode::Basic => "Basic (Auto-accept)",
         AutomationMode::Advanced => "Advanced (Auto-accept + Auto-create)",

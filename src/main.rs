@@ -1,8 +1,6 @@
 // Use modules from the ambient library instead of redeclaring them
 use ambient::{
-    blockchain_data, manager, network, snicker, cli, signer,
-    wallet_node, config, automation, encryption, fee,
-    partial_utxo_set,
+    cli, config,
 };
 
 use anyhow::Result;

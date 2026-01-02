@@ -16,8 +16,8 @@ use super::{NetworkStatus, ProposalFilter, ProposalNetwork, PublishReceipt};
 use super::serialization::{serialize_proposal_json, deserialize_proposal_json};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use futures::stream::{self, BoxStream, StreamExt};
-use nostr_sdk::{Client, Event, EventBuilder, EventId, Filter, Keys, Kind, Tag, TagKind};
+use futures::stream::BoxStream;
+use nostr_sdk::{Client, EventBuilder, Filter, Keys, Kind, Tag, TagKind};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Custom Nostr kind for SNICKER proposals
@@ -29,7 +29,7 @@ pub struct NostrNetwork {
     /// Nostr client for relay communication
     client: Client,
     /// Relay URLs to connect to
-    relay_urls: Vec<String>,
+    _relay_urls: Vec<String>,
     /// Keys for signing events
     keys: Keys,
     /// PoW difficulty for publishing
@@ -59,7 +59,7 @@ impl NostrNetwork {
 
         Ok(Self {
             client,
-            relay_urls,
+            _relay_urls: relay_urls,
             keys,
             pow_difficulty,
         })
@@ -81,7 +81,7 @@ impl NostrNetwork {
 
         Ok(Self {
             client,
-            relay_urls,
+            _relay_urls: relay_urls,
             keys,
             pow_difficulty,
         })
@@ -115,7 +115,7 @@ impl ProposalNetwork for NostrNetwork {
         let tag_hex = hex::encode(&proposal.tag);
 
         // Build event with tags for filtering
-        let mut event_builder = EventBuilder::new(
+        let event_builder = EventBuilder::new(
             Kind::Custom(SNICKER_PROPOSAL_KIND),
             content
         )

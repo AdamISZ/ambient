@@ -10,11 +10,10 @@
 pub mod coin_selection;
 pub mod tx_builder;
 
-pub(crate) use coin_selection::SelectedUtxos;
 
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -31,7 +30,7 @@ use crate::signer::{Signer, InMemorySigner};
 
 use bdk_wallet::{
     PersistedWallet,
-    bitcoin::{Network, Address, Amount, FeeRate, Transaction, Txid, psbt::Psbt, hashes::Hash},
+    bitcoin::{Network, Transaction},
     keys::{
         bip39::{Language, Mnemonic, WordCount},
         DerivableKey, ExtendedKey, GeneratedKey, GeneratableKey,
@@ -42,7 +41,7 @@ use bdk_wallet::{
 };
 
 use bdk_kyoto::builder::{Builder, BuilderExt};
-use bdk_kyoto::{Info, LightClient, Receiver, ScanType, UnboundedReceiver, Warning, TxBroadcast, TxBroadcastPolicy, HeaderCheckpoint};
+use bdk_kyoto::{Info, LightClient, Receiver, ScanType, UnboundedReceiver, Warning, HeaderCheckpoint};
 
 use crate::encryption::WalletEncryption;
 use crate::fee;
@@ -499,7 +498,7 @@ impl WalletNode {
 
         info!("🔍 Wallet load result: {}", if maybe_wallet.is_some() { "Found existing wallet" } else { "No wallet found - will create new" });
 
-        let wallet = if let Some(mut loaded) = maybe_wallet {
+        let wallet = if let Some(loaded) = maybe_wallet {
             info!("✅ Loaded existing wallet from database");
 
             let initial_external_index = loaded.derivation_index(KeychainKind::External).unwrap_or(0);
@@ -1166,7 +1165,6 @@ impl WalletNode {
 
                     // NOTE: SNICKER UTXO spend detection now happens during block scanning
                     // (see SNICKER spend check in partial UTXO set scan loop above)
-                    // The old check_spent_snicker_utxos() method is no longer used.
 
                     // Check for long-pending SNICKER UTXOs and warn
                     if let Err(e) = Self::check_long_pending_snicker_utxos(
@@ -1833,7 +1831,7 @@ impl WalletNode {
         snicker_db: Option<&crate::encryption::EncryptedMemoryDb>,
         wallet_conn: Arc<Mutex<Connection>>,
         requester: &bdk_kyoto::Requester,
-        wallet_name: &str,
+        _wallet_name: &str,
         network: Network,
         external_descriptor: &str,
         internal_descriptor: &str,
@@ -1861,7 +1859,7 @@ impl WalletNode {
         tracing::debug!("🔍 Checking {} pending SNICKER UTXOs", pending.len());
 
         // Query in-memory wallet database for tip height and block hashes
-        let (tip_height, block_hashes) = {
+        let (_tip_height, block_hashes) = {
             let wallet_conn_guard = wallet_conn.lock().await;
 
             let tip_height: u32 = wallet_conn_guard.query_row(
@@ -1970,72 +1968,6 @@ impl WalletNode {
         Ok(())
     }
 
-    /// Check for spent SNICKER UTXOs and mark them as spent (static helper)
-    async fn check_spent_snicker_utxos(
-        snicker_conn: Arc<std::sync::Mutex<Connection>>,
-        snicker_db: Option<&crate::encryption::EncryptedMemoryDb>,
-        wallet_conn: Arc<Mutex<Connection>>,
-    ) -> Result<()> {
-        // Get all unspent SNICKER UTXOs from database
-        // Check both confirmed (block_height IS NOT NULL) and unconfirmed (block_height IS NULL)
-        // because a UTXO can be spent even before it confirms (if used in a new SNICKER proposal)
-        let unspent: Vec<(String, u32)> = {
-            let conn = snicker_conn.lock().unwrap();
-            let mut stmt = conn.prepare(
-                "SELECT txid, vout FROM snicker_utxos WHERE status IN ('unspent', 'pending')"
-            )?;
-            let mut rows = stmt.query([])?;
-            let mut result = Vec::new();
-            while let Some(row) = rows.next()? {
-                result.push((row.get(0)?, row.get(1)?));
-            }
-            result
-        };
-
-        if unspent.is_empty() {
-            return Ok(());
-        }
-
-        tracing::debug!("🔍 Checking {} unspent SNICKER UTXOs for spending", unspent.len());
-
-        // Query in-memory wallet database to check for spending transactions
-        let wallet_conn_guard = wallet_conn.lock().await;
-
-        // Check each UTXO to see if it's been spent by scanning wallet transactions
-        for (txid_str, vout) in unspent {
-            // Query wallet database for any transaction that spends this outpoint
-            let spending_txid: Result<String, _> = wallet_conn_guard.query_row(
-                "SELECT DISTINCT tx.txid FROM bdk_tx tx
-                 INNER JOIN bdk_txin txin ON tx.id = txin.tx_id
-                 WHERE txin.prev_tx = ?1 AND txin.prev_vout = ?2",
-                (&txid_str, vout),
-                |row| row.get(0),
-            );
-
-            if let Ok(spending_txid_str) = spending_txid {
-                tracing::info!("🔍 SNICKER UTXO {}:{} has been spent in {}", txid_str, vout, spending_txid_str);
-
-                // Mark as SPENT in SNICKER database (confirmed in a block)
-                let snicker_update_conn = snicker_conn.lock().unwrap();
-                snicker_update_conn.execute(
-                    "UPDATE snicker_utxos SET status = 'spent', spent_in_txid = ? WHERE txid = ? AND vout = ?",
-                    (spending_txid_str, &txid_str, vout),
-                )?;
-                drop(snicker_update_conn);
-                tracing::info!("✅ Marked SNICKER UTXO {}:{} as SPENT (confirmed)", txid_str, vout);
-            }
-        }
-
-        drop(wallet_conn_guard);
-
-        // Flush to encrypted file after any UTXO changes
-        if let Some(db) = snicker_db {
-            db.flush(&*snicker_conn.lock().unwrap())?;
-        }
-
-        Ok(())
-    }
-
     /// Check for SNICKER UTXOs that have been pending for >24 hours and log warnings
     ///
     /// This only applies to UTXOs we broadcast ourselves (receiver role or manual sends).
@@ -2109,7 +2041,7 @@ impl WalletNode {
                 |row| row.get(0),
             )?
         };
-        let script_pubkey = bdk_wallet::bitcoin::ScriptBuf::from_bytes(script_bytes);
+        let _script_pubkey = bdk_wallet::bitcoin::ScriptBuf::from_bytes(script_bytes);
 
         // NOTE: SNICKER UTXOs are NOT tracked via Kyoto subscriptions.
         // Spend detection happens via block scanning in background_sync, which checks
@@ -2287,7 +2219,7 @@ impl WalletNode {
                 // BIP341: Check if the tweaked public key has odd parity
                 // If so, negate the private key to match the even-parity output key
                 let tweaked_pubkey = tweaked_seckey.public_key(&secp);
-                let tweaked_xonly = XOnlyPublicKey::from(tweaked_pubkey);
+                let _tweaked_xonly = XOnlyPublicKey::from(tweaked_pubkey);
 
                 // Get the parity from the full public key
                 let parity = tweaked_pubkey.serialize()[0];

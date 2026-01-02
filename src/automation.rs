@@ -3,7 +3,6 @@
 //! Provides a background task that periodically scans for and processes
 //! SNICKER proposals based on user configuration.
 
-use anyhow::Result;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
