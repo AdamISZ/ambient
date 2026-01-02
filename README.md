@@ -1,5 +1,7 @@
 # Ambient Wallet
 
+[![CI](https://github.com/AdamISZ/ambient/actions/workflows/ci.yml/badge.svg)](https://github.com/AdamISZ/ambient/actions/workflows/ci.yml)
+
 A light-client Bitcoin wallet that automatically creates coinjoins in the background.
 
 ---
