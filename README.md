@@ -1,6 +1,6 @@
 # Ambient Wallet
 
-A Taproot-only Bitcoin wallet that automatically creates coinjoins in the background.
+A light-client Bitcoin wallet that automatically creates coinjoins in the background.
 
 ---
 
@@ -14,34 +14,48 @@ Do not use with real funds. The protocol, implementation, and APIs are subject t
 
 ---
 
-## Overview
+## What the user needs to know
 
-Ambient is a Bitcoin wallet that implements [SNICKER](https://gist.github.com/AdamISZ/2c13fb5819bd469ca318156e2cf25d79) (Simple Non-Interactive Coinjoin with Keys for Encryption Reused) to provide privacy-enhancing coinjoins without user interaction.
+**The core idea:** Your wallet passively proposes, and receives proposals, for 2-party coinjoins in the background while you use it normally. No manual coinjoin rounds, no coordination servers, no waiting - but also, no promises! (i.e. you don't know if a coinjoin will happen, or not).
 
-**The core idea:** Your wallet passively proposes, and receives proposals, for 2-party coinjoins in the background while you use it normally. No manual coinjoin rounds, no coordination servers, no waiting.
+This is a light client wallet, using compact filters, so you can start it immediately without a full node. But it doesn't have the same security properties, as a full node, either.
+
+Pay attention to the main tradeoff you have to accept for being able to passively coinjoin without any effort or attention: **you must keep the wallet folder, not only the seedphrase**. If you lose the wallet folder (which contains an encrypted dataset), you *can* still recover your funds with just the seedphrase, but it will require using a full node and could be a slow process. So don't!
+
+There are other small quirks: it's taproot only (which isn't a negative), but it's also the case that since your wallet is proposing coinjoins in the background occasionally, you might get a payment conflicted with a coinjoin that happens to occur at the same time; you'll never lose money this way, but a time sensitive payment could be delayed. This will be exceptionally rare and the interface warns you to use a higher fee if it's actually important, but, something to know.
+
+Finally, there are fees to pay for the coinjoins, albeit small ones. Your wallet can both receive and pay for the coinjoin itself, but the net effect over time will be very slightly negative; check the Settings for the restriction on how many sats you're willing to lose per day, week and per individual transaction.
+
+### So what do I get out of these coinjoins?
+
+Not *that* much: any individual coinjoin does very little to make your coins' history more private. SNICKER coinjoins are *not* steganographic (i.e. it's obvious that they are coinjoins), but since they have equal-outputs, they unambiguously *do* increase your "anonymity set" (the crowd you're mixing with). This wallet always *both* proposes *and* receives, which helps a lot: no one can trace your coins through 10 such transactions *just* by assuming your behaviour follows one of those two patterns: your "role" is random. The intention is that **over a long time, with no actual effort from the user except leaving the wallet online, the privacy effect is quite significant**. That's about the best you can achieve here; it's not a tool to anonymize 10 BTC next week.
+
+
+## In more detail
+
+From here, we'll start to discuss more technicalities. Ambient is a Bitcoin wallet that implements [SNICKER](https://gist.github.com/AdamISZ/2c13fb5819bd469ca318156e2cf25d79) (Simple Non-Interactive Coinjoin with Keys for Encryption Reused) to provide privacy-enhancing coinjoins without user interaction.
+
 
 ### How It Works
 
 1. **Proposer** scans the blockchain for potential coinjoin partners
-2. Creates an encrypted proposal and broadcasts it via Nostr relays
-3. **Receiver** discovers proposals meant for them (via Nostr subscription), validates, and signs if acceptable
-4. Completed coinjoin transaction is broadcast to Bitcoin network
-
-**Automation modes:**
-- **Basic**: Automatically accept incoming proposals within delta range
-- **Advanced**: Auto-accept + auto-create proposals (fully autonomous coinjoining)
+2. Creates an encrypted proposal and broadcasts it via Nostr relays (currently planned default, though other networks should be hot-swappable pretty easily)
+3. **Receiver** discovers proposals meant for them (attempt-to-decrypt using a tag is very fast), validates, and signs if acceptable
+4. Completed coinjoin transaction is broadcast by the receiver to Bitcoin network
 
 ### Trustless Validation
 
-Ambient includes a **partial UTXO set** feature that enables trustless validation of incoming proposals:
+Under the hood, Ambient includes a **partial UTXO set** feature that enables trustless validation of incoming proposals:
 
-- **Maintains a filtered UTXO set**: Tracks P2TR outputs ≥ 5000 sats from the last ~1000 blocks
-- **Validates proposer UTXOs**: Verifies that proposer's inputs actually exist and are unspent
+- **Maintains a filtered UTXO set**: Tracks P2TR outputs ≥ 5000 sats from 1000 blocks before wallet creation, forwards
+- **Validates proposer UTXOs**: Verifies that proposer's inputs actually exist and are unspent (so they can't be more than 1000 blocks older than the receiver wallet's birthday)
 - **Prevents spam attacks**: Rejects proposals with fake or spent UTXOs without external API calls
-- **Privacy-preserving**: Downloads all blocks (like a full node) but stores only filtered UTXOs (~60 MB)
+- **Privacy-preserving**: Downloads all blocks *from its creation* (not from genesis) but stores only filtered UTXOs (~60 MB)
 - **Automatic maintenance**: Updates in real-time as new blocks arrive, self-prunes old data
 
-This "lobotomized full node" approach provides the security of full validation with the lightweight storage of an SPV client.
+This "lobotomized full node" approach provides a lot of the security of full validation with the lightweight storage of an SPV client. "A lot" : of course, this is more an SPV model of security inasmuch as you cannot validate locally using only a "slice" of the full utxo set.
+
+You're forgiven for being a bit confused by this model. Are we doing BIP157 compact block filters or not? The answer is Ambient is a dual wallet: for the non-SNICKER utxos we just use a very vanilla BDK wallet that happens to be taproot, hooked up to the blockchain using the light client model of Kyoto. But that doesn't work for the customized SNICKER outputs from the coinjoins; for that we need our own infrastructure for tracking, and the partial UTXO set described above, serves that role.
 
 See [`docs/AMBIENT_UTXO_MANAGEMENT.md`](docs/AMBIENT_UTXO_MANAGEMENT.md) for the complete design.
 
@@ -51,28 +65,29 @@ See [`docs/AMBIENT_UTXO_MANAGEMENT.md`](docs/AMBIENT_UTXO_MANAGEMENT.md) for the
 - **Encrypted proposals**: Proposals are encrypted to the receiver's public key for privacy (+)
 - **Trustless validation**: Maintains a partial UTXO set to validate proposer UTXOs without external services
 - **Encrypted storage**: All wallet data encrypted at rest with ChaCha20-Poly1305 and Argon2id key derivation
-- **In-memory security**: Databases decrypted only in RAM, never written to disk as plaintext
+- **In-memory security**: Databases decrypted only in RAM, never written to disk as plaintext (++)
 - **Recoverable from seed**: Uses deterministic tweaks (proposer's input key) enabling full wallet recovery from seed phrase alone
-- **Taproot-only**: [BIP86](#bip86-key-derivation) keypath spending for efficiency and privacy (++)
+- **Taproot-only**: [BIP86](#bip86-key-derivation) keypath spending for efficiency and privacy (+++)
 - **Light client**: Uses compact block filters (BIP157) via Kyoto - no need to run a full node
 - **GUI & CLI**: Desktop GUI (Linux) and command-line interface
 
 (+) - The encryption is done with ChaCha20-Poly1305 stream ciphering, much better than the original CBC proposal in the [SNICKER](#snicker-bip-draft) gist.
 
+(++) - In-RAM security is a work in progress: much harder than for a normal wallet, because there is hot-signing involved in making and accepting proposals for coinjoins passively without user interaction. This is a similar challenge to that of Lightning; in itself it fundamentally means that secret material must be sitting in memory. However, we can change this model via the Signer trait, to allow e.g. a policy-based hardware wallet signing process, in a future update.
+
 (++) - The original description of [SNICKER](#snicker-bip-draft) addressed the limitations of needing to know the public key of the recipient in various ways, but by restricting ourselves to the taproot coin set we completely avoid this issue - the public keys are all known.
 
 ---
 
-## Technologies
+## Supporting technologies
 
-- **[Rust](https://www.rust-lang.org/)** - Systems programming language
+- Rust
 - **[BDK (Bitcoin Dev Kit)](https://bitcoindevkit.org/)** - Bitcoin wallet library
 - **[Kyoto](https://github.com/rustaceanrob/kyoto)** - Compact block filter light client (BIP157/158)
 - **[Iced](https://github.com/iced-rs/iced)** - Cross-platform GUI framework
-- **[Nostr](https://github.com/rust-nostr/nostr)** - Decentralized proposal broadcast/discovery network
-- **Taproot ([BIP341](#bip341-taproot))** - Modern Bitcoin scripting with keypath spending
+- **[Nostr](https://github.com/rust-nostr/nostr)**
+- **Taproot ([BIP341](#bip341-taproot))** - needed for non-interactive proposal against keys onchain
 - **[BIP86](#bip86-key-derivation)** - Deterministic key derivation for Taproot
-- **[SNICKER](#snicker-bip-draft)** - Non-interactive coinjoin protocol
 - **ChaCha20-Poly1305** - Authenticated encryption (AEAD) for wallet files
 - **Argon2id** - Memory-hard key derivation function
 
@@ -81,31 +96,27 @@ See [`docs/AMBIENT_UTXO_MANAGEMENT.md`](docs/AMBIENT_UTXO_MANAGEMENT.md) for the
 ## Project Status
 
 **Current state:**
-- ✅ Basic Taproot wallet functionality (send, receive, balance)
+- ✅ Basic Taproot wallet functionality (send, send all, receive, balance)
 - ✅ [SNICKER](#snicker-bip-draft) protocol implementation (propose, receive, validate)
 - ✅ Encrypted proposal system
 - ✅ Encrypted wallet storage (ChaCha20-Poly1305 + Argon2id)
 - ✅ In-memory database security (no plaintext on disk)
-- ✅ Recoverable tweaked outputs
+- ✅ Recoverable tweaked outputs - (but recover method is *not* yet done!)
 - ✅ Light client sync via Kyoto (BIP157/158)
 - ✅ Partial UTXO set for trustless proposer validation
 - ✅ Nostr network integration (proposal broadcast/discovery)
-- ✅ Automation modes (Basic: auto-accept, Advanced: auto-accept + auto-create)
 - ✅ SNICKER UTXO tracking and management
 - ✅ GUI interface (Iced framework)
 - ✅ Real-time wallet status updates
 - ✅ End-to-end integration tests
+- ✅ "Send All" function for emptying wallet
+- ✅ Customized UTXO selection (prefer single SNICKER UTXO, warn on multiple)
 
 **In Progress / TODO:**
-- [ ] "Send All" function for emptying wallet
-- [ ] Improved UTXO selection (prefer single SNICKER UTXO, warn on multiple)
-- [ ] Enhanced status bar (permanent, network status, INFO logs)
-- [ ] Standard OS file picker integration
-- [ ] Fallback validation mode for UTXOs outside scan window
-- [ ] Fee estimation improvements
+
 - [ ] Password change functionality
-- [ ] Private key memory zeroization
-- [ ] Comprehensive testing on signet/mainnet
+- [ ] Recovery method including Snicker discovery, using a Core instance
+- [ ] a ton of other stuff, will update this list later
 
 ---
 
