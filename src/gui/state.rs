@@ -47,6 +47,8 @@ pub enum WalletTab {
 pub struct WalletData {
     pub current_tab: WalletTab,
     pub balance: Amount,
+    pub pending_outgoing: u64, // Pending outgoing sats (broadcast but unconfirmed)
+    pub pending_incoming: u64, // Pending incoming SNICKER sats (broadcast but unconfirmed)
     pub last_address: Option<String>,
     pub is_syncing: bool,
     pub status_message: Option<String>,
@@ -89,6 +91,8 @@ impl Default for WalletData {
         Self {
             current_tab: WalletTab::Overview,
             balance: Amount::ZERO,
+            pending_outgoing: 0,
+            pending_incoming: 0,
             last_address: None,
             is_syncing: false,
             status_message: None,

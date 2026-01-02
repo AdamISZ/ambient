@@ -932,7 +932,7 @@ impl AmbientApp {
                         async move {
                             rt_handle.spawn(async move {
                                 let manager = manager_clone.read().await;
-                                manager.list_unspent().await
+                                manager.list_unspent_with_status().await
                             }).await.unwrap()
                         },
                         |utxos_result| {
@@ -945,6 +945,8 @@ impl AmbientApp {
                             };
                             Message::WalletDataUpdated {
                                 balance: None, // Balance already updated
+                                pending_outgoing: 0, // Will be fetched on next full sync
+                                pending_incoming: 0,
                                 utxos,
                             }
                         }
@@ -972,43 +974,33 @@ impl AmbientApp {
                         async move {
                             rt_handle.spawn(async move {
                                 let manager = manager_clone.read().await;
-                                let balance = manager.get_balance().await;
-                                let utxos = manager.list_unspent().await;
-                                (balance, utxos)
+                                let balance_breakdown = manager.get_balance_breakdown().await;
+                                let utxos = manager.list_unspent_with_status().await;
+                                (balance_breakdown, utxos)
                             }).await.unwrap()
                         },
                         |(balance_result, utxos_result)| {
-                            // Parse balance
-                            let balance = match balance_result {
-                                Ok(balance_str) => {
-                                    if let Some(sats_part) = balance_str.split_whitespace().next() {
-                                        if let Ok(sats) = sats_part.parse::<u64>() {
-                                            Some(bdk_wallet::bitcoin::Amount::from_sat(sats))
-                                        } else {
-                                            eprintln!("❌ Failed to parse balance: {}", balance_str);
-                                            None
-                                        }
-                                    } else {
-                                        eprintln!("❌ Invalid balance format: {}", balance_str);
-                                        None
-                                    }
+                            // Parse balance breakdown (confirmed, pending_out, pending_in)
+                            let (balance, pending_outgoing, pending_incoming) = match balance_result {
+                                Ok((confirmed, pending_out, pending_in)) => {
+                                    (Some(bdk_wallet::bitcoin::Amount::from_sat(confirmed)), pending_out, pending_in)
                                 }
                                 Err(e) => {
-                                    eprintln!("❌ Failed to fetch balance: {}", e);
-                                    None
+                                    eprintln!("Failed to fetch balance: {}", e);
+                                    (None, 0, 0)
                                 }
                             };
 
-                            // Get UTXOs
+                            // Get UTXOs with status
                             let utxos = match utxos_result {
                                 Ok(list) => list,
                                 Err(e) => {
-                                    eprintln!("❌ Failed to fetch UTXOs: {}", e);
+                                    eprintln!("Failed to fetch UTXOs: {}", e);
                                     Vec::new()
                                 }
                             };
 
-                            Message::WalletDataUpdated { balance, utxos }
+                            Message::WalletDataUpdated { balance, pending_outgoing, pending_incoming, utxos }
                         }
                     );
                 }
@@ -1028,16 +1020,20 @@ impl AmbientApp {
                 Task::none()
             }
 
-            Message::WalletDataUpdated { balance, utxos } => {
-                // Update balance and UTXOs together
+            Message::WalletDataUpdated { balance, pending_outgoing, pending_incoming, utxos } => {
+                // Update balance, pending info, and UTXOs together
                 if let AppState::WalletLoaded { wallet_data, .. } = &mut self.state {
                     // Update balance if provided
                     if let Some(amount) = balance {
                         if wallet_data.balance != amount {
-                            println!("💰 Balance updated: {} → {}", wallet_data.balance, amount);
+                            println!("Balance updated: {} -> {}", wallet_data.balance, amount);
                         }
                         wallet_data.balance = amount;
                     }
+
+                    // Update pending amounts
+                    wallet_data.pending_outgoing = pending_outgoing;
+                    wallet_data.pending_incoming = pending_incoming;
 
                     // Update UTXOs
                     wallet_data.utxos = utxos;

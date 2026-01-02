@@ -60,6 +60,8 @@ pub enum Message {
     BalanceUpdated(Amount),
     WalletDataUpdated {
         balance: Option<Amount>,
+        pending_outgoing: u64,
+        pending_incoming: u64,
         utxos: Vec<String>,
     },
 

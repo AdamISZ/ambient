@@ -813,7 +813,38 @@ impl WalletNode {
 
                     let height = wallet_guard.local_chain().tip().height();
                     let regular_balance = wallet_guard.balance().total().to_sat();
-                    info!("✅ Auto-sync: updated to height {height}");
+                    info!("Auto-sync: updated to height {height}");
+
+                    // Check for confirmed pending transactions and remove them from tracking
+                    {
+                        let snicker_conn_guard = snicker_conn.lock().unwrap();
+                        let pending_txids = crate::snicker::Snicker::get_pending_txids_raw(&snicker_conn_guard);
+                        for pending_txid in pending_txids {
+                            // Check if this transaction is now confirmed in the wallet
+                            if let Ok(txid) = pending_txid.parse::<bdk_wallet::bitcoin::Txid>() {
+                                // Check if transaction exists in wallet and has confirmation info
+                                // get_tx returns Some if the tx is tracked, and we check chain_position for confirmation
+                                let is_confirmed = wallet_guard.get_tx(txid)
+                                    .map(|canonical_tx| {
+                                        // If chain_position is ChainPosition::Confirmed, it's in a block
+                                        matches!(canonical_tx.chain_position, bdk_wallet::chain::ChainPosition::Confirmed { .. })
+                                    })
+                                    .unwrap_or(false);
+
+                                if is_confirmed {
+                                    if let Err(e) = crate::snicker::Snicker::remove_confirmed_transaction_raw(&snicker_conn_guard, &pending_txid) {
+                                        tracing::error!("Failed to remove confirmed tx {} from pending: {}", pending_txid, e);
+                                    } else {
+                                        tracing::info!("Pending transaction {} confirmed", pending_txid);
+                                    }
+                                }
+                            }
+                        }
+                        // Flush to persist changes
+                        if let Err(e) = snicker_db.flush(&*snicker_conn_guard) {
+                            tracing::error!("Failed to flush snicker db after pending check: {}", e);
+                        }
+                    }
 
                     // Release wallet lock before checking SNICKER UTXOs
                     drop(wallet_guard);
@@ -994,10 +1025,34 @@ impl WalletNode {
                                 }
 
                                 // Scan block for partial UTXO set
-                                if let Err(e) = utxo_set.scan_block(scan_height, &indexed_block.block) {
-                                    tracing::error!("Failed to scan block {} for partial UTXO set: {}",
-                                                   scan_height, e);
-                                    continue;
+                                match utxo_set.scan_block(scan_height, &indexed_block.block) {
+                                    Ok(spent_outpoints) => {
+                                        // Clean up proposal pairings for any spent UTXOs
+                                        // (both target UTXOs and our own UTXOs)
+                                        if !spent_outpoints.is_empty() {
+                                            let conn = snicker_conn.lock().unwrap();
+                                            for outpoint in &spent_outpoints {
+                                                let txid_str = outpoint.txid.to_string();
+                                                // Delete pairings where this was the target
+                                                crate::snicker::Snicker::delete_pairings_for_target(
+                                                    &conn, &txid_str, outpoint.vout
+                                                );
+                                                // Delete pairings where this was our UTXO
+                                                crate::snicker::Snicker::delete_pairings_for_our_utxo(
+                                                    &conn, &txid_str, outpoint.vout
+                                                );
+                                            }
+                                            // Flush after pairing cleanup
+                                            if let Err(e) = snicker_db.flush(&*conn) {
+                                                tracing::error!("Failed to flush SNICKER database after pairing cleanup: {}", e);
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("Failed to scan block {} for partial UTXO set: {}",
+                                                       scan_height, e);
+                                        continue;
+                                    }
                                 }
 
                                 blocks_scanned += 1;
@@ -1295,6 +1350,135 @@ impl WalletNode {
             |row| row.get(0),
         ).unwrap_or(None);
         Ok(balance.unwrap_or(0) as u64)
+    }
+
+    /// Get detailed balance breakdown including pending amounts
+    /// Returns: (confirmed_sats, pending_outgoing_sats, pending_incoming_snicker_sats)
+    pub async fn get_balance_breakdown(&self) -> Result<(u64, u64, u64)> {
+        let wallet = self.wallet.lock().await;
+        let regular_balance = wallet.balance().total().to_sat();
+        drop(wallet);
+
+        let snicker_balance = self.get_snicker_balance_sats().await?;
+        let confirmed = regular_balance + snicker_balance;
+
+        let conn = self.snicker_conn.lock().unwrap();
+
+        // Pending outgoing: sum of all inputs in pending transactions
+        let pending_outgoing: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(amount_sats), 0) FROM pending_inputs",
+            [],
+            |row| row.get(0),
+        ).unwrap_or(0);
+
+        // Pending incoming SNICKER: UTXOs with block_height IS NULL (broadcast but unconfirmed)
+        let pending_incoming_snicker: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(amount), 0) FROM snicker_utxos WHERE block_height IS NULL AND status = 'unspent'",
+            [],
+            |row| row.get(0),
+        ).unwrap_or(0);
+
+        Ok((confirmed, pending_outgoing as u64, pending_incoming_snicker as u64))
+    }
+
+    /// Get balance as formatted string with pending info
+    pub async fn get_balance_with_pending(&self) -> Result<String> {
+        let (confirmed, pending_out, pending_in) = self.get_balance_breakdown().await?;
+
+        if pending_out == 0 && pending_in == 0 {
+            Ok(format!("{} sats", confirmed))
+        } else {
+            let mut parts = vec![format!("Confirmed: {} sats", confirmed)];
+            if pending_out > 0 {
+                parts.push(format!("Pending out: -{} sats", pending_out));
+            }
+            if pending_in > 0 {
+                parts.push(format!("Pending in: +{} sats", pending_in));
+            }
+            Ok(parts.join(" | "))
+        }
+    }
+
+    /// List unspent outputs with pending status markers
+    pub async fn list_unspent_with_status(&self) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+
+        // Get pending spent outpoints and proposal pairings
+        let (pending_spent, proposal_outpoints): (Vec<(String, u32)>, Vec<(String, u32)>) = {
+            let conn = self.snicker_conn.lock().unwrap();
+
+            // Pending spent outpoints
+            let mut pending = Vec::new();
+            if let Ok(mut stmt) = conn.prepare("SELECT spent_txid, spent_vout FROM pending_inputs") {
+                if let Ok(mut rows) = stmt.query([]) {
+                    while let Ok(Some(row)) = rows.next() {
+                        if let (Ok(txid), Ok(vout)) = (row.get::<_, String>(0), row.get::<_, u32>(1)) {
+                            pending.push((txid, vout));
+                        }
+                    }
+                }
+            }
+
+            // UTXOs with live proposals (our_txid, our_vout from proposal_pairings)
+            let mut proposals = Vec::new();
+            if let Ok(mut stmt) = conn.prepare("SELECT DISTINCT our_txid, our_vout FROM proposal_pairings") {
+                if let Ok(mut rows) = stmt.query([]) {
+                    while let Ok(Some(row)) = rows.next() {
+                        if let (Ok(txid), Ok(vout)) = (row.get::<_, String>(0), row.get::<_, u32>(1)) {
+                            proposals.push((txid, vout));
+                        }
+                    }
+                }
+            }
+
+            (pending, proposals)
+        };
+
+        // Regular UTXOs from BDK wallet
+        let wallet = self.wallet.lock().await;
+        for utxo in wallet.list_unspent() {
+            let txid_str = utxo.outpoint.txid.to_string();
+            let is_pending = pending_spent.iter().any(|(t, v)| t == &txid_str && *v == utxo.outpoint.vout);
+            let has_proposal = proposal_outpoints.iter().any(|(t, v)| t == &txid_str && *v == utxo.outpoint.vout);
+
+            let mut status_parts = Vec::new();
+            if has_proposal { status_parts.push("[PROPOSED]"); }
+            if is_pending { status_parts.push("[PENDING]"); }
+            let status = if status_parts.is_empty() { String::new() } else { format!(" {}", status_parts.join(" ")) };
+
+            out.push(format!("{}:{} ({} sats){}", txid_str, utxo.outpoint.vout, utxo.txout.value.to_sat(), status));
+        }
+        drop(wallet);
+
+        // SNICKER UTXOs
+        let conn = self.snicker_conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT txid, vout, amount, block_height, status FROM snicker_utxos WHERE status IN ('unspent', 'pending')"
+        )?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let txid: String = row.get(0)?;
+            let vout: u32 = row.get(1)?;
+            let amount: i64 = row.get(2)?;
+            let block_height: Option<u32> = row.get(3)?;
+            let status: String = row.get(4)?;
+
+            let has_proposal = proposal_outpoints.iter().any(|(t, v)| t == &txid && *v == vout);
+
+            // Determine display status
+            let mut status_parts = Vec::new();
+            status_parts.push("[SNICKER]");
+            if has_proposal { status_parts.push("[PROPOSED]"); }
+            if status == "pending" {
+                status_parts.push("[PENDING SPEND]");
+            } else if block_height.is_none() {
+                status_parts.push("[PENDING CONFIRM]");
+            }
+
+            out.push(format!("{}:{} ({} sats) {}", txid, vout, amount, status_parts.join(" ")));
+        }
+
+        Ok(out)
     }
 
     /// Get next address and persist derivation index.

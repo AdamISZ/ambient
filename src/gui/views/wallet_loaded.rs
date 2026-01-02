@@ -224,12 +224,28 @@ fn menu_button(label: &str, message: Message) -> Element<'static, Message> {
 fn view_overview(wallet_name: &str, data: &WalletData) -> Element<'static, Message> {
     let wallet_name = wallet_name.to_string();
     let balance = data.balance;
+    let pending_out = data.pending_outgoing;
+    let pending_in = data.pending_incoming;
     let sync_status = if data.is_syncing {
         "Syncing..."
     } else {
         "Synced"
     };
     let utxos = data.utxos.clone();
+
+    // Build pending info string
+    let pending_info = if pending_out > 0 || pending_in > 0 {
+        let mut parts = Vec::new();
+        if pending_out > 0 {
+            parts.push(format!("-{} sats", pending_out));
+        }
+        if pending_in > 0 {
+            parts.push(format!("+{} sats", pending_in));
+        }
+        format!("Pending: {}", parts.join(" | "))
+    } else {
+        String::new()
+    };
 
     column![
         container(
@@ -240,15 +256,22 @@ fn view_overview(wallet_name: &str, data: &WalletData) -> Element<'static, Messa
                 ].spacing(10),
 
                 row![
-                    text("Balance:").size(24),
+                    text("Confirmed:").size(24),
                     text(format!("{}", balance)).size(24),
                 ].spacing(10),
+
+                // Show pending info if any
+                if !pending_info.is_empty() {
+                    text(pending_info).size(16)
+                } else {
+                    text("").size(1)
+                },
 
                 row![
                     text("Status:").size(16),
                     text(sync_status).size(16),
                 ].spacing(10),
-            ].spacing(20)
+            ].spacing(15)
         )
         .padding(20),
 

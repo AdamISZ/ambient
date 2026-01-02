@@ -121,6 +121,21 @@ impl Manager {
         self.wallet_node.get_balance().await
     }
 
+    /// Get balance with pending info as formatted string
+    pub async fn get_balance_with_pending(&self) -> Result<String> {
+        self.wallet_node.get_balance_with_pending().await
+    }
+
+    /// Get detailed balance breakdown: (confirmed, pending_out, pending_in)
+    pub async fn get_balance_breakdown(&self) -> Result<(u64, u64, u64)> {
+        self.wallet_node.get_balance_breakdown().await
+    }
+
+    /// List unspent outputs with pending status markers
+    pub async fn list_unspent_with_status(&self) -> Result<Vec<String>> {
+        self.wallet_node.list_unspent_with_status().await
+    }
+
     /// Get next receiving address
     pub async fn get_next_address(&mut self) -> Result<String> {
         self.wallet_node.get_next_address().await
@@ -309,7 +324,55 @@ impl Manager {
         snicker_only: bool,
     ) -> Result<Vec<ProposalOpportunity>> {
         // Get all our UTXOs (both regular wallet and SNICKER UTXOs)
-        let our_utxos = self.wallet_node.get_all_wallet_utxos().await?;
+        let all_utxos = self.wallet_node.get_all_wallet_utxos().await?;
+        let total_utxo_count = all_utxos.len();
+
+        // Get tip height and max age config for filtering
+        let tip_height = {
+            let wallet = self.wallet_node.wallet.lock().await;
+            wallet.local_chain().tip().height()
+        };
+        let config = crate::config::Config::load()?;
+        let max_utxo_age = config.partial_utxo_set.max_utxo_age_delta_blocks;
+
+        // Filter to only UTXOs that:
+        // 1. Exist in partial_utxo_set and are unspent
+        // 2. Are young enough for receivers to validate (within max_utxo_age_delta_blocks)
+        let partial_utxo_set = self.wallet_node.partial_utxo_set.lock().await;
+        let our_utxos: Vec<_> = all_utxos
+            .into_iter()
+            .filter(|utxo| {
+                match partial_utxo_set.get(&utxo.outpoint()) {
+                    Ok(Some(partial)) if partial.status == crate::partial_utxo_set::UtxoStatus::Unspent => {
+                        let age = tip_height.saturating_sub(partial.block_height);
+                        if age <= max_utxo_age {
+                            true
+                        } else {
+                            tracing::debug!(
+                                "Skipping UTXO {}:{} - too old ({} blocks, max {})",
+                                utxo.outpoint().txid, utxo.outpoint().vout, age, max_utxo_age
+                            );
+                            false
+                        }
+                    }
+                    _ => {
+                        tracing::debug!(
+                            "Skipping UTXO {}:{} - not in partial_utxo_set or not unspent",
+                            utxo.outpoint().txid, utxo.outpoint().vout
+                        );
+                        false
+                    }
+                }
+            })
+            .collect();
+        drop(partial_utxo_set);
+
+        if our_utxos.is_empty() && total_utxo_count > 0 {
+            tracing::info!(
+                "All {} wallet UTXOs filtered out - none within {} blocks of tip",
+                total_utxo_count, max_utxo_age
+            );
+        }
 
         // Query candidates from partial_utxo_set (unspent P2TR UTXOs in size range)
         let candidates = self.get_snicker_candidates(min_candidate_sats, max_candidate_sats, max_block_age, snicker_only).await?;
@@ -434,9 +497,6 @@ impl Manager {
                 tracing::info!("✅ Signed regular input {} with tweaked privkey", our_input_idx);
             }
 
-            // Note: We only sign OUR input (the proposer's input)
-            // The other input belongs to the receiver and will be signed by them
-
             Ok(())
         };
 
@@ -470,6 +530,12 @@ impl Manager {
             &target_utxo_str,
             delta_sats,
         ).await?;
+
+        // Record the pairing for tracking "at risk" UTXOs
+        self.snicker.record_proposal_pairing(
+            &opportunity.our_outpoint,
+            &opportunity.target_outpoint,
+        )?;
 
         Ok((proposal, encrypted_proposal))
     }
@@ -970,11 +1036,33 @@ impl Manager {
         self.store_accepted_snicker_utxo(&proposal, &tx, &our_utxos).await?;
         println!("📋 SNICKER UTXO tracked (will be detected during sync)");
 
-        println!("🔍 Step 7: Broadcasting transaction...");
+        println!("Step 7: Broadcasting transaction...");
         // Broadcast the transaction
         let txid = self.broadcast_transaction(tx.clone()).await?;
 
-        println!("🔍 Step 8: Marking pending SNICKER UTXO...");
+        // Store pending transaction for tracking (confirmed vs pending balance)
+        // Gather input amounts from proposer UTXO and our UTXOs
+        let inputs: Vec<(String, u32, u64)> = tx.input.iter().filter_map(|input| {
+            let outpoint = input.previous_output;
+            // Check if it's the proposer's UTXO
+            if outpoint == proposer_outpoint {
+                return Some((outpoint.txid.to_string(), outpoint.vout, proposer_value));
+            }
+            // Check if it's one of our UTXOs
+            if let Some(utxo) = our_utxos.iter().find(|u| u.outpoint() == outpoint) {
+                return Some((outpoint.txid.to_string(), outpoint.vout, utxo.value().to_sat()));
+            }
+            None
+        }).collect();
+        let total_output_sats: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
+        self.snicker.store_pending_transaction(
+            &txid.to_string(),
+            &inputs,
+            total_output_sats,
+        )?;
+        tracing::info!("Tracking pending SNICKER transaction {} with {} inputs", txid, inputs.len());
+
+        println!("Step 8: Marking pending SNICKER UTXO...");
         // Mark the input SNICKER UTXO as pending (broadcast but not confirmed)
         // Spend detection happens via block scanning (see wallet_node::background_sync)
         for input in &tx.input {

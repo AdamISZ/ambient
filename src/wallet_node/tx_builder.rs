@@ -224,8 +224,38 @@ impl WalletNode {
         let txid = tx.compute_txid();
 
         // Broadcast transaction
-        info!("📡 Broadcasting transaction...");
-        self.broadcast_transaction(tx).await?;
+        info!("Broadcasting transaction...");
+        self.broadcast_transaction(tx.clone()).await?;
+
+        // Store pending transaction for tracking (confirmed vs pending balance)
+        let inputs: Vec<(String, u32, u64)> = {
+            let mut inputs = Vec::new();
+            // Add SNICKER inputs
+            for (txid_str, vout, amount, _, _) in &selected.snicker_utxos {
+                inputs.push((txid_str.clone(), *vout, *amount));
+            }
+            // Add regular inputs
+            for utxo in &selected.regular_utxos {
+                inputs.push((
+                    utxo.outpoint.txid.to_string(),
+                    utxo.outpoint.vout,
+                    utxo.txout.value.to_sat(),
+                ));
+            }
+            inputs
+        };
+        let total_output_sats: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
+        {
+            let snicker_conn = self.snicker_conn.lock().unwrap();
+            // Use the Snicker methods directly on the connection
+            crate::snicker::Snicker::store_pending_transaction_raw(
+                &snicker_conn,
+                &txid.to_string(),
+                &inputs,
+                total_output_sats,
+            )?;
+        }
+        info!("Tracking pending transaction {} with {} inputs", txid, inputs.len());
 
         // Update database state after successful broadcast
         // Mark SNICKER UTXOs as PENDING (not spent yet - waiting for confirmation)
@@ -238,7 +268,7 @@ impl WalletNode {
                     &txid.to_string(),
                 ).await?;
             }
-            info!("📝 Marked {} SNICKER UTXOs as pending (awaiting confirmation)", selected.snicker_utxos.len());
+            info!("Marked {} SNICKER UTXOs as pending (awaiting confirmation)", selected.snicker_utxos.len());
         }
 
         // Persist wallet state (for regular UTXO tracking)
@@ -250,7 +280,7 @@ impl WalletNode {
             drop(wallet);
         }
 
-        info!("✅ Transaction broadcast successful");
+        info!("Transaction broadcast successful");
         Ok(txid)
     }
 

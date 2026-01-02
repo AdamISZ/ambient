@@ -160,9 +160,11 @@ impl PartialUtxoSet {
     /// This processes both spends (inputs) and creations (outputs):
     /// 1. Mark any existing UTXOs in our set as spent (process inputs)
     /// 2. Add new P2TR UTXOs >= min_amount (process outputs)
-    pub fn scan_block(&mut self, height: u32, block: &Block) -> Result<()> {
+    ///
+    /// Returns: Vector of outpoints that were marked as spent (for cleanup of proposal pairings)
+    pub fn scan_block(&mut self, height: u32, block: &Block) -> Result<Vec<OutPoint>> {
         let mut utxos_added = 0;
-        let mut utxos_spent = 0;
+        let mut spent_outpoints = Vec::new();
 
         for tx in &block.txdata {
             let txid = tx.compute_txid();
@@ -174,7 +176,7 @@ impl PartialUtxoSet {
                 let outpoint = input.previous_output;
                 if self.exists(&outpoint)? {
                     self.mark_spent(outpoint, txid, height)?;
-                    utxos_spent += 1;
+                    spent_outpoints.push(outpoint);
                 }
             }
 
@@ -237,14 +239,14 @@ impl PartialUtxoSet {
             }
         }
 
-        if utxos_added > 0 || utxos_spent > 0 {
+        if utxos_added > 0 || !spent_outpoints.is_empty() {
             tracing::debug!(
                 "Block {}: +{} UTXOs, -{} spends",
-                height, utxos_added, utxos_spent
+                height, utxos_added, spent_outpoints.len()
             );
         }
 
-        Ok(())
+        Ok(spent_outpoints)
     }
 
     /// Insert a UTXO into the partial set

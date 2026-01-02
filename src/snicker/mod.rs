@@ -65,7 +65,7 @@ impl ProposalFlags {
     /// No flags set (current default)
     pub const NONE: u32 = 0x00000000;
 
-    // Reserved for future features:
+    // (Imaginary examples!) Reserved for future features:
     // pub const FEATURE_RBF: u32           = 0x00000001; // Opt-in RBF
     // pub const FEATURE_TAPROOT_ONLY: u32  = 0x00000002; // All inputs are Taproot
     // pub const FEATURE_BATCH: u32         = 0x00000004; // Part of batch proposal
@@ -935,6 +935,8 @@ impl Snicker {
         Self::init_decrypted_proposals_table(conn)?;
         Self::init_snicker_utxos_table(conn)?;
         Self::init_automation_log_table(conn)?;
+        Self::init_pending_transactions_table(conn)?;
+        Self::init_proposal_pairings_table(conn)?;
         Ok(())
     }
 
@@ -1061,6 +1063,67 @@ impl Snicker {
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_automation_log_action
              ON automation_log(action_type, timestamp)",
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// Initialize the pending transactions table for tracking broadcast-but-unconfirmed txs
+    fn init_pending_transactions_table(conn: &mut Connection) -> Result<()> {
+        // Track pending transactions (broadcast but not confirmed)
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS pending_transactions (
+                txid TEXT PRIMARY KEY,
+                broadcast_time INTEGER NOT NULL,
+                total_input_sats INTEGER NOT NULL,
+                total_output_sats INTEGER NOT NULL,
+                fee_sats INTEGER NOT NULL
+            )",
+            [],
+        )?;
+        // Track which outpoints are spent by pending transactions
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS pending_inputs (
+                spending_txid TEXT NOT NULL,
+                spent_txid TEXT NOT NULL,
+                spent_vout INTEGER NOT NULL,
+                amount_sats INTEGER NOT NULL,
+                PRIMARY KEY (spent_txid, spent_vout),
+                FOREIGN KEY (spending_txid) REFERENCES pending_transactions(txid) ON DELETE CASCADE
+            )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_pending_inputs_spending_txid
+             ON pending_inputs(spending_txid)",
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// Initialize the proposal pairings table for tracking which UTXOs have live proposals
+    fn init_proposal_pairings_table(conn: &mut Connection) -> Result<()> {
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS proposal_pairings (
+                our_txid TEXT NOT NULL,
+                our_vout INTEGER NOT NULL,
+                target_txid TEXT NOT NULL,
+                target_vout INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (our_txid, our_vout, target_txid, target_vout)
+            )",
+            [],
+        )?;
+        // Index for cleanup when target is spent
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_proposal_pairings_target
+             ON proposal_pairings(target_txid, target_vout)",
+            [],
+        )?;
+        // Index for querying by our outpoint
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_proposal_pairings_our
+             ON proposal_pairings(our_txid, our_vout)",
             [],
         )?;
         Ok(())
@@ -1503,8 +1566,260 @@ impl Snicker {
             (spent_in_txid.to_string(), txid.to_string(), vout),
         )?;
 
-        tracing::info!("✅ Marked SNICKER UTXO {}:{} as SPENT (confirmed) in {}", txid, vout, spent_in_txid);
+        tracing::info!("Marked SNICKER UTXO {}:{} as SPENT (confirmed) in {}", txid, vout, spent_in_txid);
         Ok(())
+    }
+
+    // ============================================================
+    // PENDING TRANSACTION TRACKING
+    // ============================================================
+
+    /// Store a pending transaction after broadcast (for tracking unconfirmed state)
+    pub fn store_pending_transaction(
+        &self,
+        txid: &str,
+        inputs: &[(String, u32, u64)], // (txid, vout, amount_sats)
+        total_output_sats: u64,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        Self::store_pending_transaction_raw(&conn, txid, inputs, total_output_sats)
+    }
+
+    /// Store a pending transaction (raw connection version for use without Snicker instance)
+    pub fn store_pending_transaction_raw(
+        conn: &Connection,
+        txid: &str,
+        inputs: &[(String, u32, u64)], // (txid, vout, amount_sats)
+        total_output_sats: u64,
+    ) -> Result<()> {
+        let broadcast_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let total_input_sats: u64 = inputs.iter().map(|(_, _, amt)| amt).sum();
+        let fee_sats = total_input_sats.saturating_sub(total_output_sats);
+
+        conn.execute(
+            "INSERT OR REPLACE INTO pending_transactions (txid, broadcast_time, total_input_sats, total_output_sats, fee_sats)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            (txid, broadcast_time, total_input_sats as i64, total_output_sats as i64, fee_sats as i64),
+        )?;
+
+        for (spent_txid, spent_vout, amount) in inputs {
+            conn.execute(
+                "INSERT OR REPLACE INTO pending_inputs (spending_txid, spent_txid, spent_vout, amount_sats)
+                 VALUES (?1, ?2, ?3, ?4)",
+                (txid, spent_txid, spent_vout, *amount as i64),
+            )?;
+        }
+
+        tracing::debug!("Stored pending transaction {} with {} inputs", txid, inputs.len());
+        Ok(())
+    }
+
+    /// Check if an outpoint is spent by a pending (unconfirmed) transaction
+    pub fn is_outpoint_pending_spent(&self, txid: &str, vout: u32) -> bool {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT 1 FROM pending_inputs WHERE spent_txid = ?1 AND spent_vout = ?2",
+            (txid, vout),
+            |_| Ok(()),
+        ).is_ok()
+    }
+
+    /// Get all pending spent outpoints (for UTXO list display)
+    pub fn get_pending_spent_outpoints(&self) -> Vec<(String, u32, u64, String)> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare(
+            "SELECT spent_txid, spent_vout, amount_sats, spending_txid FROM pending_inputs"
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+
+        let mut result = Vec::new();
+        let mut rows = match stmt.query([]) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+
+        while let Ok(Some(row)) = rows.next() {
+            if let (Ok(txid), Ok(vout), Ok(amount), Ok(spending_txid)) = (
+                row.get::<_, String>(0),
+                row.get::<_, u32>(1),
+                row.get::<_, i64>(2),
+                row.get::<_, String>(3),
+            ) {
+                result.push((txid, vout, amount as u64, spending_txid));
+            }
+        }
+        result
+    }
+
+    /// Get pending balance info: (pending_outgoing_sats, pending_incoming_snicker_sats)
+    pub fn get_pending_balance(&self) -> (u64, u64) {
+        let conn = self.conn.lock().unwrap();
+
+        // Pending outgoing: sum of all inputs in pending transactions
+        let pending_outgoing: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(amount_sats), 0) FROM pending_inputs",
+            [],
+            |row| row.get(0),
+        ).unwrap_or(0);
+
+        // Pending incoming SNICKER: UTXOs with block_height IS NULL (broadcast but unconfirmed)
+        let pending_incoming_snicker: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(amount), 0) FROM snicker_utxos WHERE block_height IS NULL AND status = 'unspent'",
+            [],
+            |row| row.get(0),
+        ).unwrap_or(0);
+
+        (pending_outgoing as u64, pending_incoming_snicker as u64)
+    }
+
+    /// Remove a confirmed transaction from pending tracking
+    pub fn remove_confirmed_transaction(&self, txid: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        Self::remove_confirmed_transaction_raw(&conn, txid)
+    }
+
+    /// Remove a confirmed transaction (raw connection version)
+    pub fn remove_confirmed_transaction_raw(conn: &Connection, txid: &str) -> Result<()> {
+        // Delete from pending_inputs first (due to foreign key)
+        conn.execute(
+            "DELETE FROM pending_inputs WHERE spending_txid = ?1",
+            [txid],
+        )?;
+
+        conn.execute(
+            "DELETE FROM pending_transactions WHERE txid = ?1",
+            [txid],
+        )?;
+
+        tracing::debug!("Removed confirmed transaction {} from pending tracking", txid);
+        Ok(())
+    }
+
+    /// Get all pending transaction txids
+    pub fn get_pending_txids_raw(conn: &Connection) -> Vec<String> {
+        let mut stmt = match conn.prepare("SELECT txid FROM pending_transactions") {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+
+        let mut result = Vec::new();
+        let mut rows = match stmt.query([]) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+
+        while let Ok(Some(row)) = rows.next() {
+            if let Ok(txid) = row.get::<_, String>(0) {
+                result.push(txid);
+            }
+        }
+        result
+    }
+
+    /// Get count of pending transactions
+    pub fn get_pending_transaction_count(&self) -> usize {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM pending_transactions",
+            [],
+            |row| row.get::<_, i64>(0),
+        ).unwrap_or(0) as usize
+    }
+
+    // ============================================================
+    // PROPOSAL PAIRINGS (tracking UTXOs with live proposals)
+    // ============================================================
+
+    /// Record that we created a proposal pairing our UTXO with a target UTXO
+    pub fn record_proposal_pairing(
+        &self,
+        our_outpoint: &bdk_wallet::bitcoin::OutPoint,
+        target_outpoint: &bdk_wallet::bitcoin::OutPoint,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        conn.execute(
+            "INSERT OR IGNORE INTO proposal_pairings (our_txid, our_vout, target_txid, target_vout, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            (
+                our_outpoint.txid.to_string(),
+                our_outpoint.vout,
+                target_outpoint.txid.to_string(),
+                target_outpoint.vout,
+                timestamp,
+            ),
+        )?;
+
+        tracing::debug!(
+            "Recorded proposal pairing: {}:{} -> {}:{}",
+            our_outpoint.txid, our_outpoint.vout,
+            target_outpoint.txid, target_outpoint.vout
+        );
+        Ok(())
+    }
+
+    /// Check if our UTXO has any live proposals (for GUI display)
+    pub fn has_live_proposals(&self, our_outpoint: &bdk_wallet::bitcoin::OutPoint) -> bool {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT 1 FROM proposal_pairings WHERE our_txid = ? AND our_vout = ? LIMIT 1",
+            (our_outpoint.txid.to_string(), our_outpoint.vout),
+            |_| Ok(true),
+        ).unwrap_or(false)
+    }
+
+    /// Delete all pairings where the target UTXO matches (called when target is spent)
+    pub fn delete_pairings_for_target(conn: &Connection, target_txid: &str, target_vout: u32) -> usize {
+        match conn.execute(
+            "DELETE FROM proposal_pairings WHERE target_txid = ? AND target_vout = ?",
+            (target_txid, target_vout),
+        ) {
+            Ok(count) => {
+                if count > 0 {
+                    tracing::debug!(
+                        "Deleted {} proposal pairings for spent target {}:{}",
+                        count, target_txid, target_vout
+                    );
+                }
+                count
+            }
+            Err(e) => {
+                tracing::warn!("Failed to delete proposal pairings: {}", e);
+                0
+            }
+        }
+    }
+
+    /// Delete all pairings where our UTXO matches (called when our UTXO is spent)
+    pub fn delete_pairings_for_our_utxo(conn: &Connection, our_txid: &str, our_vout: u32) -> usize {
+        match conn.execute(
+            "DELETE FROM proposal_pairings WHERE our_txid = ? AND our_vout = ?",
+            (our_txid, our_vout),
+        ) {
+            Ok(count) => {
+                if count > 0 {
+                    tracing::debug!(
+                        "Deleted {} proposal pairings for spent UTXO {}:{}",
+                        count, our_txid, our_vout
+                    );
+                }
+                count
+            }
+            Err(e) => {
+                tracing::warn!("Failed to delete proposal pairings: {}", e);
+                0
+            }
+        }
     }
 
     // ============================================================

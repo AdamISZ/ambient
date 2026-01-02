@@ -212,7 +212,7 @@ pub async fn repl(
             "balance" => {
                 if let Some(arc) = manager_arc.as_ref() {
                     let mgr = arc.read().await;
-                    println!("Balance: {}", mgr.get_balance().await?);
+                    println!("{}", mgr.get_balance_with_pending().await?);
                 } else {
                     println!("No wallet loaded.");
                 }
@@ -231,7 +231,7 @@ pub async fn repl(
             "listunspent" => {
                 if let Some(arc) = manager_arc.as_ref() {
                     let mgr = arc.read().await;
-                    let utxos = mgr.list_unspent().await?;
+                    let utxos = mgr.list_unspent_with_status().await?;
                     if utxos.is_empty() {
                         println!("No UTXOs.");
                     } else {
