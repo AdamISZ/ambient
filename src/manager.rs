@@ -129,13 +129,19 @@ impl Manager {
         self.wallet_node.get_balance_breakdown().await
     }
 
+    /// Get the current tip height from the wallet's local chain
+    pub async fn get_tip_height(&self) -> Result<u32> {
+        let wallet = self.wallet_node.wallet.lock().await;
+        Ok(wallet.local_chain().tip().height())
+    }
+
     /// List unspent outputs with pending status markers
     pub async fn list_unspent_with_status(&self) -> Result<Vec<String>> {
         self.wallet_node.list_unspent_with_status().await
     }
 
     /// Get next receiving address
-    pub async fn get_next_address(&mut self) -> Result<String> {
+    pub async fn get_next_address(&self) -> Result<String> {
         self.wallet_node.get_next_address().await
     }
 
@@ -174,7 +180,7 @@ impl Manager {
     ///
     /// Returns error if fee estimation fails - user must specify manual fee rate.
     pub async fn send_to_address_auto(
-        &mut self,
+        &self,
         address_str: &str,
         amount_sats: u64,
     ) -> Result<bdk_wallet::bitcoin::Txid> {
@@ -183,7 +189,7 @@ impl Manager {
 
     /// Send to address with manual fee rate
     pub async fn send_to_address(
-        &mut self,
+        &self,
         address_str: &str,
         amount_sats: u64,
         fee_rate_sat_vb: f32,
@@ -201,7 +207,7 @@ impl Manager {
     /// Returns the signed transaction hex that can be tested with testmempoolaccept
     /// before broadcasting via RPC.
     pub async fn build_snicker_tx(
-        &mut self,
+        &self,
         address_str: &str,
         amount_sats: u64,
         fee_rate_sat_vb: f32,
@@ -336,12 +342,25 @@ impl Manager {
         // Filter to only UTXOs that:
         // 1. Exist in partial_utxo_set and are unspent
         // 2. Are young enough for receivers to validate (within max_utxo_age_delta_blocks)
-        let partial_utxo_set = self.wallet_node.partial_utxo_set.lock().await;
-        let our_utxos: Vec<_> = all_utxos
+        //
+        // First pass: query partial_utxo_set with minimal lock scope
+        let utxo_info: Vec<_> = {
+            let partial_utxo_set = self.wallet_node.partial_utxo_set.lock().await;
+            all_utxos
+                .into_iter()
+                .map(|utxo| {
+                    let info = partial_utxo_set.get(&utxo.outpoint()).ok().flatten();
+                    (utxo, info)
+                })
+                .collect()
+        };
+
+        // Second pass: filter with logging (no lock held)
+        let our_utxos: Vec<_> = utxo_info
             .into_iter()
-            .filter(|utxo| {
-                match partial_utxo_set.get(&utxo.outpoint()) {
-                    Ok(Some(partial)) if partial.status == crate::partial_utxo_set::UtxoStatus::Unspent => {
+            .filter(|(utxo, info)| {
+                match info {
+                    Some(partial) if partial.status == crate::partial_utxo_set::UtxoStatus::Unspent => {
                         let age = tip_height.saturating_sub(partial.block_height);
                         if age <= max_utxo_age {
                             true
@@ -362,8 +381,8 @@ impl Manager {
                     }
                 }
             })
+            .map(|(utxo, _)| utxo)
             .collect();
-        drop(partial_utxo_set);
 
         if our_utxos.is_empty() && total_utxo_count > 0 {
             tracing::info!(
@@ -388,7 +407,7 @@ impl Manager {
     /// # Returns
     /// Tuple of (partially-signed PSBT, encrypted proposal with signed PSBT to publish)
     pub async fn create_snicker_proposal(
-        &mut self,
+        &self,
         opportunity: &ProposalOpportunity,
         delta_sats: i64,
         min_change_output_size: u64,
@@ -401,17 +420,17 @@ impl Manager {
             .clone();
 
         // Get addresses for outputs from wallet
-        let mut wallet = self.wallet_node.wallet.lock().await;
-        let mut conn = self.wallet_node.conn.lock().await;
+        let (equal_output_addr, change_output_addr) = {
+            let mut wallet = self.wallet_node.wallet.lock().await;
+            let mut conn = self.wallet_node.conn.lock().await;
 
-        let equal_output_addr = wallet.reveal_next_address(bdk_wallet::KeychainKind::External).address;
-        let change_output_addr = wallet.reveal_next_address(bdk_wallet::KeychainKind::Internal).address;
+            let equal_output_addr = wallet.reveal_next_address(bdk_wallet::KeychainKind::External).address;
+            let change_output_addr = wallet.reveal_next_address(bdk_wallet::KeychainKind::Internal).address;
 
-        // Persist updated derivation indices
-        wallet.persist(&mut conn)?;
-
-        drop(wallet);
-        drop(conn);
+            // Persist updated derivation indices
+            wallet.persist(&mut conn)?;
+            (equal_output_addr, change_output_addr)
+        };
 
         // Derive our input private key (the proposer's input key used for SNICKER tweak)
         let our_input_privkey = self.wallet_node.derive_utxo_privkey(&our_utxo).await?;
@@ -545,7 +564,7 @@ impl Manager {
     ///
     /// # Returns
     /// The finalized transaction ready for broadcast
-    pub async fn finalize_psbt(&mut self, psbt: Psbt) -> Result<Transaction> {
+    pub async fn finalize_psbt(&self, psbt: Psbt) -> Result<Transaction> {
         self.wallet_node.finalize_psbt(psbt).await
     }
 
@@ -553,7 +572,7 @@ impl Manager {
     /// Store an encrypted SNICKER proposal by attempting to decrypt it
     /// If decryption succeeds (proposal is for one of our UTXOs), stores in decrypted_proposals table
     /// If decryption fails (not for us), silently ignores
-    pub async fn store_snicker_proposal(&mut self, proposal: &EncryptedProposal) -> Result<()> {
+    pub async fn store_snicker_proposal(&self, proposal: &EncryptedProposal) -> Result<()> {
         // Get all our UTXOs (both regular wallet and SNICKER UTXOs)
         let our_utxos = self.wallet_node.get_all_wallet_utxos().await?;
 
@@ -620,7 +639,7 @@ impl Manager {
 
     /// Deserialize and store a proposal from its serialized form
     /// Returns the proposal tag
-    pub async fn load_proposal_from_serialized(&mut self, serialized: &str) -> Result<[u8; 8]> {
+    pub async fn load_proposal_from_serialized(&self, serialized: &str) -> Result<[u8; 8]> {
         // Parse the JSON-like format
         let ephemeral_pubkey = serialized
             .lines()
@@ -719,7 +738,7 @@ impl Manager {
     /// # Returns
     /// Some(ProposalScanResult) if proposal is decryptable and within range, None otherwise
     pub async fn process_incoming_proposal(
-        &mut self,
+        &self,
         proposal: &crate::snicker::EncryptedProposal,
         delta_range: (i64, i64),
     ) -> Result<Option<ProposalScanResult>> {
@@ -798,7 +817,7 @@ impl Manager {
     /// # Returns
     /// Vec of ProposalScanResult containing all matching proposals with details
     pub async fn scan_proposals_directory(
-        &mut self,
+        &self,
         delta_range: (i64, i64),
     ) -> Result<Vec<ProposalScanResult>> {
         tracing::debug!("🔍 Fetching proposals from network");
@@ -916,7 +935,7 @@ impl Manager {
     /// # Returns
     /// Fully-signed PSBT (both parties signed) ready for finalization
     pub async fn accept_snicker_proposal(
-        &mut self,
+        &self,
         tag: &[u8; 8],
         acceptable_delta_range: (i64, i64),
     ) -> Result<Psbt> {
@@ -967,7 +986,7 @@ impl Manager {
     /// - Storing the resulting SNICKER UTXO
     /// - Broadcasting the transaction
     pub async fn accept_and_broadcast_snicker_proposal(
-        &mut self,
+        &self,
         tag: &[u8; 8],
         acceptable_delta_range: (i64, i64),
     ) -> Result<bdk_wallet::bitcoin::Txid> {
@@ -1081,7 +1100,7 @@ impl Manager {
     }
 
     /// Broadcast a transaction to the network
-    pub async fn broadcast_transaction(&mut self, tx: Transaction) -> Result<bdk_wallet::bitcoin::Txid> {
+    pub async fn broadcast_transaction(&self, tx: Transaction) -> Result<bdk_wallet::bitcoin::Txid> {
         self.wallet_node.broadcast_transaction(tx).await
     }
 
@@ -1116,21 +1135,21 @@ impl Manager {
         };
 
         // Query partial_utxo_set for unspent P2TR UTXOs in the specified range
-        let partial_utxo_set = self.wallet_node.partial_utxo_set.lock().await;
-
-        let transaction_type_filter = if snicker_only { Some("v1") } else { None };
-        let utxos = partial_utxo_set.query_range(
-            start_height,
-            tip_height,
-            min_amount,
-            max_amount,
-            transaction_type_filter,
-        )?;
-
-        // Convert PartialUtxo to tuple format expected by find_opportunities
-        let candidates: Vec<_> = utxos.iter()
-            .map(|utxo| (utxo.txid, utxo.vout, utxo.block_height, utxo.amount, utxo.script_pubkey.clone()))
-            .collect();
+        let candidates: Vec<_> = {
+            let partial_utxo_set = self.wallet_node.partial_utxo_set.lock().await;
+            let transaction_type_filter = if snicker_only { Some("v1") } else { None };
+            let utxos = partial_utxo_set.query_range(
+                start_height,
+                tip_height,
+                min_amount,
+                max_amount,
+                transaction_type_filter,
+            )?;
+            // Convert PartialUtxo to tuple format expected by find_opportunities
+            utxos.iter()
+                .map(|utxo| (utxo.txid, utxo.vout, utxo.block_height, utxo.amount, utxo.script_pubkey.clone()))
+                .collect()
+        };
 
         tracing::info!("Found {} candidate UTXOs from partial_utxo_set ({}-{} sats, snicker_only={})",
             candidates.len(), min_amount, max_amount, snicker_only);
@@ -1229,7 +1248,7 @@ impl Manager {
     // ============================================================
 
     /// Configure RPC client for Bitcoin Core access
-    pub fn set_rpc_client(&mut self, url: &str, auth: (String, String)) -> Result<()> {
+    pub fn set_rpc_client(&self, url: &str, auth: (String, String)) -> Result<()> {
         self.wallet_node.set_rpc_client(url, auth)
     }
 
@@ -1240,12 +1259,12 @@ impl Manager {
     }
 
     /// Re-register revealed addresses with Kyoto
-    pub async fn reregister_revealed(&mut self) -> Result<String> {
+    pub async fn reregister_revealed(&self) -> Result<String> {
         self.wallet_node.reregister_revealed().await
     }
 
     /// Reveal addresses up to a specific index
-    pub async fn reveal_up_to(&mut self, index: u32) -> Result<String> {
+    pub async fn reveal_up_to(&self, index: u32) -> Result<String> {
         self.wallet_node.reveal_up_to(index).await
     }
 
@@ -1341,7 +1360,7 @@ impl Manager {
     /// and can be tried in future cycles if the first one fails to confirm.
     ///
     /// Returns number of proposals accepted.
-    pub async fn auto_accept_proposals(&mut self, config: &crate::config::SnickerAutomation) -> Result<u32> {
+    pub async fn auto_accept_proposals(&self, config: &crate::config::SnickerAutomation) -> Result<u32> {
         use crate::config::AutomationMode;
         use std::collections::HashMap;
 
@@ -1350,14 +1369,9 @@ impl Manager {
             return Ok(0);
         }
 
-        // Check rate limit
-        if !self.snicker.check_rate_limit("auto_accept", config.max_proposals_per_day).await? {
-            tracing::info!("⏸️  Rate limit reached for auto-accept (max {} per day)", config.max_proposals_per_day);
-            return Ok(0);
-        }
-
-        // Scan for proposals in range
-        let delta_range = (-config.max_delta, config.max_delta);
+        // Scan for proposals in range (using max_sats_per_coinjoin as the limit)
+        let max_delta = config.max_sats_per_coinjoin as i64;
+        let delta_range = (-max_delta, max_delta);
         let proposals = self.scan_for_our_proposals(delta_range).await?;
 
         if proposals.is_empty() {
@@ -1436,20 +1450,40 @@ impl Manager {
         let mut accepted_count = 0;
 
         for proposal in selected_proposals {
-            // Check rate limit before each acceptance
-            if !self.snicker.check_rate_limit("auto_accept", config.max_proposals_per_day).await? {
-                tracing::info!("⏸️  Rate limit reached during auto-accept, stopping");
-                break;
-            }
-
-            // Calculate delta for logging
+            // Calculate delta for this proposal
             let delta = self.snicker.calculate_delta_from_proposal(&proposal).ok();
+            let delta_sats = delta.unwrap_or(0);
+
+            // Check spending limits before accepting
+            let within_limits = self.snicker.check_spending_limits(
+                delta_sats,
+                config.max_sats_per_coinjoin,
+                config.max_sats_per_day,
+                config.max_sats_per_week,
+            )?;
+
+            if !within_limits {
+                tracing::info!(
+                    "⏸️ Skipping proposal {} - would exceed spending limits (delta: {} sats)",
+                    hex::encode(proposal.tag), delta_sats
+                );
+                continue;
+            }
 
             // Accept and broadcast the proposal
             match self.accept_and_broadcast_snicker_proposal(&proposal.tag, delta_range).await {
                 Ok(txid) => {
                     accepted_count += 1;
                     tracing::info!("✅ Auto-accepted proposal {} → txid: {}", hex::encode(proposal.tag), txid);
+
+                    // Record spending for this coinjoin
+                    if let Err(e) = self.snicker.record_coinjoin_spending(
+                        delta_sats,
+                        "receiver",
+                        &txid.to_string(),
+                    ) {
+                        tracing::warn!("Failed to record spending: {}", e);
+                    }
 
                     // Mark proposal as broadcast to avoid re-processing
                     self.snicker.update_proposal_status(&proposal.tag, "broadcast").await?;
@@ -1488,7 +1522,7 @@ impl Manager {
     ///
     /// Returns number of proposals created.
     pub async fn auto_create_proposals(
-        &mut self,
+        &self,
         config: &crate::config::SnickerAutomation,
         min_utxo_sats: u64,
         delta_sats: i64,
@@ -1500,9 +1534,20 @@ impl Manager {
             return Ok(0);
         }
 
-        // Check rate limit
-        if !self.snicker.check_rate_limit("auto_create", config.max_proposals_per_day).await? {
-            tracing::info!("⏸️  Rate limit reached for auto-create (max {} per day)", config.max_proposals_per_day);
+        // Check spending limits before creating proposals
+        // delta_sats is what we're proposing to pay (positive = we pay)
+        let within_limits = self.snicker.check_spending_limits(
+            delta_sats,
+            config.max_sats_per_coinjoin,
+            config.max_sats_per_day,
+            config.max_sats_per_week,
+        )?;
+
+        if !within_limits {
+            tracing::info!(
+                "⏸️ Spending limits would be exceeded for new proposals (delta: {} sats)",
+                delta_sats
+            );
             return Ok(0);
         }
 
@@ -1521,12 +1566,6 @@ impl Manager {
         let mut created_count = 0;
 
         for opportunity in opportunities {
-            // Check rate limit before each creation
-            if !self.snicker.check_rate_limit("auto_create", config.max_proposals_per_day).await? {
-                tracing::info!("⏸️  Rate limit reached during auto-create, stopping");
-                break;
-            }
-
             // Check if we already created a proposal for this UTXO pair
             let our_utxo_str = format!("{}:{}", opportunity.our_outpoint.txid, opportunity.our_outpoint.vout);
             let target_utxo_str = format!("{}:{}", opportunity.target_outpoint.txid, opportunity.target_outpoint.vout);

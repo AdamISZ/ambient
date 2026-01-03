@@ -9,7 +9,6 @@ use crate::gui::modal::Modal;
 use crate::config::Config;
 use std::sync::Arc;
 use std::mem::ManuallyDrop;
-use tokio::sync::RwLock;
 
 /// Main application struct
 pub struct AmbientApp {
@@ -112,9 +111,7 @@ impl AmbientApp {
                         async move {
                             // Create receiver on first run
                             if receiver_opt.is_none() {
-                                let mgr = manager.read().await;
-                                let receiver = mgr.subscribe_to_updates();
-                                drop(mgr);
+                                let receiver = manager.subscribe_to_updates();
                                 receiver_opt = Some(receiver);
                             }
 
@@ -455,8 +452,8 @@ impl AmbientApp {
 
                         println!("✅ Wallet '{}' ready", wallet_name);
 
-                        // Wrap manager in Arc<RwLock<>> for shared mutable access
-                        let manager = Arc::new(RwLock::new(manager));
+                        // Wrap manager in Arc for shared access (internal mutability via Mutex fields)
+                        let manager = Arc::new(manager);
 
                         // Transition to WalletLoaded state
                         self.state = AppState::WalletLoaded {
@@ -464,8 +461,11 @@ impl AmbientApp {
                             wallet_data: crate::gui::state::WalletData::default(),
                         };
 
-                        // Fetch initial balance
-                        return Task::done(Message::SyncRequested);
+                        // Fetch initial balance and auto-start automation (if enabled)
+                        return Task::batch([
+                            Task::done(Message::SyncRequested),
+                            Task::done(Message::AutomationStart),
+                        ]);
                     } else {
                         eprintln!("❌ No manager found after generation");
                         self.active_modal = None;
@@ -523,8 +523,8 @@ impl AmbientApp {
 
                         println!("✅ Wallet '{}' loaded", wallet_name);
 
-                        // Wrap manager in Arc<RwLock<>> for shared mutable access
-                        let manager = Arc::new(RwLock::new(manager));
+                        // Wrap manager in Arc for shared access (internal mutability via Mutex fields)
+                        let manager = Arc::new(manager);
 
                         // Transition to WalletLoaded state
                         self.state = AppState::WalletLoaded {
@@ -535,8 +535,12 @@ impl AmbientApp {
                         // Close the modal
                         self.active_modal = None;
 
-                        // Fetch initial balance
-                        return Task::done(Message::SyncRequested);
+                        // Fetch initial balance and auto-start automation (if enabled)
+                        // Automation is enabled by default, so this will start it
+                        return Task::batch([
+                            Task::done(Message::SyncRequested),
+                            Task::done(Message::AutomationStart),
+                        ]);
                     }
                     Err(e) => {
                         eprintln!("❌ Failed to load wallet: {}", e);
@@ -879,23 +883,24 @@ impl AmbientApp {
                     return Task::perform(
                         async move {
                             rt_handle.spawn(async move {
-                                let mut manager = manager_clone.write().await;
-                                manager.get_next_address().await
+                                manager_clone.get_next_address().await
                             }).await.unwrap()
                         },
-                        |result| match result {
-                            Ok(addr_str) => {
-                                match addr_str.parse::<bdk_wallet::bitcoin::Address<bdk_wallet::bitcoin::address::NetworkUnchecked>>() {
-                                    Ok(addr) => Message::AddressGenerated(addr.assume_checked()),
-                                    Err(e) => {
-                                        eprintln!("❌ Failed to parse address: {}", e);
-                                        Message::Placeholder
+                        |result| {
+                            match result {
+                                Ok(addr_str) => {
+                                    match addr_str.parse::<bdk_wallet::bitcoin::Address<bdk_wallet::bitcoin::address::NetworkUnchecked>>() {
+                                        Ok(addr) => Message::AddressGenerated(addr.assume_checked()),
+                                        Err(e) => {
+                                            eprintln!("❌ Failed to parse address: {}", e);
+                                            Message::Placeholder
+                                        }
                                     }
                                 }
-                            }
-                            Err(e) => {
-                                eprintln!("❌ Failed to generate address: {}", e);
-                                Message::Placeholder
+                                Err(e) => {
+                                    eprintln!("❌ Failed to generate address: {}", e);
+                                    Message::Placeholder
+                                }
                             }
                         }
                     );
@@ -930,8 +935,7 @@ impl AmbientApp {
                     return Task::perform(
                         async move {
                             rt_handle.spawn(async move {
-                                let manager = manager_clone.read().await;
-                                manager.list_unspent_with_status().await
+                                manager_clone.list_unspent_with_status().await
                             }).await.unwrap()
                         },
                         |utxos_result| {
@@ -972,9 +976,8 @@ impl AmbientApp {
                     return Task::perform(
                         async move {
                             rt_handle.spawn(async move {
-                                let manager = manager_clone.read().await;
-                                let balance_breakdown = manager.get_balance_breakdown().await;
-                                let utxos = manager.list_unspent_with_status().await;
+                                let balance_breakdown = manager_clone.get_balance_breakdown().await;
+                                let utxos = manager_clone.list_unspent_with_status().await;
                                 (balance_breakdown, utxos)
                             }).await.unwrap()
                         },
@@ -1071,8 +1074,7 @@ impl AmbientApp {
                         return Task::perform(
                             async move {
                                 rt_handle.spawn(async move {
-                                    let manager = manager_clone.read().await;
-                                    manager.calculate_max_sendable(&address, fee_rate_val).await
+                                    manager_clone.calculate_max_sendable(&address, fee_rate_val).await
                                 }).await.unwrap()
                             },
                             |result| match result {
@@ -1123,8 +1125,7 @@ impl AmbientApp {
                     return Task::perform(
                         async move {
                             rt_handle.spawn(async move {
-                                let manager = manager_clone.read().await;
-                                manager.calculate_max_sendable(&address, fee_rate).await
+                                manager_clone.calculate_max_sendable(&address, fee_rate).await
                             }).await.unwrap()
                         },
                         |result| match result {
@@ -1201,8 +1202,7 @@ impl AmbientApp {
                     return Task::perform(
                         async move {
                             rt_handle.spawn(async move {
-                                let mut manager = manager_clone.write().await;
-                                manager.send_to_address(&address, amount_sats, fee_rate).await
+                                manager_clone.send_to_address(&address, amount_sats, fee_rate).await
                             }).await.unwrap()
                         },
                         |result| match result {
@@ -1313,8 +1313,7 @@ impl AmbientApp {
                     return Task::perform(
                         async move {
                             rt_handle.spawn(async move {
-                                let manager = manager_clone.read().await;
-                                manager.find_snicker_opportunities(min_candidate_sats, max_candidate_sats, max_block_age, snicker_only).await
+                                manager_clone.find_snicker_opportunities(min_candidate_sats, max_candidate_sats, max_block_age, snicker_only).await
                             }).await.unwrap()
                         },
                         |result| match result {
@@ -1371,13 +1370,12 @@ impl AmbientApp {
                     return Task::perform(
                         async move {
                             rt_handle.spawn(async move {
-                                let mut manager = manager_clone.write().await;
-                                let (proposal, encrypted) = manager.create_snicker_proposal(&opportunity, delta_sats as i64, crate::config::DEFAULT_MIN_CHANGE_OUTPUT_SIZE).await?;
+                                let (proposal, encrypted) = manager_clone.create_snicker_proposal(&opportunity, delta_sats as i64, crate::config::DEFAULT_MIN_CHANGE_OUTPUT_SIZE).await?;
 
                                 let tag_hex = ::hex::encode(&proposal.tag);
 
                                 // Publish to network
-                                let receipt = manager.network.publish_proposal(&encrypted).await?;
+                                let receipt = manager_clone.network.publish_proposal(&encrypted).await?;
 
                                 println!("✅ Proposal created and published: {}", receipt.id);
                                 Ok(tag_hex)
@@ -1422,8 +1420,7 @@ impl AmbientApp {
                     return Task::perform(
                         async move {
                             rt_handle.spawn(async move {
-                                let mut manager = manager_clone.write().await;
-                                manager.scan_proposals_directory((min_delta, max_delta)).await
+                                manager_clone.scan_proposals_directory((min_delta, max_delta)).await
                             }).await.unwrap()
                         },
                         |result| match result {
@@ -1486,8 +1483,7 @@ impl AmbientApp {
                         return Task::perform(
                             async move {
                                 rt_handle.spawn(async move {
-                                    let mut manager = manager_clone.write().await;
-                                    manager.accept_and_broadcast_snicker_proposal(&tag, (-1_000_000, 1_000_000)).await
+                                    manager_clone.accept_and_broadcast_snicker_proposal(&tag, (-1_000_000, 1_000_000)).await
                                 }).await.unwrap()
                             },
                             |result| match result {
@@ -1556,12 +1552,15 @@ impl AmbientApp {
                     let interval_secs = wallet_data.automation_interval_secs
                         .parse::<u64>()
                         .unwrap_or(10);
-                    let max_delta = wallet_data.automation_max_delta
-                        .parse::<i64>()
-                        .unwrap_or(10_000);
-                    let max_per_day = wallet_data.automation_max_per_day
-                        .parse::<u32>()
-                        .unwrap_or(10);
+                    let max_sats_per_coinjoin = wallet_data.automation_max_sats_per_coinjoin
+                        .parse::<u64>()
+                        .unwrap_or(1000);
+                    let max_sats_per_day = wallet_data.automation_max_sats_per_day
+                        .parse::<u64>()
+                        .unwrap_or(2500);
+                    let max_sats_per_week = wallet_data.automation_max_sats_per_week
+                        .parse::<u64>()
+                        .unwrap_or(10000);
 
                     let task_config = AutomationConfig {
                         interval_secs,
@@ -1571,11 +1570,14 @@ impl AmbientApp {
 
                     let snicker_config = SnickerAutomation {
                         mode: wallet_data.automation_mode,
-                        max_delta,
-                        max_proposals_per_day: max_per_day,
-                        prefer_snicker_outputs: true,  // Default
-                        snicker_pattern_only: true,    // Default
+                        max_sats_per_coinjoin,
+                        max_sats_per_day,
+                        max_sats_per_week,
+                        prefer_snicker_outputs: true,   // Prefer spending SNICKER outputs
+                        snicker_pattern_only: false,    // Allow targeting any P2TR UTXO (for bootstrapping)
                         min_change_output_size: crate::config::DEFAULT_MIN_CHANGE_OUTPUT_SIZE,
+                        outstanding_proposals: 5,       // Default
+                        receiver_timeout_blocks: 144,   // Default (~1 day)
                     };
 
                     let mode = wallet_data.automation_mode;
@@ -1584,8 +1586,9 @@ impl AmbientApp {
 
                     println!("🤖 Starting SNICKER automation...");
                     println!("   Mode: {:?}", mode);
-                    println!("   Max delta: {} sats", max_delta);
-                    println!("   Max proposals/day: {}", max_per_day);
+                    println!("   Max sats/coinjoin: {}", max_sats_per_coinjoin);
+                    println!("   Max sats/day: {}", max_sats_per_day);
+                    println!("   Max sats/week: {}", max_sats_per_week);
 
                     // Create the task wrapped in Arc<Mutex<>>
                     let task = Arc::new(tokio::sync::Mutex::new(AutomationTask::new()));
@@ -1656,6 +1659,30 @@ impl AmbientApp {
                 Task::none()
             }
 
+            Message::AutomationToggleEnabled => {
+                if let AppState::WalletLoaded { wallet_data, .. } = &mut self.state {
+                    wallet_data.automation_enabled = !wallet_data.automation_enabled;
+                    // Update mode based on enabled state
+                    wallet_data.automation_mode = if wallet_data.automation_enabled {
+                        crate::config::AutomationMode::Advanced
+                    } else {
+                        crate::config::AutomationMode::Disabled
+                    };
+                    println!(
+                        "Automation {}",
+                        if wallet_data.automation_enabled { "enabled" } else { "disabled" }
+                    );
+                }
+                Task::none()
+            }
+
+            Message::AutomationRoleUpdated(role) => {
+                if let AppState::WalletLoaded { wallet_data, .. } = &mut self.state {
+                    wallet_data.automation_role = role;
+                }
+                Task::none()
+            }
+
             Message::AutomationModeChanged(mode_str) => {
                 if let AppState::WalletLoaded { wallet_data, .. } = &mut self.state {
                     use std::str::FromStr;
@@ -1666,16 +1693,23 @@ impl AmbientApp {
                 Task::none()
             }
 
-            Message::AutomationMaxDeltaChanged(value) => {
+            Message::AutomationMaxSatsPerCoinjoinChanged(value) => {
                 if let AppState::WalletLoaded { wallet_data, .. } = &mut self.state {
-                    wallet_data.automation_max_delta = value;
+                    wallet_data.automation_max_sats_per_coinjoin = value;
                 }
                 Task::none()
             }
 
-            Message::AutomationMaxPerDayChanged(value) => {
+            Message::AutomationMaxSatsPerDayChanged(value) => {
                 if let AppState::WalletLoaded { wallet_data, .. } = &mut self.state {
-                    wallet_data.automation_max_per_day = value;
+                    wallet_data.automation_max_sats_per_day = value;
+                }
+                Task::none()
+            }
+
+            Message::AutomationMaxSatsPerWeekChanged(value) => {
+                if let AppState::WalletLoaded { wallet_data, .. } = &mut self.state {
+                    wallet_data.automation_max_sats_per_week = value;
                 }
                 Task::none()
             }

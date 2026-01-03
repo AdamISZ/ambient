@@ -49,12 +49,12 @@ impl AutomationTask {
     /// Start the automation task
     ///
     /// # Arguments
-    /// * `manager` - Arc to the Manager (must be wrapped in Arc<RwLock<Manager>>)
+    /// * `manager` - Arc to the Manager (internal mutability via Mutex fields)
     /// * `snicker_config` - SNICKER automation configuration
     /// * `task_config` - Task runner configuration
     pub async fn start(
         &mut self,
-        manager: Arc<RwLock<crate::manager::Manager>>,
+        manager: Arc<crate::manager::Manager>,
         snicker_config: crate::config::SnickerAutomation,
         task_config: AutomationConfig,
     ) {
@@ -76,39 +76,64 @@ impl AutomationTask {
 
             tracing::info!("🤖 SNICKER automation task started (pub-sub mode)");
             tracing::info!("   Mode: {:?}", snicker_config.mode);
-            tracing::info!("   Max delta: {} sats", snicker_config.max_delta);
-            tracing::info!("   Max proposals/day: {}", snicker_config.max_proposals_per_day);
+            tracing::info!("   Max sats/coinjoin: {}", snicker_config.max_sats_per_coinjoin);
+            tracing::info!("   Max sats/day: {}", snicker_config.max_sats_per_day);
+            tracing::info!("   Max sats/week: {}", snicker_config.max_sats_per_week);
+            tracing::info!("   Outstanding proposals target: {}", snicker_config.outstanding_proposals);
+            tracing::info!("   Receiver timeout: {} blocks", snicker_config.receiver_timeout_blocks);
 
-            // Step 1: Initial scan of existing proposals on startup
+            // Clone network Arc - allows network operations without blocking Manager
+            let network = manager.network.clone();
+
+            // Step 0: Initialize automation state if needed
             {
-                let mut mgr = manager.write().await;
-                tracing::info!("📂 Initial scan of existing proposals...");
-                match mgr.scan_proposals_directory(
-                    (i64::MIN, i64::MAX),  // Scan all proposals regardless of delta
-                ).await {
-                    Ok(results) if !results.is_empty() => {
-                        tracing::info!("📥 Found {} existing proposal(s)", results.len());
+                let current_height = manager.get_tip_height().await.unwrap_or(0);
+                match manager.snicker.initialize_automation_state(current_height) {
+                    Ok(true) => {
+                        tracing::info!("📊 Initialized automation state at height {}", current_height);
                     }
-                    Ok(_) => {
-                        tracing::debug!("No existing proposals");
+                    Ok(false) => {
+                        let state = manager.snicker.get_automation_state();
+                        tracing::info!(
+                            "📊 Automation state: {} mode (last coinjoin at height {})",
+                            state.role, state.last_coinjoin_height
+                        );
                     }
                     Err(e) => {
-                        tracing::error!("❌ Initial scan failed: {}", e);
+                        tracing::error!("❌ Failed to initialize automation state: {}", e);
                     }
                 }
-                drop(mgr);
             }
 
-            // Step 2: Subscribe to proposal stream for real-time updates
-            let proposal_stream = {
-                let mgr = manager.read().await;
-                match mgr.network.subscribe_proposals(ProposalFilter::default()).await {
-                    Ok(stream) => stream,
-                    Err(e) => {
-                        tracing::error!("❌ Failed to subscribe to proposals: {}", e);
-                        tracing::info!("🤖 SNICKER automation task stopped");
-                        return;
+            // Step 1: Initial scan - fetch proposals WITHOUT holding Manager lock
+            tracing::info!("📂 Initial scan of existing proposals...");
+            match network.fetch_proposals(ProposalFilter::default()).await {
+                Ok(proposals) if !proposals.is_empty() => {
+                    tracing::info!("📥 Fetched {} proposal(s) from network, processing...", proposals.len());
+                    let mut processed = 0;
+                    for proposal in proposals {
+                        let delta_range = (i64::MIN, i64::MAX);
+                        if manager.process_incoming_proposal(&proposal, delta_range).await.is_ok() {
+                            processed += 1;
+                        }
                     }
+                    tracing::info!("📥 Processed {} proposal(s)", processed);
+                }
+                Ok(_) => {
+                    tracing::debug!("No existing proposals");
+                }
+                Err(e) => {
+                    tracing::error!("❌ Initial scan failed: {}", e);
+                }
+            }
+
+            // Step 2: Subscribe to proposal stream WITHOUT holding Manager lock
+            let proposal_stream = match network.subscribe_proposals(ProposalFilter::default()).await {
+                Ok(stream) => stream,
+                Err(e) => {
+                    tracing::error!("❌ Failed to subscribe to proposals: {}", e);
+                    tracing::info!("🤖 SNICKER automation task stopped");
+                    return;
                 }
             };
 
@@ -141,17 +166,15 @@ impl AutomationTask {
                             Ok(proposal) => {
                                 tracing::debug!("📨 Received proposal: {}", hex::encode(&proposal.tag));
 
-                                let mut mgr = manager.write().await;
+                                let delta_range = (i64::MIN, snicker_config.max_sats_per_coinjoin as i64);
 
-                                // Process and check if it's valid for us
-                                let delta_range = (i64::MIN, snicker_config.max_delta);
-                                match mgr.process_incoming_proposal(&proposal, delta_range).await {
+                                match manager.process_incoming_proposal(&proposal, delta_range).await {
                                     Ok(Some(scan_result)) => {
                                         tracing::info!("✅ Valid proposal {} (delta: {} sats)",
                                                  hex::encode(&scan_result.tag), scan_result.delta);
 
                                         // Auto-accept if enabled
-                                        match mgr.auto_accept_proposals(&snicker_config).await {
+                                        match manager.auto_accept_proposals(&snicker_config).await {
                                             Ok(count) if count > 0 => {
                                                 tracing::info!("✅ Auto-accepted {} proposal(s)", count);
                                             }
@@ -168,8 +191,6 @@ impl AutomationTask {
                                         tracing::debug!("Failed to process proposal: {}", e);
                                     }
                                 }
-
-                                drop(mgr);
                             }
                             Err(e) => {
                                 tracing::warn!("Failed to receive proposal: {}", e);
@@ -187,27 +208,68 @@ impl AutomationTask {
 
                         // Only run auto-create in Advanced mode
                         if snicker_config.mode == AutomationMode::Advanced {
-                            tracing::debug!("🔄 Running auto-create cycle");
+                            // Check automation state - only create proposals in Proposer role
+                            let automation_state = manager.snicker.get_automation_state();
 
-                            let mut mgr = manager.write().await;
-
-                            match mgr.auto_create_proposals(
-                                &snicker_config,
-                                task_config.min_utxo_sats,
-                                task_config.proposal_delta_sats,
-                            ).await {
-                                Ok(count) if count > 0 => {
-                                    tracing::info!("✅ Auto-created {} proposal(s)", count);
+                            // Check receiver timeout and reroll if needed
+                            if automation_state.role == crate::snicker::AutomationRole::Receiver {
+                                let current_height = manager.get_tip_height().await.unwrap_or(0);
+                                match manager.snicker.check_receiver_timeout(
+                                    current_height,
+                                    snicker_config.receiver_timeout_blocks,
+                                ) {
+                                    Ok(Some(new_role)) => {
+                                        tracing::info!("🎲 Receiver timeout - rerolled to {:?}", new_role);
+                                    }
+                                    Ok(None) => {
+                                        // Still in receiver mode, no timeout yet
+                                        tracing::debug!("📥 In Receiver mode, waiting for incoming proposals");
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("❌ Failed to check receiver timeout: {}", e);
+                                    }
                                 }
-                                Ok(_) => {
-                                    tracing::debug!("No proposals to create");
-                                }
-                                Err(e) => {
-                                    tracing::error!("❌ Auto-create failed: {}", e);
-                                }
+                                continue;
                             }
 
-                            drop(mgr);
+                            // In Proposer role - maintain N outstanding proposals
+                            let outstanding = manager.snicker.count_outstanding_proposals();
+                            let target = snicker_config.outstanding_proposals as usize;
+
+                            if outstanding >= target {
+                                tracing::debug!(
+                                    "📊 Have {} outstanding proposals (target: {}), skipping",
+                                    outstanding, target
+                                );
+                                continue;
+                            }
+
+                            let proposals_to_create = target - outstanding;
+                            tracing::debug!(
+                                "📊 Have {} outstanding proposals, creating {} more (target: {})",
+                                outstanding, proposals_to_create, target
+                            );
+
+                            // Create proposals to reach target
+                            for _ in 0..proposals_to_create {
+                                match manager.auto_create_proposals(
+                                    &snicker_config,
+                                    task_config.min_utxo_sats,
+                                    task_config.proposal_delta_sats,
+                                ).await {
+                                    Ok(count) if count > 0 => {
+                                        tracing::info!("✅ Auto-created {} proposal(s)", count);
+                                    }
+                                    Ok(_) => {
+                                        tracing::debug!("No proposals to create (no opportunities)");
+                                        break; // No point continuing if no opportunities
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("❌ Auto-create failed: {}", e);
+                                        break;
+                                    }
+                                }
+                            }
                         }
                     }
 
@@ -233,28 +295,15 @@ impl AutomationTask {
         self.task_handle = Some(handle);
     }
 
-    /// Stop the automation task
-    pub async fn stop(&mut self) {
-        if !self.is_running() {
-            tracing::warn!("Automation task not running");
-            return;
-        }
-
-        // Set cancel flag
-        *self.cancel_flag.write().await = true;
-
-        // Wait for task to finish
-        if let Some(handle) = self.task_handle.take() {
-            let _ = handle.await;
-        }
-    }
-
-    /// Check if the automation task is currently running
+    /// Check if the automation task is running
     pub fn is_running(&self) -> bool {
-        self.task_handle.as_ref().map_or(false, |h| !h.is_finished())
+        self.task_handle
+            .as_ref()
+            .map(|h| !h.is_finished())
+            .unwrap_or(false)
     }
 
-    /// Get the current status as a string
+    /// Get the status of the automation task as a string
     pub fn status(&self) -> &'static str {
         if self.is_running() {
             "Running"
@@ -262,13 +311,27 @@ impl AutomationTask {
             "Stopped"
         }
     }
+
+    /// Stop the automation task
+    pub async fn stop(&mut self) {
+        // Set cancel flag
+        *self.cancel_flag.write().await = true;
+
+        // Wait for task to finish
+        if let Some(handle) = self.task_handle.take() {
+            // Give it a moment to finish gracefully
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            // If still running, abort it
+            if !handle.is_finished() {
+                handle.abort();
+            }
+        }
+    }
 }
 
-impl Drop for AutomationTask {
-    fn drop(&mut self) {
-        // Abort the task if it's still running
-        if let Some(handle) = self.task_handle.take() {
-            handle.abort();
-        }
+impl Default for AutomationTask {
+    fn default() -> Self {
+        Self::new()
     }
 }

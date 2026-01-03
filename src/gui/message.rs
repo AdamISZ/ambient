@@ -130,13 +130,16 @@ pub enum Message {
     SettingsSaved(Result<(), String>),
 
     // Automation
+    AutomationToggleEnabled,  // Toggle enable/disable
     AutomationStart,
     AutomationStop,
     AutomationStarted(Result<(), String>),
     AutomationStopped,
-    AutomationModeChanged(String),
-    AutomationMaxDeltaChanged(String),
-    AutomationMaxPerDayChanged(String),
+    AutomationRoleUpdated(String),  // Role changed (Proposer/Receiver)
+    AutomationModeChanged(String),  // Legacy, kept for compatibility
+    AutomationMaxSatsPerCoinjoinChanged(String),
+    AutomationMaxSatsPerDayChanged(String),
+    AutomationMaxSatsPerWeekChanged(String),
     AutomationIntervalChanged(String),
     AutomationStatusUpdate,
 

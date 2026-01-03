@@ -6,7 +6,6 @@ use crate::automation::AutomationTask;
 use crate::config::AutomationMode;
 use bdk_wallet::bitcoin::Amount;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
 /// Root application state - simplified to persistent states only
 /// Transient operations (like wallet creation) are handled by modals
@@ -23,7 +22,7 @@ pub enum AppState {
 
     /// Wallet loaded and active
     WalletLoaded {
-        manager: Arc<RwLock<Manager>>,
+        manager: Arc<Manager>,
         wallet_data: WalletData,
     },
 
@@ -75,11 +74,14 @@ pub struct WalletData {
     pub snicker_scan_block_age_input: String, // Max block age for candidates (0 = all)
 
     // Automation state
+    pub automation_enabled: bool,                  // Enable/disable toggle (replaces mode)
     pub automation_running: bool,
-    pub automation_mode: AutomationMode,
-    pub automation_max_delta: String,    // Input field for max delta
-    pub automation_max_per_day: String,  // Input field for max proposals per day
-    pub automation_interval_secs: String, // Input field for interval
+    pub automation_mode: AutomationMode,           // Internal mode (Advanced when enabled)
+    pub automation_role: String,                   // Current role: "Proposer" or "Receiver"
+    pub automation_max_sats_per_coinjoin: String,  // Max sats to lose per coinjoin
+    pub automation_max_sats_per_day: String,       // Max sats per day
+    pub automation_max_sats_per_week: String,      // Max sats per week
+    pub automation_interval_secs: String,          // Input field for interval
     pub automation_task: Option<Arc<tokio::sync::Mutex<AutomationTask>>>, // The actual task runner (shared)
 
     // Display cache (updated periodically from wallet)
@@ -113,10 +115,13 @@ impl Default for WalletData {
             snicker_scan_min_utxo_input: String::from("10000"),
             snicker_scan_max_utxo_input: String::from("100000000"),
             snicker_scan_block_age_input: String::from("0"),
+            automation_enabled: true,  // Enabled by default
             automation_running: false,
-            automation_mode: AutomationMode::Disabled,
-            automation_max_delta: String::from("10000"),
-            automation_max_per_day: String::from("10"),
+            automation_mode: AutomationMode::Advanced,  // Advanced when enabled
+            automation_role: String::from("Proposer"),  // Default to Proposer
+            automation_max_sats_per_coinjoin: String::from("1000"),
+            automation_max_sats_per_day: String::from("2500"),
+            automation_max_sats_per_week: String::from("10000"),
             automation_interval_secs: String::from("10"),
             automation_task: None,
             utxos: Vec::new(),

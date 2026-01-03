@@ -5,17 +5,14 @@ use iced::widget::{column, container, text, button, row, text_input, scrollable}
 use iced::widget::scrollable::{Direction, Scrollbar};
 use iced::widget::button::Style;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
 use crate::gui::message::Message;
 use crate::gui::state::{WalletTab, WalletData};
 use crate::manager::Manager;
 
 /// Render the wallet loaded view
-pub fn view(manager: &Arc<RwLock<Manager>>, data: &WalletData) -> Element<'static, Message> {
-    let wallet_name_owned = manager.try_read()
-        .map(|m| m.wallet_node.name().to_string())
-        .unwrap_or_else(|_| "Wallet (locked)".to_string());
+pub fn view(manager: &Arc<Manager>, data: &WalletData) -> Element<'static, Message> {
+    let wallet_name_owned = manager.wallet_node.name().to_string();
     let current_tab = data.current_tab;
 
     // Left sidebar navigation
@@ -428,8 +425,7 @@ fn view_transactions() -> Element<'static, Message> {
 
 /// Automation section for SNICKER tab
 fn view_automation_section(data: &WalletData) -> Element<'static, Message> {
-    use crate::config::AutomationMode;
-    use iced::widget::pick_list;
+    // Removed: AutomationMode and pick_list - replaced with simple toggle
 
     // Status indicator
     let status_text = if data.automation_running {
@@ -438,68 +434,65 @@ fn view_automation_section(data: &WalletData) -> Element<'static, Message> {
         text("○ Stopped").size(14).color(Color::from_rgb(0.5, 0.5, 0.5)) // Gray
     };
 
-    // Mode dropdown
-    let mode_options = vec![
-        AutomationMode::Disabled,
-        AutomationMode::Basic,
-        AutomationMode::Advanced,
-    ];
-    let _mode_label = match data.automation_mode {
-        AutomationMode::Disabled => "Disabled",
-        AutomationMode::Basic => "Basic (Auto-accept)",
-        AutomationMode::Advanced => "Advanced (Auto-accept + Auto-create)",
+    // Enable/Disable toggle button
+    let toggle_label = if data.automation_enabled {
+        "Disable Automation"
+    } else {
+        "Enable Automation"
     };
 
-    // Start/Stop buttons
-    let start_button = if !data.automation_running && data.automation_mode != AutomationMode::Disabled {
-        button("Start Automation")
-            .on_press(Message::AutomationStart)
-            .padding(8)
-    } else {
-        button("Start Automation")
-            .padding(8)
-    };
+    // Role display
+    let role_text = text(format!("Role: {}", data.automation_role)).size(14);
 
-    let stop_button = if data.automation_running {
-        button("Stop Automation")
-            .on_press(Message::AutomationStop)
-            .padding(8)
+    // Build the control row based on state
+    let controls = if data.automation_enabled {
+        let start_label = "Start";
+        let stop_label = "Stop";
+
+        if data.automation_running {
+            row![
+                button(toggle_label).on_press(Message::AutomationToggleEnabled).padding(8),
+                button(start_label).padding(8),
+                button(stop_label).on_press(Message::AutomationStop).padding(8),
+            ].spacing(10)
+        } else {
+            row![
+                button(toggle_label).on_press(Message::AutomationToggleEnabled).padding(8),
+                button(start_label).on_press(Message::AutomationStart).padding(8),
+                button(stop_label).padding(8),
+            ].spacing(10)
+        }
     } else {
-        button("Stop Automation")
-            .padding(8)
+        row![
+            button(toggle_label).on_press(Message::AutomationToggleEnabled).padding(8),
+        ].spacing(10)
     };
 
     container(
         column![
             text("AUTOMATION").size(24),
-            text("Automatically accept and/or create SNICKER proposals").size(12),
-            row![
-                text("Mode:").size(14),
-                pick_list(
-                    mode_options,
-                    Some(data.automation_mode),
-                    |mode| Message::AutomationModeChanged(mode.to_string())
-                )
-                .width(Length::Fixed(300.0)),
-            ].spacing(10),
-            row![
-                text("Max Delta:").size(14),
-                text_input("10000", &data.automation_max_delta)
-                    .on_input(Message::AutomationMaxDeltaChanged)
-                    .width(Length::Fixed(100.0)),
-                text("sats").size(14),
-                text("Max Proposals/Day:").size(14),
-                text_input("10", &data.automation_max_per_day)
-                    .on_input(Message::AutomationMaxPerDayChanged)
-                    .width(Length::Fixed(60.0)),
-            ].spacing(10),
+            text("Automatically participate in SNICKER coinjoins").size(12),
+            controls,
             row![
                 text("Status:").size(14),
                 status_text,
+                role_text,
             ].spacing(10),
             row![
-                start_button,
-                stop_button,
+                text("Max sats/coinjoin:").size(14),
+                text_input("1000", &data.automation_max_sats_per_coinjoin)
+                    .on_input(Message::AutomationMaxSatsPerCoinjoinChanged)
+                    .width(Length::Fixed(80.0)),
+            ].spacing(10),
+            row![
+                text("Max sats/day:").size(14),
+                text_input("2500", &data.automation_max_sats_per_day)
+                    .on_input(Message::AutomationMaxSatsPerDayChanged)
+                    .width(Length::Fixed(80.0)),
+                text("Max sats/week:").size(14),
+                text_input("10000", &data.automation_max_sats_per_week)
+                    .on_input(Message::AutomationMaxSatsPerWeekChanged)
+                    .width(Length::Fixed(80.0)),
             ].spacing(10),
         ].spacing(10)
     )

@@ -47,6 +47,73 @@ use bdk_wallet::{
 use serde::{Serialize, Deserialize};
 
 // ============================================================
+// AUTOMATION STATE
+// ============================================================
+
+/// Role in the SNICKER automation state machine
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AutomationRole {
+    /// Actively maintaining N outstanding proposals
+    Proposer,
+    /// Waiting only, no new proposals created
+    Receiver,
+}
+
+impl AutomationRole {
+    /// Flip a coin to get a random role
+    pub fn coin_flip() -> Self {
+        if rand::random::<bool>() {
+            AutomationRole::Proposer
+        } else {
+            AutomationRole::Receiver
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AutomationRole::Proposer => "proposer",
+            AutomationRole::Receiver => "receiver",
+        }
+    }
+}
+
+impl std::str::FromStr for AutomationRole {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.to_lowercase().as_str() {
+            "proposer" => Ok(AutomationRole::Proposer),
+            "receiver" => Ok(AutomationRole::Receiver),
+            _ => Err(anyhow!("Invalid automation role: {}", s)),
+        }
+    }
+}
+
+impl std::fmt::Display for AutomationRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// Persisted automation state
+#[derive(Debug, Clone)]
+pub struct AutomationState {
+    /// Current role (Proposer or Receiver)
+    pub role: AutomationRole,
+    /// Block height of most recent successful coinjoin (or wallet creation height)
+    pub last_coinjoin_height: u32,
+}
+
+impl Default for AutomationState {
+    fn default() -> Self {
+        Self {
+            role: AutomationRole::Proposer,
+            last_coinjoin_height: 0,
+        }
+    }
+}
+
+// ============================================================
 // SNICKER PROPOSAL VERSIONING
 // ============================================================
 
@@ -937,6 +1004,8 @@ impl Snicker {
         Self::init_automation_log_table(conn)?;
         Self::init_pending_transactions_table(conn)?;
         Self::init_proposal_pairings_table(conn)?;
+        Self::init_automation_state_table(conn)?;
+        Self::init_coinjoin_spending_table(conn)?;
         Ok(())
     }
 
@@ -1124,6 +1193,41 @@ impl Snicker {
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_proposal_pairings_our
              ON proposal_pairings(our_txid, our_vout)",
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// Initialize the automation state table for persisting proposer/receiver mode
+    fn init_automation_state_table(conn: &mut Connection) -> Result<()> {
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS automation_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                mode TEXT NOT NULL DEFAULT 'proposer',
+                last_coinjoin_height INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL
+            )",
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// Initialize the coinjoin spending table for tracking sats spent on coinjoins
+    fn init_coinjoin_spending_table(conn: &mut Connection) -> Result<()> {
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS coinjoin_spending (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp INTEGER NOT NULL,
+                delta_sats INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                txid TEXT NOT NULL
+            )",
+            [],
+        )?;
+        // Index for efficient time-based queries
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_coinjoin_spending_timestamp
+             ON coinjoin_spending(timestamp)",
             [],
         )?;
         Ok(())
@@ -1823,6 +1927,300 @@ impl Snicker {
     }
 
     // ============================================================
+    // AUTOMATION STATE
+    // ============================================================
+
+    /// Get the current automation state from database
+    /// Returns default state (Proposer, height 0) if no state exists
+    pub fn get_automation_state(&self) -> AutomationState {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT mode, last_coinjoin_height FROM automation_state WHERE id = 1",
+            [],
+            |row| {
+                let mode_str: String = row.get(0)?;
+                let height: u32 = row.get(1)?;
+                let role = mode_str.parse::<AutomationRole>().unwrap_or(AutomationRole::Proposer);
+                Ok(AutomationState {
+                    role,
+                    last_coinjoin_height: height,
+                })
+            },
+        ).unwrap_or_default()
+    }
+
+    /// Set the automation state in database
+    pub fn set_automation_state(&self, state: &AutomationState) -> Result<()> {
+        {
+            let conn = self.conn.lock().unwrap();
+            Self::set_automation_state_static(&conn, state)?;
+        } // Drop lock before flush_db
+        self.flush_db()?;
+        Ok(())
+    }
+
+    /// Initialize automation state if it doesn't exist
+    /// Sets to Proposer role with the given initial height
+    /// Returns true if state was initialized, false if it already existed
+    pub fn initialize_automation_state(&self, initial_height: u32) -> Result<bool> {
+        let state = self.get_automation_state();
+        if state.last_coinjoin_height == 0 {
+            // No state exists, initialize with Proposer role
+            let new_state = AutomationState {
+                role: AutomationRole::Proposer,
+                last_coinjoin_height: initial_height,
+            };
+            self.set_automation_state(&new_state)?;
+            tracing::info!(
+                "Initialized automation state: Proposer mode, base height {}",
+                initial_height
+            );
+            Ok(true)
+        } else {
+            tracing::debug!(
+                "Automation state already exists: {:?} at height {}",
+                state.role, state.last_coinjoin_height
+            );
+            Ok(false)
+        }
+    }
+
+    /// Get automation state (static version for use with raw connection)
+    pub fn get_automation_state_static(conn: &Connection) -> AutomationState {
+        conn.query_row(
+            "SELECT mode, last_coinjoin_height FROM automation_state WHERE id = 1",
+            [],
+            |row| {
+                let mode_str: String = row.get(0)?;
+                let height: u32 = row.get(1)?;
+                let role = mode_str.parse::<AutomationRole>().unwrap_or(AutomationRole::Proposer);
+                Ok(AutomationState {
+                    role,
+                    last_coinjoin_height: height,
+                })
+            },
+        ).unwrap_or_default()
+    }
+
+    /// Set automation state (static version for use with raw connection)
+    pub fn set_automation_state_static(conn: &Connection, state: &AutomationState) -> Result<()> {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64;
+
+        conn.execute(
+            "INSERT INTO automation_state (id, mode, last_coinjoin_height, updated_at)
+             VALUES (1, ?1, ?2, ?3)
+             ON CONFLICT(id) DO UPDATE SET
+                mode = excluded.mode,
+                last_coinjoin_height = excluded.last_coinjoin_height,
+                updated_at = excluded.updated_at",
+            (state.role.as_str(), state.last_coinjoin_height, timestamp),
+        )?;
+
+        tracing::info!(
+            "Updated automation state: role={}, last_coinjoin_height={}",
+            state.role, state.last_coinjoin_height
+        );
+
+        Ok(())
+    }
+
+    /// Perform coin flip and update state after a successful coinjoin
+    /// Returns the new role
+    pub fn on_coinjoin_confirmed(&self, block_height: u32) -> Result<AutomationRole> {
+        let new_role = AutomationRole::coin_flip();
+        let new_state = AutomationState {
+            role: new_role,
+            last_coinjoin_height: block_height,
+        };
+
+        self.set_automation_state(&new_state)?;
+        tracing::info!(
+            "Coinjoin confirmed at height {}. Coin flip result: {}",
+            block_height, new_role
+        );
+
+        Ok(new_role)
+    }
+
+    /// Check if receiver timeout has elapsed and reroll if needed
+    /// Returns Some(new_role) if reroll occurred, None otherwise
+    pub fn check_receiver_timeout(&self, current_height: u32, timeout_blocks: u32) -> Result<Option<AutomationRole>> {
+        let state = self.get_automation_state();
+
+        // Only applies when in Receiver mode
+        if state.role != AutomationRole::Receiver {
+            return Ok(None);
+        }
+
+        let blocks_since_coinjoin = current_height.saturating_sub(state.last_coinjoin_height);
+
+        if blocks_since_coinjoin >= timeout_blocks {
+            let new_role = AutomationRole::coin_flip();
+            let new_state = AutomationState {
+                role: new_role,
+                last_coinjoin_height: state.last_coinjoin_height, // Don't update height on timeout
+            };
+
+            self.set_automation_state(&new_state)?;
+            tracing::info!(
+                "Receiver timeout after {} blocks (threshold: {}). Coin flip result: {}",
+                blocks_since_coinjoin, timeout_blocks, new_role
+            );
+
+            Ok(Some(new_role))
+        } else {
+            tracing::debug!(
+                "Receiver mode: {} blocks since last coinjoin (timeout at {})",
+                blocks_since_coinjoin, timeout_blocks
+            );
+            Ok(None)
+        }
+    }
+
+    /// Get the number of outstanding proposals (for maintaining N proposals)
+    pub fn count_outstanding_proposals(&self) -> usize {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(DISTINCT our_txid || ':' || our_vout) FROM proposal_pairings",
+            [],
+            |row| row.get::<_, i64>(0),
+        ).map(|c| c as usize).unwrap_or(0)
+    }
+
+    // ============================================================
+    // COINJOIN SPENDING TRACKING
+    // ============================================================
+
+    /// Record a completed coinjoin and its delta (sats spent/received)
+    /// delta_sats > 0 means we paid sats, < 0 means we received sats
+    pub fn record_coinjoin_spending(
+        &self,
+        delta_sats: i64,
+        role: &str,
+        txid: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64;
+
+        conn.execute(
+            "INSERT INTO coinjoin_spending (timestamp, delta_sats, role, txid)
+             VALUES (?1, ?2, ?3, ?4)",
+            (timestamp, delta_sats, role, txid),
+        )?;
+
+        tracing::info!(
+            "Recorded coinjoin spending: {} sats (role: {}, txid: {})",
+            delta_sats, role, txid
+        );
+        Ok(())
+    }
+
+    /// Record coinjoin spending (static version for use with raw connection)
+    pub fn record_coinjoin_spending_static(
+        conn: &Connection,
+        delta_sats: i64,
+        role: &str,
+        txid: &str,
+    ) -> Result<()> {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64;
+
+        conn.execute(
+            "INSERT INTO coinjoin_spending (timestamp, delta_sats, role, txid)
+             VALUES (?1, ?2, ?3, ?4)",
+            (timestamp, delta_sats, role, txid),
+        )?;
+
+        tracing::info!(
+            "Recorded coinjoin spending: {} sats (role: {}, txid: {})",
+            delta_sats, role, txid
+        );
+        Ok(())
+    }
+
+    /// Get total sats spent on coinjoins in the last N seconds
+    /// Only counts positive deltas (where we paid sats)
+    pub fn get_spending_since(&self, seconds: u64) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let cutoff = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64 - seconds as i64;
+
+        let spent: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(CASE WHEN delta_sats > 0 THEN delta_sats ELSE 0 END), 0)
+             FROM coinjoin_spending
+             WHERE timestamp >= ?1",
+            [cutoff],
+            |row| row.get(0),
+        )?;
+
+        Ok(spent.max(0) as u64)
+    }
+
+    /// Get spending for the last 24 hours
+    pub fn get_spending_last_day(&self) -> Result<u64> {
+        self.get_spending_since(86400) // 24 * 60 * 60
+    }
+
+    /// Get spending for the last 7 days
+    pub fn get_spending_last_week(&self) -> Result<u64> {
+        self.get_spending_since(604800) // 7 * 24 * 60 * 60
+    }
+
+    /// Check if a proposed coinjoin would exceed spending limits
+    /// Returns Ok(true) if within limits, Ok(false) if would exceed
+    pub fn check_spending_limits(
+        &self,
+        delta_sats: i64,
+        max_per_coinjoin: u64,
+        max_per_day: u64,
+        max_per_week: u64,
+    ) -> Result<bool> {
+        // Only count positive deltas (where we're paying)
+        if delta_sats <= 0 {
+            return Ok(true); // No cost, always allowed
+        }
+
+        let delta_u64 = delta_sats as u64;
+
+        // Check per-coinjoin limit
+        if delta_u64 > max_per_coinjoin {
+            tracing::info!(
+                "Coinjoin delta {} sats exceeds per-coinjoin limit of {} sats",
+                delta_u64, max_per_coinjoin
+            );
+            return Ok(false);
+        }
+
+        // Check daily limit
+        let spent_today = self.get_spending_last_day()?;
+        if spent_today + delta_u64 > max_per_day {
+            tracing::info!(
+                "Would exceed daily limit: {} + {} > {} sats",
+                spent_today, delta_u64, max_per_day
+            );
+            return Ok(false);
+        }
+
+        // Check weekly limit
+        let spent_week = self.get_spending_last_week()?;
+        if spent_week + delta_u64 > max_per_week {
+            tracing::info!(
+                "Would exceed weekly limit: {} + {} > {} sats",
+                spent_week, delta_u64, max_per_week
+            );
+            return Ok(false);
+        }
+
+        Ok(true)
+    }
+
+    // ============================================================
     // AUTOMATION & RATE LIMITING
     // ============================================================
 
@@ -2067,7 +2465,7 @@ mod tests {
     #[test]
     fn test_snicker_struct_creation() {
         let snicker = create_test_snicker();
-        assert_eq!(snicker.network, Network::Regtest);
+        assert_eq!(snicker._network, Network::Regtest);
     }
 
     // ============================================================

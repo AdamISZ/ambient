@@ -2,7 +2,6 @@ use anyhow::Result;
 use std::io::{self, Write};
 use std::fs;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use dialoguer::Password;
 
 use crate::manager::Manager;
@@ -93,7 +92,7 @@ pub async fn repl(
     println!("RustSnicker Wallet 🥷");
     println!("Type 'help' for commands.\n");
 
-    let mut manager_arc: Option<Arc<RwLock<Manager>>> = None;
+    let mut manager_arc: Option<Arc<Manager>> = None;
     let mut opportunities: Vec<ProposalOpportunity> = Vec::new();
     let mut last_scan_delta_range: Option<(i64, i64)> = None;
     let mut last_created_proposal: Option<EncryptedProposal> = None;
@@ -140,7 +139,7 @@ pub async fn repl(
                 }
 
                 println!("🪄 Creating wallet '{name}' …");
-                let (mut manager, mnemonic) =
+                let (manager, mnemonic) =
                     Manager::generate(name, network_str, recovery_height, &password).await?;
                 println!("🔑 New mnemonic (store this safely!):\n{mnemonic}\n");
                 println!("⚠️  IMPORTANT: Backup the entire wallet directory!");
@@ -155,7 +154,7 @@ pub async fn repl(
                     }
                 }
 
-                manager_arc = Some(Arc::new(RwLock::new(manager)));
+                manager_arc = Some(Arc::new(manager));
             }
 
             "load" => {
@@ -181,7 +180,7 @@ pub async fn repl(
 
                     println!("📁 Loading wallet '{name}' …");
                     match Manager::load(name, network_str, recovery_height, &password, peer.clone()).await {
-                        Ok(mut manager) => {
+                        Ok(manager) => {
                             // Configure RPC if provided
                             if let Some((ref url, ref user, ref password)) = rpc_config {
                                 if let Err(e) = manager.set_rpc_client(url, (user.clone(), password.clone())) {
@@ -190,7 +189,7 @@ pub async fn repl(
                                 }
                             }
 
-                            manager_arc = Some(Arc::new(RwLock::new(manager)));
+                            manager_arc = Some(Arc::new(manager));
                             break; // Success, exit retry loop
                         }
                         Err(e) => {
@@ -211,8 +210,7 @@ pub async fn repl(
 
             "balance" => {
                 if let Some(arc) = manager_arc.as_ref() {
-                    let mgr = arc.read().await;
-                    println!("{}", mgr.get_balance_with_pending().await?);
+                    println!("{}", arc.get_balance_with_pending().await?);
                 } else {
                     println!("No wallet loaded.");
                 }
@@ -220,8 +218,7 @@ pub async fn repl(
 
             "address" => {
                 if let Some(arc) = manager_arc.as_ref() {
-                    let mut mgr = arc.write().await;
-                    let addr = mgr.get_next_address().await?;
+                    let addr = arc.get_next_address().await?;
                     println!("Next address: {addr}");
                 } else {
                     println!("No wallet loaded.");
@@ -230,8 +227,7 @@ pub async fn repl(
 
             "listunspent" => {
                 if let Some(arc) = manager_arc.as_ref() {
-                    let mgr = arc.read().await;
-                    let utxos = mgr.list_unspent_with_status().await?;
+                    let utxos = arc.list_unspent_with_status().await?;
                     if utxos.is_empty() {
                         println!("No UTXOs.");
                     } else {
@@ -246,8 +242,7 @@ pub async fn repl(
 
             "summary" => {
                 if let Some(arc) = manager_arc.as_ref() {
-                    let mgr = arc.read().await;
-                    mgr.print_summary().await;
+                    arc.print_summary().await;
                 } else {
                     println!("No wallet loaded.");
                 }
@@ -255,8 +250,7 @@ pub async fn repl(
 
             "peek" => {
                 if let Some(arc) = manager_arc.as_ref() {
-                    let mgr = arc.write().await;
-                    let addresses = mgr.peek_addresses(10).await?;
+                    let addresses = arc.peek_addresses(10).await?;
                     for addr in addresses {
                         println!("{}", addr);
                     }
@@ -267,8 +261,7 @@ pub async fn repl(
 
             "reregister" => {
                 if let Some(arc) = manager_arc.as_ref() {
-                    let mut mgr = arc.write().await;
-                    println!("{}", mgr.reregister_revealed().await?);
+                    println!("{}", arc.reregister_revealed().await?);
                 } else {
                     println!("No wallet loaded.");
                 }
@@ -280,9 +273,8 @@ pub async fn repl(
                     continue;
                 }
                 if let Some(arc) = manager_arc.as_ref() {
-                    let mut mgr = arc.write().await;
                     let index: u32 = args[0].parse().unwrap_or(0);
-                    println!("{}", mgr.reveal_up_to(index).await?);
+                    println!("{}", arc.reveal_up_to(index).await?);
                 } else {
                     println!("No wallet loaded.");
                 }
@@ -290,8 +282,7 @@ pub async fn repl(
 
             "debug" => {
                 if let Some(arc) = manager_arc.as_ref() {
-                    let mgr = arc.read().await;
-                    println!("{}", mgr.debug_transactions().await?);
+                    println!("{}", arc.debug_transactions().await?);
                 } else {
                     println!("No wallet loaded.");
                 }
@@ -314,12 +305,10 @@ pub async fn repl(
                         }
                     };
 
-                    let mut mgr = arc.write().await;
-
                     // Use auto fee estimation if no fee rate provided
                     if args.len() == 2 {
                         println!("Sending {} sats to {} (auto fee estimation)...", amount, address);
-                        match mgr.send_to_address_auto(address, amount).await {
+                        match arc.send_to_address_auto(address, amount).await {
                             Ok(txid) => println!("✅ Transaction broadcast: {}", txid),
                             Err(e) => println!("❌ Error: {}", e),
                         }
@@ -332,7 +321,7 @@ pub async fn repl(
                             }
                         };
                         println!("Sending {} sats to {} (fee rate: {} sat/vB)...", amount, address, fee_rate);
-                        match mgr.send_to_address(address, amount, fee_rate).await {
+                        match arc.send_to_address(address, amount, fee_rate).await {
                             Ok(txid) => println!("✅ Transaction broadcast: {}", txid),
                             Err(e) => println!("❌ Error: {}", e),
                         }
@@ -372,8 +361,7 @@ pub async fn repl(
 
                     println!("Building SNICKER transaction: {} sats to {} (fee rate: {} sat/vB)...",
                              amount, address, fee_rate);
-                    let mut mgr = arc.write().await;
-                    match mgr.build_snicker_tx(address, amount, fee_rate).await {
+                    match arc.build_snicker_tx(address, amount, fee_rate).await {
                         Ok(tx_hex) => {
                             println!("✅ Transaction built successfully!");
                             println!("");
@@ -408,8 +396,7 @@ pub async fn repl(
                     match hash_str.parse::<bdk_wallet::bitcoin::BlockHash>() {
                         Ok(block_hash) => {
                             println!("🔍 Fetching block {} via Kyoto P2P...", block_hash);
-                            let mgr = arc.write().await;
-                            match mgr.get_block_info(block_hash).await {
+                            match arc.get_block_info(block_hash).await {
                                 Ok((version, prev_blockhash, num_txs, p2tr_count)) => {
                                     println!("✅ Successfully fetched block:");
                                     println!("   Hash: {}", block_hash);
@@ -451,8 +438,7 @@ pub async fn repl(
                     };
 
                     println!("🔍 Querying Kyoto headers.db for heights {}-{}...", start_height, end_height);
-                    let mgr = arc.read().await;
-                    match mgr.get_block_hashes_from_headers_db(start_height, end_height).await {
+                    match arc.get_block_hashes_from_headers_db(start_height, end_height).await {
                         Ok(hashes) => {
                             println!("✅ Retrieved {} block hashes:", hashes.len());
                             for (height, hash) in hashes.iter().take(10) {
@@ -517,8 +503,7 @@ pub async fn repl(
 
                     println!("🔍 Finding SNICKER opportunities (candidates: {}-{} sats, block_age: {}, snicker_only={})...",
                              min_candidate_sats, max_candidate_sats, max_block_age, snicker_only);
-                    let mgr = arc.write().await;
-                    match mgr.find_snicker_opportunities(min_candidate_sats, max_candidate_sats, max_block_age, snicker_only).await {
+                    match arc.find_snicker_opportunities(min_candidate_sats, max_candidate_sats, max_block_age, snicker_only).await {
                         Ok(found) => {
                             if found.is_empty() {
                                 println!("No opportunities found.");
@@ -555,8 +540,7 @@ pub async fn repl(
 
             "clear_proposals" => {
                 if let Some(arc) = manager_arc.as_ref() {
-                    let mgr = arc.write().await;
-                    match mgr.clear_snicker_proposals().await {
+                    match arc.clear_snicker_proposals().await {
                         Ok(count) => println!("✅ Cleared {} proposals", count),
                         Err(e) => println!("❌ Error: {}", e),
                     }
@@ -567,9 +551,8 @@ pub async fn repl(
 
             "snicker_pattern_check" => {
                 if let Some(arc) = manager_arc.as_ref() {
-                    let mgr = arc.read().await;
                     // Query candidates with reasonable defaults (10k-100M sats, all blocks, all transaction types)
-                    match mgr.get_snicker_candidates(10_000, 100_000_000, 0, false).await {
+                    match arc.get_snicker_candidates(10_000, 100_000_000, 0, false).await {
                         Ok(all_candidates) => {
                             println!("🔍 Listing {} candidate UTXOs...\n", all_candidates.len());
 
@@ -640,8 +623,7 @@ pub async fn repl(
                              opp.our_value.to_sat());
                     println!("   Target: {} sats, Delta: {} sats", opp.target_txout.value.to_sat(), delta_sats);
 
-                    let mut mgr = arc.write().await;
-                    match mgr.create_snicker_proposal(opp, delta_sats, crate::config::DEFAULT_MIN_CHANGE_OUTPUT_SIZE).await {
+                    match arc.create_snicker_proposal(opp, delta_sats, crate::config::DEFAULT_MIN_CHANGE_OUTPUT_SIZE).await {
                         Ok((proposal, encrypted_proposal)) => {
                             println!("✅ Proposal created!");
                             println!("   Tag: {}", ::hex::encode(&proposal.tag));
@@ -685,8 +667,7 @@ pub async fn repl(
                     // Store delta range for later use in accept_proposal
                     last_scan_delta_range = Some((min_delta, max_delta));
 
-                    let mgr = arc.write().await;
-                    match mgr.scan_for_our_proposals((min_delta, max_delta)).await {
+                    match arc.scan_for_our_proposals((min_delta, max_delta)).await {
                         Ok(found) => {
                             if found.is_empty() {
                                 println!("No proposals found for our UTXOs.");
@@ -695,7 +676,7 @@ pub async fn repl(
                                 for proposal in found.iter().take(10) {
                                     // Use Manager's formatting method
                                     let (tag_hex, proposer_input, proposer_value, receiver_output, delta) =
-                                        mgr.format_proposal_info(proposal);
+                                        arc.format_proposal_info(proposal);
 
                                     println!("  [{}] Proposer: {} ({} sats) → Our output: {} sats (delta: {})",
                                              tag_hex, proposer_input, proposer_value, receiver_output, delta);
@@ -737,8 +718,7 @@ pub async fn repl(
                     println!("✍️  Accepting proposal {}...", tag_hex);
 
                     // Use the high-level manager method that handles the complete workflow
-                    let mut mgr = arc.write().await;
-                    match mgr.accept_and_broadcast_snicker_proposal(&tag, acceptable_range).await {
+                    match arc.accept_and_broadcast_snicker_proposal(&tag, acceptable_range).await {
                         Ok(txid) => {
                             println!("✅ SNICKER coinjoin broadcast: {}", txid);
                             println!("🎉 SNICKER coinjoin complete!");
@@ -784,8 +764,7 @@ pub async fn repl(
                             // Parse the hex-encoded format back to EncryptedProposal
                             match parse_encrypted_proposal(&contents) {
                                 Ok(proposal) => {
-                                    let mut mgr = arc.write().await;
-                                    match mgr.store_snicker_proposal(&proposal).await {
+                                    match arc.store_snicker_proposal(&proposal).await {
                                         Ok(_) => {
                                             println!("✅ Proposal loaded and stored");
                                             println!("   Use 'scan_proposals' to find it among your UTXOs");
@@ -835,8 +814,9 @@ pub async fn repl(
 
                     println!("🤖 Starting SNICKER automation...");
                     println!("   Mode: {:?}", config.snicker_automation.mode);
-                    println!("   Max delta: {} sats", config.snicker_automation.max_delta);
-                    println!("   Max proposals/day: {}", config.snicker_automation.max_proposals_per_day);
+                    println!("   Max sats/coinjoin: {}", config.snicker_automation.max_sats_per_coinjoin);
+                    println!("   Max sats/day: {}", config.snicker_automation.max_sats_per_day);
+                    println!("   Max sats/week: {}", config.snicker_automation.max_sats_per_week);
                     println!("   Interval: {} seconds", task_config.interval_secs);
 
                     task.start(
@@ -874,8 +854,9 @@ pub async fn repl(
                         // Load config to show current settings
                         if let Ok(config) = Config::load() {
                             println!("   Mode: {:?}", config.snicker_automation.mode);
-                            println!("   Max delta: {} sats", config.snicker_automation.max_delta);
-                            println!("   Max proposals/day: {}", config.snicker_automation.max_proposals_per_day);
+                            println!("   Max sats/coinjoin: {}", config.snicker_automation.max_sats_per_coinjoin);
+                            println!("   Max sats/day: {}", config.snicker_automation.max_sats_per_day);
+                            println!("   Max sats/week: {}", config.snicker_automation.max_sats_per_week);
                             println!("   SNICKER pattern only: {}", config.snicker_automation.snicker_pattern_only);
                             println!("   Prefer SNICKER outputs: {}", config.snicker_automation.prefer_snicker_outputs);
                         }

@@ -131,7 +131,7 @@ pub struct WalletNode {
     /// Encapsulates private key access with encryption at rest
     signer: Arc<dyn Signer>,
     /// Optional Bitcoin Core RPC client (required for proposer mode scanning)
-    pub(crate) rpc_client: Option<Arc<bdk_bitcoind_rpc::bitcoincore_rpc::Client>>,
+    pub(crate) rpc_client: std::sync::Mutex<Option<Arc<bdk_bitcoind_rpc::bitcoincore_rpc::Client>>>,
     /// Wallet name (for locating correct headers.db)
     wallet_name: String,
     /// Shared in-memory SNICKER database connection (uses std::sync::Mutex for sync access)
@@ -388,7 +388,7 @@ impl WalletNode {
             requester,
             network,
             signer,
-            rpc_client: None,
+            rpc_client: std::sync::Mutex::new(None),
             wallet_name: name.to_string(),
             snicker_conn,
             update_tx,
@@ -788,11 +788,6 @@ impl WalletNode {
                         }
                     }
                     if max_external > 0 || max_internal > 0 {
-                        // tracing::debug!("🔧 Repopulating SPK index after scan: External up to {}, Internal up to {}",
-                        //     max_external, max_internal);
-                        // Use peek_address() to add scripts to SPK index WITHOUT advancing derivation index
-                        // This allows the light client to scan for these addresses while keeping
-                        // the next user-facing address at the first unused one
                         for index in 0..=(max_external + RECOVERY_LOOKAHEAD) {
                             let _ = wallet_guard.peek_address(KeychainKind::External, index);
                         }
@@ -1029,18 +1024,126 @@ impl WalletNode {
                                         // Clean up proposal pairings for any spent UTXOs
                                         // (both target UTXOs and our own UTXOs)
                                         if !spent_outpoints.is_empty() {
-                                            let conn = snicker_conn.lock().unwrap();
-                                            for outpoint in &spent_outpoints {
-                                                let txid_str = outpoint.txid.to_string();
-                                                // Delete pairings where this was the target
-                                                crate::snicker::Snicker::delete_pairings_for_target(
-                                                    &conn, &txid_str, outpoint.vout
+                                            // Phase 1: Identify coinjoins and collect info (sync operations only)
+                                            let mut coinjoin_detected = false;
+                                            let mut coinjoin_cost_info: Option<(bdk_wallet::bitcoin::Txid, u64, Vec<bdk_wallet::bitcoin::ScriptBuf>, Vec<u64>)> = None;
+
+                                            {
+                                                let conn = snicker_conn.lock().unwrap();
+
+                                                for outpoint in &spent_outpoints {
+                                                    let txid_str = outpoint.txid.to_string();
+
+                                                    // Check if this was our UTXO with a live proposal
+                                                    let had_proposal: bool = conn.query_row(
+                                                        "SELECT 1 FROM proposal_pairings WHERE our_txid = ? AND our_vout = ? LIMIT 1",
+                                                        (&txid_str, outpoint.vout),
+                                                        |_| Ok(true),
+                                                    ).unwrap_or(false);
+
+                                                    if had_proposal && !coinjoin_detected {
+                                                        // Find the spending transaction in this block
+                                                        for tx in &indexed_block.block.txdata {
+                                                            for input in &tx.input {
+                                                                if input.previous_output == *outpoint {
+                                                                    if crate::snicker::is_likely_snicker_transaction(tx) {
+                                                                        let coinjoin_txid = tx.compute_txid();
+                                                                        tracing::info!(
+                                                                            "🎉 Coinjoin detected! UTXO {}:{} spent in SNICKER tx {}",
+                                                                            outpoint.txid, outpoint.vout, coinjoin_txid
+                                                                        );
+
+                                                                        // Get our input amount from partial_utxo_set
+                                                                        let our_input_amount = match utxo_set.get(outpoint) {
+                                                                            Ok(Some(utxo)) => utxo.amount,
+                                                                            _ => {
+                                                                                tracing::warn!("Could not find input amount for {}:{}", outpoint.txid, outpoint.vout);
+                                                                                0
+                                                                            }
+                                                                        };
+
+                                                                        // Collect output scripts and amounts for async wallet check
+                                                                        let scripts: Vec<_> = tx.output.iter()
+                                                                            .map(|o| o.script_pubkey.clone())
+                                                                            .collect();
+                                                                        let amounts: Vec<_> = tx.output.iter()
+                                                                            .map(|o| o.value.to_sat())
+                                                                            .collect();
+
+                                                                        coinjoin_cost_info = Some((coinjoin_txid, our_input_amount, scripts, amounts));
+                                                                        coinjoin_detected = true;
+                                                                        break;
+                                                                    }
+                                                                }
+                                                            }
+                                                            if coinjoin_detected {
+                                                                break;
+                                                            }
+                                                        }
+                                                    }
+
+                                                    // Delete pairings where this was the target
+                                                    crate::snicker::Snicker::delete_pairings_for_target(
+                                                        &conn, &txid_str, outpoint.vout
+                                                    );
+                                                    // Delete pairings where this was our UTXO
+                                                    crate::snicker::Snicker::delete_pairings_for_our_utxo(
+                                                        &conn, &txid_str, outpoint.vout
+                                                    );
+                                                }
+                                            } // Release conn before async operations
+
+                                            // Phase 2: Async wallet check for output ownership (if coinjoin detected)
+                                            if let Some((coinjoin_txid, our_input_amount, scripts, amounts)) = coinjoin_cost_info {
+                                                let wallet_guard = wallet.lock().await;
+                                                let mut our_output_amount: u64 = 0;
+                                                for (script, amount) in scripts.iter().zip(amounts.iter()) {
+                                                    if wallet_guard.is_mine(script.clone()) {
+                                                        our_output_amount += amount;
+                                                    }
+                                                }
+                                                drop(wallet_guard);
+
+                                                // Cost = what we put in - what we got out
+                                                let cost_sats = our_input_amount.saturating_sub(our_output_amount);
+                                                tracing::info!(
+                                                    "💰 Coinjoin cost: {} sats (input: {}, outputs: {})",
+                                                    cost_sats, our_input_amount, our_output_amount
                                                 );
-                                                // Delete pairings where this was our UTXO
-                                                crate::snicker::Snicker::delete_pairings_for_our_utxo(
-                                                    &conn, &txid_str, outpoint.vout
-                                                );
+
+                                                // Record spending (re-acquire conn)
+                                                let conn = snicker_conn.lock().unwrap();
+                                                if let Err(e) = crate::snicker::Snicker::record_coinjoin_spending_static(
+                                                    &conn,
+                                                    cost_sats as i64,
+                                                    "proposer",
+                                                    &coinjoin_txid.to_string(),
+                                                ) {
+                                                    tracing::error!("Failed to record coinjoin spending: {}", e);
+                                                }
+                                                drop(conn);
                                             }
+
+                                            // Phase 3: Role flip and flush (re-acquire conn)
+                                            let conn = snicker_conn.lock().unwrap();
+                                            if coinjoin_detected {
+                                                // Read current state, flip role
+                                                let current_state = crate::snicker::Snicker::get_automation_state_static(&conn);
+                                                let new_role = crate::snicker::AutomationRole::coin_flip();
+                                                let new_state = crate::snicker::AutomationState {
+                                                    role: new_role,
+                                                    last_coinjoin_height: scan_height,
+                                                };
+                                                if let Err(e) = crate::snicker::Snicker::set_automation_state_static(&conn, &new_state) {
+                                                    tracing::error!("Failed to update automation state after coinjoin: {}", e);
+                                                } else {
+                                                    tracing::info!(
+                                                        "🎲 Coin flip after coinjoin at height {}: {} -> {}",
+                                                        scan_height, current_state.role, new_role
+                                                    );
+                                                }
+                                            }
+
                                             // Flush after pairing cleanup
                                             if let Err(e) = snicker_db.flush(&*conn) {
                                                 tracing::error!("Failed to flush SNICKER database after pairing cleanup: {}", e);
@@ -1481,7 +1584,7 @@ impl WalletNode {
 
     /// Get next address and persist derivation index.
     /// Note: In bdk_kyoto 0.15+, scripts are automatically registered from the wallet.
-    pub async fn get_next_address(&mut self) -> Result<String> {
+    pub async fn get_next_address(&self) -> Result<String> {
         let mut wallet = self.wallet.lock().await;
         let mut conn = self.conn.lock().await;
 
@@ -1515,7 +1618,7 @@ impl WalletNode {
 
   /// Note: In bdk_kyoto 0.15+, scripts are automatically registered from the wallet.
   /// This function is kept for compatibility but no longer does anything.
-  pub async fn reregister_revealed(&mut self) -> Result<String> {
+  pub async fn reregister_revealed(&self) -> Result<String> {
       let wallet = self.wallet.lock().await;
       let last_revealed = wallet.derivation_index(KeychainKind::External).unwrap_or(0);
 
@@ -1528,7 +1631,7 @@ impl WalletNode {
 
   /// Reveal addresses up to a specific index.
   /// Note: In bdk_kyoto 0.15+, scripts are automatically registered from the wallet.
-  pub async fn reveal_up_to(&mut self, index: u32) -> Result<String> {
+  pub async fn reveal_up_to(&self, index: u32) -> Result<String> {
       let mut wallet = self.wallet.lock().await;
       let mut conn = self.conn.lock().await;
       let current = wallet.derivation_index(KeychainKind::External).unwrap_or(0);
@@ -1748,12 +1851,12 @@ impl WalletNode {
     /// # Arguments
     /// * `url` - RPC URL (e.g., "http://127.0.0.1:18443")
     /// * `auth` - Authentication (username, password)
-    pub fn set_rpc_client(&mut self, url: &str, auth: (String, String)) -> Result<()> {
+    pub fn set_rpc_client(&self, url: &str, auth: (String, String)) -> Result<()> {
         use bdk_bitcoind_rpc::bitcoincore_rpc::{Auth, Client};
 
         let rpc_auth = Auth::UserPass(auth.0, auth.1);
         let client = Client::new(url, rpc_auth)?;
-        self.rpc_client = Some(Arc::new(client));
+        *self.rpc_client.lock().unwrap() = Some(Arc::new(client));
 
         info!("✅ Bitcoin Core RPC client connected: {}", url);
         Ok(())
@@ -2103,7 +2206,7 @@ impl WalletNode {
     /// * `tx` - The transaction to insert
     /// * `block_height` - Block height where the transaction was confirmed
     pub async fn insert_tx_at_height(
-        &mut self,
+        &self,
         tx: &Transaction,
         block_height: u32,
     ) -> Result<()> {

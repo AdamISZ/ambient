@@ -24,7 +24,7 @@ impl WalletNode {
     /// Build a transaction with specified recipients and fee rate.
     /// Returns an unsigned PSBT that can be signed, exported, or modified.
     pub async fn build_transaction(
-        &mut self,
+        &self,
         recipients: Vec<(Address, Amount)>,
         fee_rate: FeeRate,
     ) -> Result<Psbt> {
@@ -65,7 +65,7 @@ impl WalletNode {
 
     /// Sign a PSBT with the wallet's keys.
     /// Returns true if the PSBT is fully signed after this operation.
-    pub async fn sign_psbt(&mut self, psbt: &mut Psbt) -> Result<bool> {
+    pub async fn sign_psbt(&self, psbt: &mut Psbt) -> Result<bool> {
         use bdk_wallet::bitcoin::secp256k1::{Keypair, Secp256k1};
 
         info!("✍️  Signing PSBT with {} inputs", psbt.inputs.len());
@@ -125,7 +125,7 @@ impl WalletNode {
 
     /// Finalize a fully-signed PSBT into a transaction ready for broadcast.
     /// Returns an error if the PSBT is not fully signed.
-    pub async fn finalize_psbt(&mut self, mut psbt: Psbt) -> Result<Transaction> {
+    pub async fn finalize_psbt(&self, mut psbt: Psbt) -> Result<Transaction> {
         use bdk_wallet::bitcoin::Witness;
 
         info!("🔍 Finalizing PSBT with {} inputs", psbt.inputs.len());
@@ -170,7 +170,7 @@ impl WalletNode {
     }
 
     /// Broadcast a transaction to the network.
-    pub async fn broadcast_transaction(&mut self, tx: Transaction) -> Result<Txid> {
+    pub async fn broadcast_transaction(&self, tx: Transaction) -> Result<Txid> {
         use bdk_wallet::bitcoin::consensus::encode::serialize_hex;
 
         let txid = tx.compute_txid();
@@ -194,7 +194,7 @@ impl WalletNode {
     ///
     /// Estimates optimal fee rate from mempool.space (or static defaults for regtest).
     /// Returns error if estimation fails - user must specify manual fee rate.
-    pub async fn send_to_address_auto(&mut self, address_str: &str, amount_sats: u64) -> Result<Txid> {
+    pub async fn send_to_address_auto(&self, address_str: &str, amount_sats: u64) -> Result<Txid> {
         // Estimate fee rate for 6 blocks
         let fee_rate = self.fee_estimator.estimate(6).await
             .map_err(|e| anyhow!(
@@ -211,7 +211,7 @@ impl WalletNode {
     ///
     /// HYBRID VERSION: Uses SNICKER UTXOs up to available amount, then fills remainder with regular UTXOs
     pub async fn send_to_address(
-        &mut self,
+        &self,
         address_str: &str,
         amount_sats: u64,
         fee_rate_sat_vb: f32,
@@ -276,8 +276,6 @@ impl WalletNode {
             let mut wallet = self.wallet.lock().await;
             let mut conn = self.conn.lock().await;
             wallet.persist(&mut conn)?;
-            drop(conn);
-            drop(wallet);
         }
 
         info!("Transaction broadcast successful");
@@ -358,7 +356,7 @@ impl WalletNode {
     /// This is useful for testing transaction validity with `testmempoolaccept`
     /// before actual broadcast.
     pub async fn build_snicker_spend_tx(
-        &mut self,
+        &self,
         address_str: &str,
         amount_sats: u64,
         fee_rate_sat_vb: f32,
@@ -597,7 +595,7 @@ impl WalletNode {
     /// Uses SNICKER UTXOs up to available amount, then fills remainder with regular UTXOs
     /// Returns the signed transaction ready for broadcast (does not broadcast)
     pub(crate) async fn build_and_sign_hybrid_tx(
-        &mut self,
+        &self,
         address_str: &str,
         amount_sats: u64,
         fee_rate_sat_vb: f32,

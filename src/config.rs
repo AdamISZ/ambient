@@ -253,16 +253,20 @@ pub struct SnickerAutomation {
     #[serde(default)]
     pub mode: AutomationMode,
 
-    /// Maximum delta (in sats) to auto-accept as receiver
-    /// Positive delta = receiver loses money (contributes to fees)
-    /// Negative delta = receiver gains money
-    /// Example: max_delta = 10000 means auto-accept proposals where we lose up to 10k sats
-    #[serde(default = "default_max_delta")]
-    pub max_delta: i64,
+    /// Maximum sats to lose per coinjoin (fee contribution limit)
+    /// Default: 1000 sats
+    #[serde(default = "default_max_sats_per_coinjoin")]
+    pub max_sats_per_coinjoin: u64,
 
-    /// Maximum proposals to accept per day (rate limiting)
-    #[serde(default = "default_max_proposals_per_day")]
-    pub max_proposals_per_day: u32,
+    /// Maximum sats to spend on coinjoins per day
+    /// Default: 2500 sats
+    #[serde(default = "default_max_sats_per_day")]
+    pub max_sats_per_day: u64,
+
+    /// Maximum sats to spend on coinjoins per week
+    /// Default: 10000 sats
+    #[serde(default = "default_max_sats_per_week")]
+    pub max_sats_per_week: u64,
 
     /// Prefer proposals that consume SNICKER outputs (creating chains)
     #[serde(default = "default_prefer_snicker_outputs")]
@@ -279,17 +283,31 @@ pub struct SnickerAutomation {
     /// Applies to all SNICKER proposal creation (manual and automated)
     #[serde(default = "default_min_change_output_size")]
     pub min_change_output_size: u64,
+
+    /// Number of outstanding proposals to maintain in Proposer mode
+    /// Default: 5 (aggressive for bootstrapping new ecosystem)
+    #[serde(default = "default_outstanding_proposals")]
+    pub outstanding_proposals: u32,
+
+    /// Timeout window in blocks before reroll in Receiver mode
+    /// If no coinjoin occurs within this many blocks, flip coin again
+    /// Default: 144 blocks (~1 day)
+    #[serde(default = "default_receiver_timeout_blocks")]
+    pub receiver_timeout_blocks: u32,
 }
 
 impl Default for SnickerAutomation {
     fn default() -> Self {
         Self {
             mode: AutomationMode::Disabled,
-            max_delta: default_max_delta(),
-            max_proposals_per_day: default_max_proposals_per_day(),
+            max_sats_per_coinjoin: default_max_sats_per_coinjoin(),
+            max_sats_per_day: default_max_sats_per_day(),
+            max_sats_per_week: default_max_sats_per_week(),
             prefer_snicker_outputs: default_prefer_snicker_outputs(),
             snicker_pattern_only: default_snicker_pattern_only(),
             min_change_output_size: default_min_change_output_size(),
+            outstanding_proposals: default_outstanding_proposals(),
+            receiver_timeout_blocks: default_receiver_timeout_blocks(),
         }
     }
 }
@@ -479,14 +497,19 @@ fn default_proposals_dir() -> PathBuf {
         })
 }
 
-/// Get the default max delta for automation (10,000 sats)
-fn default_max_delta() -> i64 {
-    10_000
+/// Get the default max sats per coinjoin (1000 sats)
+fn default_max_sats_per_coinjoin() -> u64 {
+    1000
 }
 
-/// Get the default max proposals per day
-fn default_max_proposals_per_day() -> u32 {
-    5
+/// Get the default max sats per day (2500 sats)
+fn default_max_sats_per_day() -> u64 {
+    2500
+}
+
+/// Get the default max sats per week (10000 sats)
+fn default_max_sats_per_week() -> u64 {
+    10000
 }
 
 /// Get the default for prefer_snicker_outputs
@@ -495,13 +518,24 @@ fn default_prefer_snicker_outputs() -> bool {
 }
 
 /// Get the default for snicker_pattern_only
+/// Default to false to allow bootstrapping - targeting any P2TR UTXO
 fn default_snicker_pattern_only() -> bool {
-    true
+    false
 }
 
 /// Get the default minimum change output size (5 × dust limit)
 fn default_min_change_output_size() -> u64 {
     DEFAULT_MIN_CHANGE_OUTPUT_SIZE
+}
+
+/// Get the default number of outstanding proposals to maintain (5)
+fn default_outstanding_proposals() -> u32 {
+    5
+}
+
+/// Get the default receiver timeout in blocks (144 = ~1 day)
+fn default_receiver_timeout_blocks() -> u32 {
+    144
 }
 
 /// Get the default Nostr relays

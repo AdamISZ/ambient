@@ -30,7 +30,7 @@ impl WalletNode {
     /// - Co-spending multiple SNICKER UTXOs defeats the privacy purpose
     /// - Falls back to regular UTXOs if no single SNICKER UTXO is sufficient
     pub(crate) async fn select_utxos_hybrid(
-        &mut self,
+        &self,
         amount_sats: u64,
         fee_rate_sat_vb: f32,
     ) -> Result<SelectedUtxos> {
