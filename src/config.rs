@@ -334,7 +334,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            network: Network::Signet,
+            network: Network::Mainnet,
             peer: None,
             wallet_dir: default_wallet_dir(),
             recovery_height: default_recovery_height(),

@@ -1,7 +1,7 @@
 //! WalletLoaded main view with tabs
 
 use iced::{Element, Length, Border, Color, Theme};
-use iced::widget::{column, container, text, button, row, text_input, scrollable};
+use iced::widget::{column, container, text, button, row, text_input, scrollable, image};
 use iced::widget::scrollable::{Direction, Scrollbar};
 use iced::widget::button::Style;
 use std::sync::Arc;
@@ -22,6 +22,9 @@ pub fn view(manager: &Arc<Manager>, data: &WalletData) -> Element<'static, Messa
         sidebar_button("Receive", WalletTab::Receive, current_tab),
         sidebar_button("Transactions", WalletTab::Transactions, current_tab),
         sidebar_button("SNICKER", WalletTab::Snicker, current_tab),
+        // Spacer to push Settings to bottom
+        container(text("")).height(Length::Fill),
+        settings_button(),
     ]
     .spacing(5)
     .padding(10);
@@ -50,7 +53,6 @@ pub fn view(manager: &Arc<Manager>, data: &WalletData) -> Element<'static, Messa
                 // Menu buttons
                 row![
                     menu_button("Close Wallet", Message::MenuCloseWallet),
-                    menu_button("Settings", Message::MenuSettings),
                     menu_button("Exit", Message::MenuExit),
                 ]
                 .spacing(10),
@@ -149,6 +151,42 @@ fn sidebar_button(label: &str, tab: WalletTab, current: WalletTab) -> Element<'s
     };
 
     btn.into()
+}
+
+/// Create a Settings button for the sidebar (bottom)
+fn settings_button() -> Element<'static, Message> {
+    button(
+        container(text("Settings").size(14))
+            .width(Length::Fill)
+            .padding(12)
+    )
+    .on_press(Message::MenuSettings)
+    .width(Length::Fill)
+    .style(|_theme: &Theme, status| {
+        match status {
+            button::Status::Hovered => Style {
+                background: Some(iced::Background::Color(Color::from_rgb(0.15, 0.15, 0.20))),
+                text_color: Color::WHITE,
+                border: Border {
+                    color: Color::from_rgb(0.3, 0.3, 0.4),
+                    width: 1.0,
+                    radius: 4.0.into(),
+                },
+                shadow: iced::Shadow::default(),
+            },
+            _ => Style {
+                background: Some(iced::Background::Color(Color::from_rgb(0.1, 0.1, 0.15))),
+                text_color: Color::from_rgb(0.7, 0.7, 0.7),
+                border: Border {
+                    color: Color::from_rgb(0.2, 0.2, 0.25),
+                    width: 1.0,
+                    radius: 4.0.into(),
+                },
+                shadow: iced::Shadow::default(),
+            },
+        }
+    })
+    .into()
 }
 
 /// Create a styled menu button with rounded corners
@@ -272,15 +310,9 @@ fn view_overview(wallet_name: &str, data: &WalletData) -> Element<'static, Messa
         )
         .padding(20),
 
-        row![
-            button("Sync Wallet")
-                .on_press(Message::SyncRequested)
-                .padding(15),
-            button("New Address")
-                .on_press(Message::NewAddressRequested)
-                .padding(15),
-        ]
-        .spacing(15),
+        button("Sync Wallet")
+            .on_press(Message::SyncRequested)
+            .padding(15),
 
         {
             if let Some(ref addr) = data.last_address {
@@ -290,7 +322,7 @@ fn view_overview(wallet_name: &str, data: &WalletData) -> Element<'static, Messa
                         text("Last Generated Address:").size(16),
                         row![
                             text(addr.clone()).size(14),
-                            button("📋 Copy")
+                            button("Copy")
                                 .on_press(Message::CopyToClipboard(addr_copy))
                                 .padding(5),
                         ].spacing(10),
@@ -385,29 +417,43 @@ fn view_receive(data: &WalletData) -> Element<'static, Message> {
                 let addr_copy = addr.clone();
                 container(
                     column![
+                        // QR code display
+                        {
+                            if let Some(ref qr_handle) = data.last_address_qr {
+                                container(
+                                    image(qr_handle.clone())
+                                        .width(Length::Fixed(200.0))
+                                        .height(Length::Fixed(200.0))
+                                )
+                                .padding(10)
+                            } else {
+                                container(text(""))
+                            }
+                        },
+
                         text("Your Receive Address:").size(18),
                         container(
                             row![
-                                text(addr.clone()).size(16),
-                                button("📋 Copy Address")
+                                text(addr.clone()).size(14),
+                                button("Copy")
                                     .on_press(Message::CopyToClipboard(addr_copy))
                                     .padding(10),
                             ].spacing(15)
                         )
-                        .padding(15),
-                        text("Share this address to receive Bitcoin").size(14),
+                        .padding(10),
+                        text("Share this address or QR code to receive Bitcoin").size(14),
                     ].spacing(10)
                 )
                 .padding(20)
             } else {
                 container(
-                    text("No address generated yet").size(16)
+                    text("Click 'Generate New Address' to create a receive address").size(16)
                 )
                 .padding(20)
             }
         },
     ]
-    .spacing(30)
+    .spacing(20)
     .into()
 }
 

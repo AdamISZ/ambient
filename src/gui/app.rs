@@ -19,6 +19,10 @@ pub struct AmbientApp {
     // Long-lived Tokio runtime for wallet operations
     // Wrapped in ManuallyDrop to prevent panic on shutdown when dropped from async context
     tokio_runtime: ManuallyDrop<tokio::runtime::Runtime>,
+    // Settings view state (full-page settings instead of modal)
+    showing_settings: bool,
+    edited_config: Option<Config>,
+    settings_advanced_expanded: bool,
 }
 
 impl AmbientApp {
@@ -42,6 +46,9 @@ impl AmbientApp {
                 config,
                 active_modal: None,
                 tokio_runtime,
+                showing_settings: false,
+                edited_config: None,
+                settings_advanced_expanded: false,
             },
             Task::none(),
         )
@@ -294,13 +301,9 @@ impl AmbientApp {
             }
 
             Message::MenuSettings => {
-                // Open settings modal
-                let wallet_loaded = matches!(self.state, AppState::WalletLoaded { .. });
-                let modal = crate::gui::modal::Modal::Settings {
-                    edited_config: self.config.clone(),
-                    wallet_loaded,
-                };
-                self.active_modal = Some(modal);
+                // Show full-page settings view
+                self.showing_settings = true;
+                self.edited_config = Some(self.config.clone());
                 Task::none()
             }
 
@@ -600,7 +603,7 @@ impl AmbientApp {
             }
 
             Message::SettingsNetworkChanged(network_str) => {
-                if let Some(crate::gui::modal::Modal::Settings { edited_config, wallet_loaded: _ }) = &mut self.active_modal {
+                if let Some(ref mut edited_config) = self.edited_config {
                     if let Ok(network) = network_str.parse() {
                         edited_config.network = network;
                     }
@@ -609,7 +612,7 @@ impl AmbientApp {
             }
 
             Message::SettingsPeerChanged(peer) => {
-                if let Some(crate::gui::modal::Modal::Settings { edited_config, wallet_loaded: _ }) = &mut self.active_modal {
+                if let Some(ref mut edited_config) = self.edited_config {
                     edited_config.peer = if peer.is_empty() {
                         None
                     } else {
@@ -620,7 +623,7 @@ impl AmbientApp {
             }
 
             Message::SettingsWalletDirChanged(dir) => {
-                if let Some(crate::gui::modal::Modal::Settings { edited_config, wallet_loaded: _ }) = &mut self.active_modal {
+                if let Some(ref mut edited_config) = self.edited_config {
                     edited_config.wallet_dir = std::path::PathBuf::from(dir);
                 }
                 Task::none()
@@ -645,7 +648,7 @@ impl AmbientApp {
             }
 
             Message::SettingsRecoveryHeightChanged(height_str) => {
-                if let Some(crate::gui::modal::Modal::Settings { edited_config, wallet_loaded: _ }) = &mut self.active_modal {
+                if let Some(ref mut edited_config) = self.edited_config {
                     if let Ok(height) = height_str.parse::<u32>() {
                         edited_config.recovery_height = height;
                     }
@@ -654,7 +657,7 @@ impl AmbientApp {
             }
 
             Message::SettingsProposalsDirChanged(dir) => {
-                if let Some(crate::gui::modal::Modal::Settings { edited_config, wallet_loaded: _ }) = &mut self.active_modal {
+                if let Some(ref mut edited_config) = self.edited_config {
                     edited_config.proposal_network.file_directory = std::path::PathBuf::from(dir);
                 }
                 Task::none()
@@ -679,7 +682,7 @@ impl AmbientApp {
             }
 
             Message::SettingsProposalNetworkBackendChanged(backend_str) => {
-                if let Some(crate::gui::modal::Modal::Settings { edited_config, wallet_loaded: _ }) = &mut self.active_modal {
+                if let Some(ref mut edited_config) = self.edited_config {
                     edited_config.proposal_network.backend = match backend_str.as_str() {
                         "FileBased" => crate::config::ProposalNetworkBackend::FileBased,
                         "Nostr" => crate::config::ProposalNetworkBackend::Nostr,
@@ -690,7 +693,7 @@ impl AmbientApp {
             }
 
             Message::SettingsNostrRelaysChanged(relays_str) => {
-                if let Some(crate::gui::modal::Modal::Settings { edited_config, wallet_loaded: _ }) = &mut self.active_modal {
+                if let Some(ref mut edited_config) = self.edited_config {
                     // Parse comma-separated relay URLs
                     edited_config.proposal_network.nostr_relays = relays_str
                         .split(',')
@@ -702,7 +705,7 @@ impl AmbientApp {
             }
 
             Message::SettingsNostrPowDifficultyChanged(pow_str) => {
-                if let Some(crate::gui::modal::Modal::Settings { edited_config, wallet_loaded: _ }) = &mut self.active_modal {
+                if let Some(ref mut edited_config) = self.edited_config {
                     edited_config.proposal_network.nostr_pow_difficulty = if pow_str.is_empty() {
                         None
                     } else {
@@ -712,14 +715,51 @@ impl AmbientApp {
                 Task::none()
             }
 
+            Message::SettingsMaxPerCoinjoinChanged(val) => {
+                if let Some(ref mut edited_config) = self.edited_config {
+                    if let Ok(v) = val.parse::<u64>() {
+                        edited_config.snicker_automation.max_sats_per_coinjoin = v;
+                    }
+                }
+                Task::none()
+            }
+
+            Message::SettingsMaxPerDayChanged(val) => {
+                if let Some(ref mut edited_config) = self.edited_config {
+                    if let Ok(v) = val.parse::<u64>() {
+                        edited_config.snicker_automation.max_sats_per_day = v;
+                    }
+                }
+                Task::none()
+            }
+
+            Message::SettingsMaxPerWeekChanged(val) => {
+                if let Some(ref mut edited_config) = self.edited_config {
+                    if let Ok(v) = val.parse::<u64>() {
+                        edited_config.snicker_automation.max_sats_per_week = v;
+                    }
+                }
+                Task::none()
+            }
+
+            Message::SettingsScanWindowChanged(val) => {
+                if let Some(ref mut edited_config) = self.edited_config {
+                    if let Ok(v) = val.parse::<u32>() {
+                        edited_config.partial_utxo_set.scan_window_blocks = v;
+                    }
+                }
+                Task::none()
+            }
+
             Message::SettingsSave => {
-                if let Some(crate::gui::modal::Modal::Settings { edited_config, wallet_loaded: _ }) = &self.active_modal {
+                if let Some(ref edited_config) = self.edited_config {
                     match edited_config.validate() {
                         Ok(_) => {
                             match edited_config.save() {
                                 Ok(_) => {
                                     self.config = edited_config.clone();
-                                    self.active_modal = None;
+                                    self.showing_settings = false;
+                                    self.edited_config = None;
                                     println!("✅ Settings saved successfully");
                                 }
                                 Err(e) => {
@@ -732,6 +772,18 @@ impl AmbientApp {
                         }
                     }
                 }
+                Task::none()
+            }
+
+            Message::SettingsClose => {
+                // Close settings without saving
+                self.showing_settings = false;
+                self.edited_config = None;
+                Task::none()
+            }
+
+            Message::SettingsToggleAdvanced => {
+                self.settings_advanced_expanded = !self.settings_advanced_expanded;
                 Task::none()
             }
 
@@ -900,10 +952,12 @@ impl AmbientApp {
             }
 
             Message::AddressGenerated(address) => {
-                // Store the generated address
+                // Store the generated address and generate QR code
                 if let AppState::WalletLoaded { wallet_data, .. } = &mut self.state {
-                    wallet_data.last_address = Some(address.to_string());
-                    println!("✅ Generated address: {}", address);
+                    let addr_str = address.to_string();
+                    wallet_data.last_address_qr = generate_qr_code(&addr_str);
+                    wallet_data.last_address = Some(addr_str.clone());
+                    println!("✅ Generated address: {}", addr_str);
                 }
                 Task::none()
             }
@@ -1740,6 +1794,18 @@ impl AmbientApp {
         use widget::{column, container, text, button};
         use iced::Length;
 
+        // Show settings view if active
+        if self.showing_settings {
+            if let Some(ref edited_config) = self.edited_config {
+                let wallet_loaded = matches!(self.state, AppState::WalletLoaded { .. });
+                return crate::gui::views::settings::view(
+                    edited_config,
+                    wallet_loaded,
+                    self.settings_advanced_expanded,
+                );
+            }
+        }
+
         // Main content (persistent views based on state)
         let main_view = match &self.state {
             AppState::NoWallet { available_wallets } => {
@@ -1752,8 +1818,8 @@ impl AmbientApp {
                     column![
                         text("Loading Wallet").size(32),
                         text(format!("Loading '{}'...", wallet_name)).size(20),
-                        text("🔐 Decrypting wallet files").size(16),
-                        text("⏳ This may take a few seconds...").size(14),
+                        text("Decrypting wallet files").size(16),
+                        text("This may take a few seconds...").size(14),
                     ]
                     .spacing(20)
                     .padding(40)
@@ -1803,6 +1869,51 @@ impl Default for AmbientApp {
         let (app, _) = Self::new();
         app
     }
+}
+
+/// Generate a QR code image handle from a Bitcoin address
+fn generate_qr_code(address: &str) -> Option<iced::widget::image::Handle> {
+    use qrcode::QrCode;
+
+    // Create QR code - use bitcoin: URI scheme for better wallet compatibility
+    let uri = format!("bitcoin:{}", address);
+    let code = QrCode::new(uri.as_bytes()).ok()?;
+
+    // Render to a simple pixel grid and convert to RGBA
+    let module_size = 8u32; // pixels per module
+    let quiet_zone = 4u32; // modules of white border
+
+    let modules = code.to_colors();
+    let width = code.width();
+    let total_size = (width + 2 * quiet_zone as usize) * module_size as usize;
+
+    let mut rgba = vec![255u8; total_size * total_size * 4]; // white background
+
+    for (y, row) in modules.chunks(width).enumerate() {
+        for (x, &module) in row.iter().enumerate() {
+            if module == qrcode::Color::Dark {
+                // Fill this module with black pixels
+                let px = (x + quiet_zone as usize) * module_size as usize;
+                let py = (y + quiet_zone as usize) * module_size as usize;
+
+                for dy in 0..module_size as usize {
+                    for dx in 0..module_size as usize {
+                        let idx = ((py + dy) * total_size + (px + dx)) * 4;
+                        rgba[idx] = 0;     // R
+                        rgba[idx + 1] = 0; // G
+                        rgba[idx + 2] = 0; // B
+                        // A stays 255
+                    }
+                }
+            }
+        }
+    }
+
+    Some(iced::widget::image::Handle::from_rgba(
+        total_size as u32,
+        total_size as u32,
+        rgba,
+    ))
 }
 
 /// Check if a directory is a valid wallet directory

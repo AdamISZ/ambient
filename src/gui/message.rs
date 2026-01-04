@@ -125,8 +125,14 @@ pub enum Message {
     SettingsProposalNetworkBackendChanged(String), // "FileBased" or "Nostr"
     SettingsNostrRelaysChanged(String), // Comma-separated relay URLs
     SettingsNostrPowDifficultyChanged(String), // PoW difficulty (optional)
+    SettingsMaxPerCoinjoinChanged(String), // Spending limit: per coinjoin
+    SettingsMaxPerDayChanged(String),      // Spending limit: per day
+    SettingsMaxPerWeekChanged(String),     // Spending limit: per week
+    SettingsScanWindowChanged(String),     // Partial UTXO set scan window
     SettingsSave,
     SettingsSaved(Result<(), String>),
+    SettingsClose,                         // Close settings view (cancel)
+    SettingsToggleAdvanced,                // Toggle advanced section visibility
 
     // Automation
     AutomationToggleEnabled,  // Toggle enable/disable

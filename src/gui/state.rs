@@ -49,6 +49,7 @@ pub struct WalletData {
     pub pending_outgoing: u64, // Pending outgoing sats (broadcast but unconfirmed)
     pub pending_incoming: u64, // Pending incoming SNICKER sats (broadcast but unconfirmed)
     pub last_address: Option<String>,
+    pub last_address_qr: Option<iced::widget::image::Handle>, // QR code for last address
     pub is_syncing: bool,
     pub status_message: Option<String>,
 
@@ -96,6 +97,7 @@ impl Default for WalletData {
             pending_outgoing: 0,
             pending_incoming: 0,
             last_address: None,
+            last_address_qr: None,
             is_syncing: false,
             status_message: None,
             send_address: String::new(),
