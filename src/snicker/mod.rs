@@ -377,6 +377,13 @@ impl Snicker {
         let secp = Secp256k1::new();
         let proposer_input_pubkey = proposer_input_seckey.public_key(&secp);
 
+        // Debug: show the proposer input pubkey being stored
+        tracing::debug!("create_proposal: proposer_input_pubkey = {}", proposer_input_pubkey);
+        tracing::debug!("  proposer_utxo script_pubkey = {}", hex::encode(proposer_utxo_txout.script_pubkey.as_bytes()));
+        use bdk_wallet::bitcoin::secp256k1::XOnlyPublicKey;
+        let proposer_xonly = XOnlyPublicKey::from(proposer_input_pubkey);
+        tracing::debug!("  proposer_input_pubkey x-only = {}", hex::encode(proposer_xonly.serialize()));
+
         // 2. Create the tweaked output using proposer's input key
         let (tweaked_output, _snicker_shared_secret) = self.create_tweaked_output(
             &receiver_txout,
@@ -903,6 +910,9 @@ impl Snicker {
         tweak_info: &TweakInfo,
         our_utxos: &[crate::wallet_node::WalletUtxo],
     ) -> Result<()> {
+        // Debug: show TweakInfo proposer_pubkey
+        tracing::debug!("validate_inputs: TweakInfo.proposer_pubkey = {}", tweak_info.proposer_pubkey);
+
         // Find our input to identify which input is the proposer's
         let our_input_idx = psbt.unsigned_tx.input.iter().position(|input| {
             our_utxos.iter().any(|utxo| utxo.outpoint() == input.previous_output)
@@ -932,6 +942,14 @@ impl Snicker {
         proposer_input_pubkey_bytes[0] = 0x02;
         proposer_input_pubkey_bytes[1..].copy_from_slice(&proposer_input_pubkey_xonly);
         let proposer_input_pubkey = PublicKey::from_slice(&proposer_input_pubkey_bytes)?;
+
+        // Debug: show which inputs we're looking at
+        tracing::debug!("validate_proposer_inputs: our_input_idx={}, proposer_input_idx={}",
+            our_input_idx, proposer_input_idx);
+        tracing::debug!("  PSBT inputs: {:?}", psbt.unsigned_tx.input.iter()
+            .map(|i| format!("{}:{}", i.previous_output.txid, i.previous_output.vout))
+            .collect::<Vec<_>>());
+        tracing::debug!("  Proposer prevout script: {}", hex::encode(proposer_prevout.script_pubkey.as_bytes()));
 
         // Verify it matches the proposer_pubkey in TweakInfo
         if proposer_input_pubkey != tweak_info.proposer_pubkey {
@@ -1388,6 +1406,10 @@ impl Snicker {
     }
 
     /// Get decrypted proposals filtered by delta range and status
+    ///
+    /// Only returns proposals where this wallet is the RECEIVER (not the proposer).
+    /// Proposals created by this wallet are stored with role='proposer' and should
+    /// not be returned for auto-accept processing.
     pub async fn get_decrypted_proposals_by_delta_range(
         &self,
         min_delta: i64,
@@ -1396,9 +1418,11 @@ impl Snicker {
     ) -> Result<Vec<Proposal>> {
         let conn = self.conn.lock().unwrap();
 
+        // Filter by role='receiver' to only get proposals where we are the target,
+        // not proposals we created ourselves (which have role='proposer')
         let mut stmt = conn.prepare(
             "SELECT tag, psbt, tweak_info FROM decrypted_proposals
-             WHERE delta_sats BETWEEN ?1 AND ?2 AND status = ?3
+             WHERE delta_sats BETWEEN ?1 AND ?2 AND status = ?3 AND role = 'receiver'
              ORDER BY created_at DESC"
         )?;
 
@@ -1539,9 +1563,23 @@ impl Snicker {
     }
 
     /// Extract proposer's UTXO from a proposal's PSBT
+    /// Uses TweakInfo to identify the receiver's input, and returns the other input as proposer's
     pub fn extract_proposer_utxo(&self, proposal: &Proposal) -> Result<String> {
-        let proposer_input = proposal.psbt.unsigned_tx.input.first()
-            .ok_or_else(|| anyhow::anyhow!("No inputs in PSBT"))?;
+        // Use TweakInfo to identify the receiver's input (by matching script_pubkey)
+        let receiver_script = &proposal.tweak_info.original_output.script_pubkey;
+
+        // Find receiver's input index by matching script_pubkey in witness_utxo
+        let receiver_input_idx = proposal.psbt.inputs.iter().position(|inp| {
+            inp.witness_utxo.as_ref()
+                .map(|utxo| &utxo.script_pubkey == receiver_script)
+                .unwrap_or(false)
+        }).ok_or_else(|| anyhow::anyhow!("Could not find receiver's input in PSBT"))?;
+
+        // The other input is the proposer's (PSBT always has exactly 2 inputs)
+        let proposer_input_idx = if receiver_input_idx == 0 { 1 } else { 0 };
+
+        let proposer_input = proposal.psbt.unsigned_tx.input.get(proposer_input_idx)
+            .ok_or_else(|| anyhow::anyhow!("Proposer input not found in PSBT"))?;
 
         Ok(format!("{}:{}", proposer_input.previous_output.txid, proposer_input.previous_output.vout))
     }
@@ -1802,6 +1840,58 @@ impl Snicker {
         )?;
 
         tracing::debug!("Removed confirmed transaction {} from pending tracking", txid);
+        Ok(())
+    }
+
+    /// Check if an outpoint is expected to be spent by one of our pending transactions.
+    /// Returns Some(spending_txid) if found, None otherwise.
+    pub fn get_pending_tx_for_input_static(
+        conn: &Connection,
+        spent_txid: &str,
+        spent_vout: u32,
+    ) -> Option<String> {
+        conn.query_row(
+            "SELECT spending_txid FROM pending_inputs WHERE spent_txid = ? AND spent_vout = ?",
+            (spent_txid, spent_vout),
+            |row| row.get::<_, String>(0),
+        ).ok()
+    }
+
+    /// Remove a conflicted pending transaction and its associated SNICKER UTXO.
+    /// Called when we detect that an input we expected to spend was spent by a different tx.
+    pub fn remove_conflicted_transaction_static(conn: &Connection, conflicted_txid: &str) -> Result<()> {
+        tracing::warn!(
+            "⚠️  Removing conflicted transaction {} (input spent by different tx)",
+            conflicted_txid
+        );
+
+        // First, delete the SNICKER UTXO that was created for this conflicted transaction.
+        // The SNICKER UTXO was stored with this txid when the proposal was accepted.
+        let deleted_utxos = conn.execute(
+            "DELETE FROM snicker_utxos WHERE txid = ?",
+            [conflicted_txid],
+        ).unwrap_or(0);
+
+        if deleted_utxos > 0 {
+            tracing::info!(
+                "🗑️  Deleted {} orphaned SNICKER UTXO(s) from conflicted tx {}",
+                deleted_utxos, conflicted_txid
+            );
+        }
+
+        // Delete from pending_inputs first (due to foreign key)
+        conn.execute(
+            "DELETE FROM pending_inputs WHERE spending_txid = ?",
+            [conflicted_txid],
+        )?;
+
+        // Delete the pending transaction itself
+        conn.execute(
+            "DELETE FROM pending_transactions WHERE txid = ?",
+            [conflicted_txid],
+        )?;
+
+        tracing::info!("✅ Cleaned up conflicted transaction {}", conflicted_txid);
         Ok(())
     }
 

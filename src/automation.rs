@@ -24,7 +24,7 @@ impl Default for AutomationConfig {
         Self {
             interval_secs: 10,  // 10 seconds (for testing - change back to 300 for production)
             min_utxo_sats: 75_000,
-            proposal_delta_sats: 1_000,
+            proposal_delta_sats: 100,  // Low default allows ~25 coinjoins/day with 2500 daily limit
         }
     }
 }

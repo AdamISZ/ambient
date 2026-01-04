@@ -456,13 +456,13 @@ pub async fn repl(
             }
 
             "find_opportunities" => {
-                if args.len() < 1 || args.len() > 4 {
-                    println!("Usage: find_opportunities <min_candidate_sats> [max_candidate_sats] [max_block_age] [snicker_only]");
+                if args.is_empty() || args.len() > 3 {
+                    println!("Usage: find_opportunities <min_candidate_sats> [max_candidate_sats] [max_block_age]");
                     println!("Example: find_opportunities 10000");
                     println!("Example: find_opportunities 10000 100000");
                     println!("Example: find_opportunities 10000 100000 1000");
-                    println!("Example: find_opportunities 10000 100000 0 true");
                     println!("  max_block_age: 0 = all blocks, N = last N blocks from tip");
+                    println!("  Note: SNICKER-pattern UTXOs are automatically prioritized");
                     continue;
                 }
                 if let Some(arc) = manager_arc.as_ref() {
@@ -495,15 +495,9 @@ pub async fn repl(
                     } else {
                         0  // All blocks
                     };
-                    let snicker_only = if args.len() > 3 {
-                        args[3].to_lowercase() == "true"
-                    } else {
-                        false
-                    };
-
-                    println!("🔍 Finding SNICKER opportunities (candidates: {}-{} sats, block_age: {}, snicker_only={})...",
-                             min_candidate_sats, max_candidate_sats, max_block_age, snicker_only);
-                    match arc.find_snicker_opportunities(min_candidate_sats, max_candidate_sats, max_block_age, snicker_only).await {
+                    println!("🔍 Finding SNICKER opportunities (candidates: {}-{} sats, block_age: {})...",
+                             min_candidate_sats, max_candidate_sats, max_block_age);
+                    match arc.find_snicker_opportunities(min_candidate_sats, max_candidate_sats, max_block_age).await {
                         Ok(found) => {
                             if found.is_empty() {
                                 println!("No opportunities found.");
@@ -551,8 +545,9 @@ pub async fn repl(
 
             "snicker_pattern_check" => {
                 if let Some(arc) = manager_arc.as_ref() {
-                    // Query candidates with reasonable defaults (10k-100M sats, all blocks, all transaction types)
-                    match arc.get_snicker_candidates(10_000, 100_000_000, 0, false).await {
+                    // Query candidates with reasonable defaults (10k-100M sats, all blocks)
+                    // SNICKER-pattern UTXOs are automatically prioritized in results
+                    match arc.get_snicker_candidates(10_000, 100_000_000, 0).await {
                         Ok(all_candidates) => {
                             println!("🔍 Listing {} candidate UTXOs...\n", all_candidates.len());
 

@@ -452,6 +452,11 @@ impl PartialUtxoSet {
         max_amount: u64,
         transaction_type_filter: Option<&str>,
     ) -> Result<Vec<PartialUtxo>> {
+        // Cap max_amount at i64::MAX to avoid overflow when casting to i64 for SQLite
+        // (u64::MAX as i64 would become -1, breaking the query)
+        let max_amount_safe = std::cmp::min(max_amount, i64::MAX as u64) as i64;
+        let min_amount_i64 = min_amount as i64;
+
         // Build query dynamically based on whether we filter by transaction_type
         let (query, params_vec): (String, Vec<Box<dyn rusqlite::ToSql>>) = if let Some(tx_type) = transaction_type_filter {
             (
@@ -468,8 +473,8 @@ impl PartialUtxoSet {
                 vec![
                     Box::new(start_height),
                     Box::new(end_height),
-                    Box::new(min_amount as i64),
-                    Box::new(max_amount as i64),
+                    Box::new(min_amount_i64),
+                    Box::new(max_amount_safe),
                     Box::new(tx_type.to_string()),
                 ]
             )
@@ -487,8 +492,8 @@ impl PartialUtxoSet {
                 vec![
                     Box::new(start_height),
                     Box::new(end_height),
-                    Box::new(min_amount as i64),
-                    Box::new(max_amount as i64),
+                    Box::new(min_amount_i64),
+                    Box::new(max_amount_safe),
                 ]
             )
         };

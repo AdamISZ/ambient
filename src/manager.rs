@@ -316,16 +316,14 @@ impl Manager {
     /// * `min_candidate_sats` - Minimum size of candidate UTXOs
     /// * `max_candidate_sats` - Maximum size of candidate UTXOs (default: u64::MAX for no limit)
     /// * `max_block_age` - Maximum age in blocks from tip (0 = all blocks)
-    /// * `snicker_only` - Only consider SNICKER v1 transaction outputs
     ///
     /// # Returns
-    /// List of opportunities sorted by value
+    /// List of opportunities sorted by value (SNICKER-pattern UTXOs prioritized)
     pub async fn find_snicker_opportunities(
         &self,
         min_candidate_sats: u64,
         max_candidate_sats: u64,
         max_block_age: u32,
-        snicker_only: bool,
     ) -> Result<Vec<ProposalOpportunity>> {
         // Get all our UTXOs (both regular wallet and SNICKER UTXOs)
         let all_utxos = self.wallet_node.get_all_wallet_utxos().await?;
@@ -392,7 +390,8 @@ impl Manager {
         }
 
         // Query candidates from partial_utxo_set (unspent P2TR UTXOs in size range)
-        let candidates = self.get_snicker_candidates(min_candidate_sats, max_candidate_sats, max_block_age, snicker_only).await?;
+        // Results are sorted with SNICKER-pattern UTXOs first
+        let candidates = self.get_snicker_candidates(min_candidate_sats, max_candidate_sats, max_block_age).await?;
 
         // Find opportunities using Snicker (no longer filtering our UTXOs by size)
         self.snicker.find_opportunities(&our_utxos, &candidates)
@@ -414,10 +413,26 @@ impl Manager {
     ) -> Result<(Proposal, EncryptedProposal)> {
         // Get our UTXO from unified UTXO list
         let all_utxos = self.wallet_node.get_all_wallet_utxos().await?;
+
+        // Debug: show the opportunity and UTXO lookup
+        tracing::debug!("create_snicker_proposal: opportunity.our_outpoint = {}:{}",
+            opportunity.our_outpoint.txid, opportunity.our_outpoint.vout);
+        tracing::debug!("create_snicker_proposal: opportunity.target_outpoint = {}:{}",
+            opportunity.target_outpoint.txid, opportunity.target_outpoint.vout);
+
         let our_utxo = all_utxos.iter()
             .find(|utxo| utxo.outpoint() == opportunity.our_outpoint)
             .ok_or_else(|| anyhow::anyhow!("UTXO not found in wallet"))?
             .clone();
+
+        // Debug: show the UTXO we found
+        tracing::debug!("create_snicker_proposal: found our_utxo = {:?}", our_utxo.outpoint());
+        tracing::debug!("create_snicker_proposal: our_utxo script_pubkey = {}",
+            hex::encode(our_utxo.script_pubkey().as_bytes()));
+        if let crate::wallet_node::WalletUtxo::Regular(local) = &our_utxo {
+            tracing::debug!("create_snicker_proposal: Regular UTXO keychain={:?}, derivation_index={}",
+                local.keychain, local.derivation_index);
+        }
 
         // Get addresses for outputs from wallet
         let (equal_output_addr, change_output_addr) = {
@@ -1003,13 +1018,25 @@ impl Manager {
         println!("✅ Found proposal");
 
         println!("🔍 Step 2: Validating proposer UTXO...");
-        // Extract proposer's input from PSBT (first input is proposer's)
-        let proposer_input = proposal.psbt.unsigned_tx.input.first()
-            .ok_or_else(|| anyhow::anyhow!("Proposal PSBT has no inputs"))?;
+
+        // Get our UTXOs first to identify which input is ours vs proposer's
+        // (PSBT inputs are shuffled for privacy, so we can't assume first = proposer)
+        let our_utxos = self.wallet_node.get_all_wallet_utxos().await?;
+
+        // Find our input index
+        let our_input_idx = proposal.psbt.unsigned_tx.input.iter().position(|input| {
+            our_utxos.iter().any(|utxo| utxo.outpoint() == input.previous_output)
+        }).ok_or_else(|| anyhow::anyhow!("Could not find our input in PSBT"))?;
+
+        // The other input is the proposer's (PSBT always has exactly 2 inputs)
+        let proposer_input_idx = if our_input_idx == 0 { 1 } else { 0 };
+
+        let proposer_input = proposal.psbt.unsigned_tx.input.get(proposer_input_idx)
+            .ok_or_else(|| anyhow::anyhow!("Proposer input not found in PSBT"))?;
         let proposer_outpoint = proposer_input.previous_output;
 
         // Get proposer's UTXO value from PSBT input
-        let proposer_value = proposal.psbt.inputs.first()
+        let proposer_value = proposal.psbt.inputs.get(proposer_input_idx)
             .and_then(|input| input.witness_utxo.as_ref())
             .map(|utxo| utxo.value.to_sat())
             .ok_or_else(|| anyhow::anyhow!("Cannot determine proposer UTXO value from PSBT"))?;
@@ -1037,18 +1064,15 @@ impl Manager {
             }
         }
 
-        println!("🔍 Step 3: Getting UTXOs...");
-        let our_utxos = self.wallet_node.get_all_wallet_utxos().await?;
-
-        println!("🔍 Step 4: Accepting and signing proposal...");
+        println!("🔍 Step 3: Accepting and signing proposal...");
         // Accept and sign the proposal
         let psbt = self.accept_snicker_proposal(tag, acceptable_delta_range).await?;
 
-        println!("🔍 Step 5: Finalizing PSBT...");
+        println!("🔍 Step 4: Finalizing PSBT...");
         // Finalize the PSBT
         let tx = self.finalize_psbt(psbt).await?;
 
-        println!("🔍 Step 6: Storing SNICKER UTXO...");
+        println!("🔍 Step 5: Storing SNICKER UTXO...");
         // Store the SNICKER UTXO for future spending
         self.store_accepted_snicker_utxo(&proposal, &tx, &our_utxos).await?;
         println!("📋 SNICKER UTXO tracked (will be detected during sync)");
@@ -1110,16 +1134,15 @@ impl Manager {
     /// * `min_amount` - Minimum UTXO amount in satoshis
     /// * `max_amount` - Maximum UTXO amount in satoshis
     /// * `max_block_age` - Maximum age in blocks from tip (0 = all blocks)
-    /// * `snicker_only` - Only return UTXOs from SNICKER v1 transactions
     ///
     /// # Returns
-    /// Vec of (txid, vout, block_height, amount, script_pubkey) tuples for unspent P2TR UTXOs
+    /// Vec of (txid, vout, block_height, amount, script_pubkey) tuples for unspent P2TR UTXOs,
+    /// sorted with SNICKER-pattern UTXOs first (higher priority for proposals)
     pub async fn get_snicker_candidates(
         &self,
         min_amount: u64,
         max_amount: u64,
         max_block_age: u32,
-        snicker_only: bool,
     ) -> Result<Vec<(bdk_wallet::bitcoin::Txid, u32, u32, u64, bdk_wallet::bitcoin::ScriptBuf)>> {
         // Get current blockchain height for query range
         let tip_height = {
@@ -1134,25 +1157,39 @@ impl Manager {
             tip_height.saturating_sub(max_block_age)
         };
 
-        // Query partial_utxo_set for unspent P2TR UTXOs in the specified range
-        let candidates: Vec<_> = {
+        // Query partial_utxo_set for ALL unspent P2TR UTXOs, then sort by priority
+        let (candidates, snicker_count): (Vec<_>, usize) = {
             let partial_utxo_set = self.wallet_node.partial_utxo_set.lock().await;
-            let transaction_type_filter = if snicker_only { Some("v1") } else { None };
-            let utxos = partial_utxo_set.query_range(
+            // Query all candidates (no transaction_type filter)
+            let mut utxos = partial_utxo_set.query_range(
                 start_height,
                 tip_height,
                 min_amount,
                 max_amount,
-                transaction_type_filter,
+                None,
             )?;
+
+            // Sort with SNICKER-pattern UTXOs first (transaction_type = Some("v1"))
+            utxos.sort_by(|a, b| {
+                let a_is_snicker = a.transaction_type.as_deref() == Some("v1");
+                let b_is_snicker = b.transaction_type.as_deref() == Some("v1");
+                b_is_snicker.cmp(&a_is_snicker) // true > false, so SNICKER first
+            });
+
+            let snicker_count = utxos.iter()
+                .filter(|u| u.transaction_type.as_deref() == Some("v1"))
+                .count();
+
             // Convert PartialUtxo to tuple format expected by find_opportunities
-            utxos.iter()
+            let candidates = utxos.iter()
                 .map(|utxo| (utxo.txid, utxo.vout, utxo.block_height, utxo.amount, utxo.script_pubkey.clone()))
-                .collect()
+                .collect();
+
+            (candidates, snicker_count)
         };
 
-        tracing::info!("Found {} candidate UTXOs from partial_utxo_set ({}-{} sats, snicker_only={})",
-            candidates.len(), min_amount, max_amount, snicker_only);
+        tracing::info!("Found {} candidate UTXOs ({} SNICKER, {} regular) from partial_utxo_set ({}-{} sats)",
+            candidates.len(), snicker_count, candidates.len() - snicker_count, min_amount, max_amount);
 
         Ok(candidates)
     }
@@ -1311,11 +1348,30 @@ impl Manager {
         let tag_hex = hex::encode(&proposal.tag);
 
         let tx = &proposal.psbt.unsigned_tx;
-        let proposer_input = tx.input.first()
+
+        // Use TweakInfo to identify the receiver's input (by matching script_pubkey)
+        // The receiver's original_output script tells us which input is the receiver's
+        let receiver_script = &proposal.tweak_info.original_output.script_pubkey;
+
+        // Find receiver's input index by matching script_pubkey in witness_utxo
+        let receiver_input_idx = proposal.psbt.inputs.iter().position(|inp| {
+            inp.witness_utxo.as_ref()
+                .map(|utxo| &utxo.script_pubkey == receiver_script)
+                .unwrap_or(false)
+        });
+
+        // The other input is the proposer's (PSBT always has exactly 2 inputs)
+        let proposer_input_idx = match receiver_input_idx {
+            Some(0) => 1,
+            Some(1) => 0,
+            _ => 0, // Fallback to first if we can't determine
+        };
+
+        let proposer_input = tx.input.get(proposer_input_idx)
             .map(|inp| format!("{}:{}", inp.previous_output.txid, inp.previous_output.vout))
             .unwrap_or_else(|| "unknown".to_string());
 
-        let proposer_value = proposal.psbt.inputs.first()
+        let proposer_value = proposal.psbt.inputs.get(proposer_input_idx)
             .and_then(|inp| inp.witness_utxo.as_ref())
             .map(|txout| txout.value.to_sat())
             .unwrap_or(0);
@@ -1553,8 +1609,8 @@ impl Manager {
 
         // Find opportunities (candidates are queried from partial_utxo_set)
         // Use wide range for candidates (min_utxo_sats to u64::MAX)
-        // Use all blocks (0) and don't filter to SNICKER-only for automation (maximize opportunities)
-        let opportunities = self.find_snicker_opportunities(min_utxo_sats, u64::MAX, 0, false).await?;
+        // Use all blocks (0) - SNICKER-pattern UTXOs are automatically prioritized
+        let opportunities = self.find_snicker_opportunities(min_utxo_sats, u64::MAX, 0).await?;
 
         if opportunities.is_empty() {
             tracing::debug!("No opportunities found");

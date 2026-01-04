@@ -1301,11 +1301,9 @@ impl AmbientApp {
                     let min_candidate_sats = wallet_data.snicker_scan_min_utxo_input.parse::<u64>().unwrap_or(10_000);
                     let max_candidate_sats = wallet_data.snicker_scan_max_utxo_input.parse::<u64>().unwrap_or(u64::MAX);
                     let max_block_age = wallet_data.snicker_scan_block_age_input.parse::<u32>().unwrap_or(0);
-                    // TODO: Add GUI option to enable snicker_only filtering
-                    let snicker_only = false;
 
-                    println!("🔍 Finding SNICKER opportunities (min: {}, max: {}, block_age: {}, snicker_only: {})...",
-                             min_candidate_sats, max_candidate_sats, max_block_age, snicker_only);
+                    println!("🔍 Finding SNICKER opportunities (min: {}, max: {}, block_age: {})...",
+                             min_candidate_sats, max_candidate_sats, max_block_age);
 
                     let manager_clone = manager.clone();
                     let rt_handle = self.tokio_runtime.handle().clone();
@@ -1313,7 +1311,7 @@ impl AmbientApp {
                     return Task::perform(
                         async move {
                             rt_handle.spawn(async move {
-                                manager_clone.find_snicker_opportunities(min_candidate_sats, max_candidate_sats, max_block_age, snicker_only).await
+                                manager_clone.find_snicker_opportunities(min_candidate_sats, max_candidate_sats, max_block_age).await
                             }).await.unwrap()
                         },
                         |result| match result {
@@ -1565,7 +1563,7 @@ impl AmbientApp {
                     let task_config = AutomationConfig {
                         interval_secs,
                         min_utxo_sats: 75_000, // TODO: Make configurable
-                        proposal_delta_sats: 1_000, // TODO: Make configurable
+                        proposal_delta_sats: 100, // Low default allows ~25 coinjoins/day with 2500 daily limit
                     };
 
                     let snicker_config = SnickerAutomation {

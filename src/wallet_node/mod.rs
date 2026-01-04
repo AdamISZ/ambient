@@ -1090,6 +1090,37 @@ impl WalletNode {
                                                     crate::snicker::Snicker::delete_pairings_for_our_utxo(
                                                         &conn, &txid_str, outpoint.vout
                                                     );
+
+                                                    // CONFLICT DETECTION: Check if this outpoint was expected
+                                                    // to be spent by one of our pending transactions
+                                                    if let Some(our_pending_txid) = crate::snicker::Snicker::get_pending_tx_for_input_static(
+                                                        &conn, &txid_str, outpoint.vout
+                                                    ) {
+                                                        // Find what transaction actually spent this outpoint
+                                                        for tx in &indexed_block.block.txdata {
+                                                            for input in &tx.input {
+                                                                if input.previous_output == *outpoint {
+                                                                    let actual_spending_txid = tx.compute_txid().to_string();
+
+                                                                    // If a DIFFERENT transaction spent this input,
+                                                                    // our pending transaction is now conflicted/invalid
+                                                                    if actual_spending_txid != our_pending_txid {
+                                                                        tracing::warn!(
+                                                                            "💥 Conflict detected: input {}:{} spent by {} (we expected {})",
+                                                                            txid_str, outpoint.vout, actual_spending_txid, our_pending_txid
+                                                                        );
+                                                                        if let Err(e) = crate::snicker::Snicker::remove_conflicted_transaction_static(
+                                                                            &conn, &our_pending_txid
+                                                                        ) {
+                                                                            tracing::error!("Failed to clean up conflicted tx: {}", e);
+                                                                        }
+                                                                    }
+                                                                    // If it's the SAME transaction, it just got confirmed - that's fine
+                                                                    break;
+                                                                }
+                                                            }
+                                                        }
+                                                    }
                                                 }
                                             } // Release conn before async operations
 
@@ -1103,6 +1134,27 @@ impl WalletNode {
                                                     }
                                                 }
                                                 drop(wallet_guard);
+
+                                                // Also check SNICKER UTXOs table for outputs with our tweaked keys
+                                                // (these aren't recognized by is_mine() since they're not descriptor-derived)
+                                                {
+                                                    let conn = snicker_conn.lock().unwrap();
+                                                    let coinjoin_txid_str = coinjoin_txid.to_string();
+                                                    // Query sum of all SNICKER UTXOs from this transaction
+                                                    let snicker_total: i64 = conn.query_row(
+                                                        "SELECT COALESCE(SUM(amount), 0) FROM snicker_utxos WHERE txid = ?",
+                                                        [&coinjoin_txid_str],
+                                                        |row| row.get(0),
+                                                    ).unwrap_or(0);
+
+                                                    if snicker_total > 0 {
+                                                        our_output_amount += snicker_total as u64;
+                                                        tracing::debug!(
+                                                            "Including SNICKER output {} sats in coinjoin cost calculation",
+                                                            snicker_total
+                                                        );
+                                                    }
+                                                }
 
                                                 // Cost = what we put in - what we got out
                                                 let cost_sats = our_input_amount.saturating_sub(our_output_amount);
@@ -2271,6 +2323,11 @@ impl WalletNode {
                 let keychain = local_utxo.keychain;
                 let derivation_index = local_utxo.derivation_index;
 
+                // Debug: log the UTXO's script_pubkey
+                tracing::debug!("derive_utxo_privkey: UTXO {}:{} script_pubkey: {}",
+                    local_utxo.outpoint.txid, local_utxo.outpoint.vout,
+                    hex::encode(local_utxo.txout.script_pubkey.as_bytes()));
+
                 use bdk_wallet::bitcoin::bip32::DerivationPath;
                 use std::str::FromStr;
 
@@ -2283,6 +2340,8 @@ impl WalletNode {
                 // Build full derivation path from account level: m/86h/<cointype>h/0h/<change>/<index>
                 let coin_type = if self.network == Network::Bitcoin { 0 } else { 1 };
                 let full_path_str = format!("m/86h/{}h/0h/{}/{}", coin_type, change, derivation_index);
+                tracing::debug!("derive_utxo_privkey: keychain={:?}, derivation_index={}, path={}",
+                    keychain, derivation_index, full_path_str);
                 let full_path = DerivationPath::from_str(&full_path_str)?;
 
                 // Derive the internal private key from signer
@@ -2330,6 +2389,19 @@ impl WalletNode {
                 // If odd parity (0x03), negate the private key
                 if parity == 0x03 {
                     tweaked_seckey = tweaked_seckey.negate();
+                }
+
+                // Debug: compare derived pubkey with UTXO's script_pubkey
+                let final_pubkey = tweaked_seckey.public_key(&secp);
+                let final_xonly = XOnlyPublicKey::from(final_pubkey);
+                let script_xonly = &local_utxo.txout.script_pubkey.as_bytes()[2..]; // Skip OP_1 PUSH32
+                tracing::debug!("derive_utxo_privkey COMPARISON:");
+                tracing::debug!("  Derived pubkey xonly:    {}", hex::encode(final_xonly.serialize()));
+                tracing::debug!("  Script pubkey xonly:     {}", hex::encode(script_xonly));
+                if final_xonly.serialize() != script_xonly[..32] {
+                    tracing::error!("❌ PUBKEY MISMATCH: derived key doesn't match UTXO script_pubkey!");
+                } else {
+                    tracing::debug!("✅ PUBKEY MATCH: derived key matches UTXO script_pubkey");
                 }
 
                 Ok(tweaked_seckey)
