@@ -6,11 +6,8 @@
 /// NOTE: This is a simplified test. For full SNICKER workflow testing (creating
 /// proposals, accepting them, etc.), use the manual workflow in the ambient CLI.
 
-use anyhow::Result;
-use bdk_wallet::bitcoin::consensus::encode::serialize_hex;
-
+#[allow(unused_imports)]
 mod common;
-use common::BITCOIND;
 
 /// Unit test: Verify fee calculation is correct with realistic fee rates
 #[test]

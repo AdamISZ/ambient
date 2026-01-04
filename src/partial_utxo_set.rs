@@ -5,7 +5,7 @@
 //!
 //! ## Three-Dimensional Filtering
 //! 1. **Script Type**: P2TR (taproot) only
-//! 2. **Amount**: >= 5000 sats only (anti-dust/inscription filter)
+//! 2. **Amount**: >= 3000 sats only (anti-dust/inscription filter)
 //! 3. **Age**: Last N blocks only (default: 1000 blocks ~1 week)
 //!
 //! ## Storage
@@ -21,9 +21,6 @@ use bdk_wallet::bitcoin::{Block, OutPoint, ScriptBuf, Txid};
 use rusqlite::{Connection, params};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
-
-/// Minimum UTXO amount to track (must match config default)
-pub const MIN_SNICKER_OUTPUT: u64 = 5000;
 
 /// UTXO status in partial set
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

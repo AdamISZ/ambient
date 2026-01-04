@@ -2795,21 +2795,21 @@ mod tests {
         let fee_3_outputs = 255 * 10; // 2550 sats
         let fee_2_outputs = 212 * 10; // 2120 sats
 
-        // Calculate proposer UTXO size needed to create change between 546 and 2730
+        // Calculate proposer UTXO size needed to create change between 546 and 3000
         // Total out (2 equal outputs) = 2 × 9000 = 18000
         // Total in = receiver (10000) + proposer_amount
         // Change = total_in - total_out - fee_3_outputs
         //        = 10000 + proposer_amount - 18000 - 2550
         //        = proposer_amount - 10550
-        // We want: 546 ≤ change < 2730
-        // So: 546 ≤ proposer_amount - 10550 < 2730
-        //     11096 ≤ proposer_amount < 13280
+        // We want: 546 ≤ change < 3000 (MIN_UTXO_SIZE)
+        // So: 546 ≤ proposer_amount - 10550 < 3000
+        //     11096 ≤ proposer_amount < 13550
         // Let's use 11500, which gives change = 950 sats
         let proposer_amount = Amount::from_sat(11500);
         let expected_change_3_outputs = 10000 + 11500 - 18000 - fee_3_outputs;
         println!("Expected change with 3 outputs: {} sats", expected_change_3_outputs);
-        assert!(expected_change_3_outputs >= 546 && expected_change_3_outputs < 2730,
-                "Test setup error: change should be between 546 and 2730");
+        assert!(expected_change_3_outputs >= 546 && expected_change_3_outputs < 3000,
+                "Test setup error: change should be between 546 and 3000");
 
         // Create proposer UTXO and addresses
         let proposer_internal_key = bdk_wallet::bitcoin::secp256k1::SecretKey::new(&mut rng).x_only_public_key(&secp).0;
@@ -2823,7 +2823,7 @@ mod tests {
         let proposer_change_addr = Address::from_script(&receiver_script, Network::Regtest).unwrap();
 
         // Call build_equal_outputs_structure with min_change_output_size
-        let min_change_output_size = crate::config::DEFAULT_MIN_CHANGE_OUTPUT_SIZE;
+        let min_change_output_size = crate::config::MIN_UTXO_SIZE;
         let result = Snicker::build_equal_outputs_structure(
             &receiver_output,
             proposer_amount,

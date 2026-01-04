@@ -7,24 +7,15 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::fs;
 
-/// Default minimum change output size to create (in satoshis)
+/// Minimum UTXO size to track and create (in satoshis)
 ///
-/// Set to 5× the dust limit (546 sats) = 2730 sats.
+/// This value serves dual purposes:
+/// 1. Minimum change output size - change below this is dropped and added to miner fee
+/// 2. Minimum tracked UTXO size - partial_utxo_set only stores UTXOs >= this amount
 ///
-/// Rationale: The dust limit (546 sats) is a Bitcoin Core policy rule that prevents
-/// creation of economically unspendable outputs. While technically valid above 546 sats,
-/// small UTXOs between 546-2730 sats are still uneconomical to spend in many scenarios:
-/// - At 10 sat/vB, spending a P2TR input costs ~580 sats in fees
-/// - At 50 sat/vB (high fee environment), it costs ~2900 sats
-/// - Creating slightly larger UTXOs (5× dust) provides a safety margin
-///
-/// For SNICKER proposals, when change would fall below this threshold, we drop the
-/// change output entirely and bump the miner fee instead. This keeps the UTXO set
-/// smaller and avoids creating economically marginal outputs.
-///
-/// Note: This applies to ALL SNICKER proposal creation (manual and automated), not just
-/// automation. It controls transaction building logic for the final "leftover" amount.
-pub const DEFAULT_MIN_CHANGE_OUTPUT_SIZE: u64 = 5 * 546; // 2730 sats
+/// At 3000 sats, outputs are economically spendable even in moderate fee environments.
+/// NOT user-configurable to prevent inconsistency between change creation and UTXO tracking.
+pub const MIN_UTXO_SIZE: u64 = 3000;
 
 /// Network type for Bitcoin
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -277,13 +268,6 @@ pub struct SnickerAutomation {
     #[serde(default = "default_snicker_pattern_only")]
     pub snicker_pattern_only: bool,
 
-    /// Minimum change output size to create (in sats)
-    /// Change outputs smaller than this will be dropped (bumping miner fee instead)
-    /// Default: 5 × 546 (dust limit) = 2730 sats
-    /// Applies to all SNICKER proposal creation (manual and automated)
-    #[serde(default = "default_min_change_output_size")]
-    pub min_change_output_size: u64,
-
     /// Number of outstanding proposals to maintain in Proposer mode
     /// Default: 5 (aggressive for bootstrapping new ecosystem)
     #[serde(default = "default_outstanding_proposals")]
@@ -305,7 +289,6 @@ impl Default for SnickerAutomation {
             max_sats_per_week: default_max_sats_per_week(),
             prefer_snicker_outputs: default_prefer_snicker_outputs(),
             snicker_pattern_only: default_snicker_pattern_only(),
-            min_change_output_size: default_min_change_output_size(),
             outstanding_proposals: default_outstanding_proposals(),
             receiver_timeout_blocks: default_receiver_timeout_blocks(),
         }
@@ -523,11 +506,6 @@ fn default_snicker_pattern_only() -> bool {
     false
 }
 
-/// Get the default minimum change output size (5 × dust limit)
-fn default_min_change_output_size() -> u64 {
-    DEFAULT_MIN_CHANGE_OUTPUT_SIZE
-}
-
 /// Get the default number of outstanding proposals to maintain (5)
 fn default_outstanding_proposals() -> u32 {
     5
@@ -556,10 +534,9 @@ fn default_scan_window_blocks() -> u32 {
     1000
 }
 
-/// Get the default minimum UTXO amount (5000 sats)
-/// This matches the minimum change output size for SNICKER
+/// Get the default minimum UTXO amount
 fn default_min_utxo_amount() -> u64 {
-    5000
+    MIN_UTXO_SIZE
 }
 
 /// Get the default maximum UTXO age delta (1000 blocks)
@@ -632,7 +609,7 @@ mod tests {
         assert_eq!(deserialized.peer, Some("localhost:18444".to_string()));
         assert_eq!(deserialized.proposal_network.backend, ProposalNetworkBackend::FileBased);
         assert_eq!(deserialized.partial_utxo_set.scan_window_blocks, 1000);
-        assert_eq!(deserialized.partial_utxo_set.min_utxo_amount_sats, 5000);
+        assert_eq!(deserialized.partial_utxo_set.min_utxo_amount_sats, MIN_UTXO_SIZE);
     }
 
     #[test]

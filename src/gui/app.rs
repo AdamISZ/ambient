@@ -712,15 +712,6 @@ impl AmbientApp {
                 Task::none()
             }
 
-            Message::SettingsMinChangeOutputSizeChanged(size_str) => {
-                if let Some(crate::gui::modal::Modal::Settings { edited_config, wallet_loaded: _ }) = &mut self.active_modal {
-                    if let Ok(size) = size_str.parse::<u64>() {
-                        edited_config.snicker_automation.min_change_output_size = size;
-                    }
-                }
-                Task::none()
-            }
-
             Message::SettingsSave => {
                 if let Some(crate::gui::modal::Modal::Settings { edited_config, wallet_loaded: _ }) = &self.active_modal {
                     match edited_config.validate() {
@@ -1368,7 +1359,7 @@ impl AmbientApp {
                     return Task::perform(
                         async move {
                             rt_handle.spawn(async move {
-                                let (proposal, encrypted) = manager_clone.create_snicker_proposal(&opportunity, delta_sats as i64, crate::config::DEFAULT_MIN_CHANGE_OUTPUT_SIZE).await?;
+                                let (proposal, encrypted) = manager_clone.create_snicker_proposal(&opportunity, delta_sats as i64, crate::config::MIN_UTXO_SIZE).await?;
 
                                 let tag_hex = ::hex::encode(&proposal.tag);
 
@@ -1573,7 +1564,6 @@ impl AmbientApp {
                         max_sats_per_week,
                         prefer_snicker_outputs: true,   // Prefer spending SNICKER outputs
                         snicker_pattern_only: false,    // Allow targeting any P2TR UTXO (for bootstrapping)
-                        min_change_output_size: crate::config::DEFAULT_MIN_CHANGE_OUTPUT_SIZE,
                         outstanding_proposals: 5,       // Default
                         receiver_timeout_blocks: 144,   // Default (~1 day)
                     };

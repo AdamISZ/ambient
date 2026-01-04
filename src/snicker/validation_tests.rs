@@ -1597,7 +1597,7 @@ fn test_build_psbt_correct_structure() {
         proposer_change_addr,
         1_000, // delta
         bdk_wallet::bitcoin::FeeRate::from_sat_per_vb(2).unwrap(),
-        crate::config::DEFAULT_MIN_CHANGE_OUTPUT_SIZE,
+        crate::config::MIN_UTXO_SIZE,
     ).unwrap();
 
     // Verify structure
@@ -1684,7 +1684,7 @@ fn test_build_psbt_correct_order() {
         proposer_change_addr,
         1_000,
         bdk_wallet::bitcoin::FeeRate::from_sat_per_vb(2).unwrap(),
-        crate::config::DEFAULT_MIN_CHANGE_OUTPUT_SIZE,
+        crate::config::MIN_UTXO_SIZE,
     ).unwrap();
 
     // Verify both inputs are present (order is randomized for privacy)
@@ -1781,7 +1781,7 @@ fn test_build_psbt_includes_witness_utxos() {
         proposer_change_addr,
         1_000,
         bdk_wallet::bitcoin::FeeRate::from_sat_per_vb(2).unwrap(),
-        crate::config::DEFAULT_MIN_CHANGE_OUTPUT_SIZE,
+        crate::config::MIN_UTXO_SIZE,
     ).unwrap();
 
     // Find receiver and proposer inputs (order is randomized)
@@ -1900,7 +1900,7 @@ fn test_build_equal_outputs_dust_prevention() {
         proposer_change_addr,
         500, // delta that would create dust
         bdk_wallet::bitcoin::FeeRate::from_sat_per_vb(2).unwrap(),
-        crate::config::DEFAULT_MIN_CHANGE_OUTPUT_SIZE,
+        crate::config::MIN_UTXO_SIZE,
     );
 
     assert!(result.is_err(), "Should reject when equal output would be dust");
@@ -1990,7 +1990,7 @@ fn test_build_equal_outputs_insufficient_funds() {
         proposer_change_addr,
         1_000,
         bdk_wallet::bitcoin::FeeRate::from_sat_per_vb(2).unwrap(),
-        crate::config::DEFAULT_MIN_CHANGE_OUTPUT_SIZE,
+        crate::config::MIN_UTXO_SIZE,
     );
 
     assert!(result.is_err(), "Should reject when proposer has insufficient funds");
@@ -2085,7 +2085,7 @@ fn test_propose_invalid_output_index() {
         proposer_change_addr,
         1_000,
         bdk_wallet::bitcoin::FeeRate::from_sat_per_vb(2).unwrap(),
-        crate::config::DEFAULT_MIN_CHANGE_OUTPUT_SIZE,
+        crate::config::MIN_UTXO_SIZE,
     );
 
     // With the new API, this test no longer validates output index bounds

@@ -1637,7 +1637,7 @@ impl Manager {
             }
 
             // Create proposal
-            match self.create_snicker_proposal(&opportunity, delta_sats, config.min_change_output_size).await {
+            match self.create_snicker_proposal(&opportunity, delta_sats, crate::config::MIN_UTXO_SIZE).await {
                 Ok((proposal, encrypted_proposal)) => {
                     created_count += 1;
                     let tag_hex = hex::encode(proposal.tag);

@@ -102,7 +102,6 @@ pub fn view(edited_config: &Config, wallet_loaded: bool) -> Element<'static, Mes
     let nostr_pow = edited_config.proposal_network.nostr_pow_difficulty
         .map(|d| d.to_string())
         .unwrap_or_default();
-    let min_change_output_size_value = edited_config.snicker_automation.min_change_output_size.to_string();
 
     // Build scrollable content section
     let scrollable_content = column![
@@ -197,16 +196,6 @@ pub fn view(edited_config: &Config, wallet_loaded: bool) -> Element<'static, Mes
                     .width(Length::Fixed(100.0))
             ].spacing(5)
         },
-
-        // Minimum change output size input
-        column![
-            text("Minimum Change Output Size (sats)").size(16),
-            text("Minimum size for change outputs in SNICKER proposals (default: 2730 = 5× dust limit)").size(12),
-            text("Change below this will be dropped and added to miner fee instead").size(12),
-            text_input("2730", &min_change_output_size_value)
-                .on_input(Message::SettingsMinChangeOutputSizeChanged)
-                .width(Length::Fixed(200.0))
-        ].spacing(5),
     ]
     .spacing(20);
 

@@ -1,11 +1,7 @@
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::time::Duration;
-
-use anyhow::{anyhow, Result};
-use once_cell::sync::Lazy;
+use anyhow::Result;
 
 mod common;
-use common::{BITCOIND, TestBitcoind};
+use common::BITCOIND;
 
 // Import Manager from main crate
 use ambient::manager::Manager;
@@ -35,13 +31,13 @@ async fn test_snicker_end_to_end() -> Result<()> {
 
     // Create Alice's wallet (receiver)
     println!("👤 Creating Alice's wallet (receiver)...");
-    let temp_dir = std::env::temp_dir();
+    let _temp_dir = std::env::temp_dir();
     let alice_name = format!("alice_{}", std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
 
     let test_password = "test123"; // Test password for encrypted wallets
 
-    let (mut alice_mgr, alice_mnemonic) =
+    let (alice_mgr, alice_mnemonic) =
         Manager::generate(&alice_name, "regtest", current_height, test_password).await?;
     println!("   ✅ Alice's mnemonic: {}", alice_mnemonic);
 
@@ -50,7 +46,7 @@ async fn test_snicker_end_to_end() -> Result<()> {
     let bob_name = format!("bob_{}", std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
 
-    let (mut bob_mgr, bob_mnemonic) =
+    let (bob_mgr, bob_mnemonic) =
         Manager::generate(&bob_name, "regtest", current_height, test_password).await?;
     println!("   ✅ Bob's mnemonic: {}", bob_mnemonic);
 
@@ -158,7 +154,6 @@ async fn test_snicker_end_to_end() -> Result<()> {
         10_000,    // min candidate UTXO size
         150_000,   // max candidate UTXO size
         0,         // all blocks (0 = no age limit)
-        false      // don't filter to SNICKER-only
     ).await?;
     println!("   ✅ Found {} opportunities", opportunities.len());
 
@@ -196,7 +191,7 @@ async fn test_snicker_end_to_end() -> Result<()> {
     let (signed_psbt, encrypted_proposal) = bob_mgr.create_snicker_proposal(
         opportunity,
         delta_sats,
-        ambient::config::DEFAULT_MIN_CHANGE_OUTPUT_SIZE,
+        ambient::config::MIN_UTXO_SIZE,
     ).await?;
 
     println!("   ✅ Proposal created and signed by Bob");

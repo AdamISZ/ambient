@@ -1,3 +1,6 @@
+#![allow(dead_code)]
+#![allow(deprecated)]
+
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::time::Duration;

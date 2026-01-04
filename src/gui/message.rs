@@ -125,7 +125,6 @@ pub enum Message {
     SettingsProposalNetworkBackendChanged(String), // "FileBased" or "Nostr"
     SettingsNostrRelaysChanged(String), // Comma-separated relay URLs
     SettingsNostrPowDifficultyChanged(String), // PoW difficulty (optional)
-    SettingsMinChangeOutputSizeChanged(String),
     SettingsSave,
     SettingsSaved(Result<(), String>),
 
