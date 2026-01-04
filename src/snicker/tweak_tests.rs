@@ -138,11 +138,11 @@ fn test_extract_taproot_pubkey() -> Result<()> {
 
     println!("✅ Taproot pubkey extraction verified");
     println!("   Internal key:   {}", hex::encode(xonly.serialize()));
-    println!("   Expected output key: {}", hex::encode(expected_output_key.to_inner().serialize()));
+    println!("   Expected output key: {}", hex::encode(expected_output_key.to_x_only_public_key().serialize()));
     println!("   Extracted:           {}", hex::encode(extracted));
 
     // The extracted key should match the tweaked output key
-    assert_eq!(extracted, expected_output_key.to_inner().serialize());
+    assert_eq!(extracted, expected_output_key.to_x_only_public_key().serialize());
 
     Ok(())
 }

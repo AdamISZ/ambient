@@ -607,7 +607,6 @@ impl std::fmt::Display for PartialUtxoSetStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bdk_wallet::bitcoin::{Amount, Network, TxOut};
 
     #[test]
     fn test_partial_utxo_set_creation() {

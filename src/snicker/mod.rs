@@ -2524,10 +2524,12 @@ mod tests {
         Snicker::new_from_path(&db_path, Network::Regtest).unwrap()
     }
 
+    #[allow(dead_code)]
     fn create_test_transaction() -> Transaction {
         create_test_transaction_with_seed(2)
     }
 
+    #[allow(dead_code)]
     fn create_test_transaction_with_seed(seed: u64) -> Transaction {
         use bdk_wallet::bitcoin::secp256k1::rand::SeedableRng;
 
@@ -2767,13 +2769,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_small_change_dropped() {
-        use bdk_wallet::bitcoin::{Network, FeeRate, Amount, TxOut, Address, OutPoint, Transaction, TxIn, Witness};
+        use bdk_wallet::bitcoin::{Network, FeeRate, Amount, TxOut, Address};
         use bdk_wallet::bitcoin::secp256k1::{Secp256k1, rand};
-        use bdk_wallet::bitcoin::transaction::Version;
-        use bdk_wallet::bitcoin::locktime::absolute::LockTime;
-        use bdk_wallet::bitcoin::Sequence;
 
-        let snicker = create_test_snicker();
+        let _snicker = create_test_snicker();
         let secp = Secp256k1::new();
         let mut rng = rand::thread_rng();
 
@@ -2785,17 +2784,9 @@ mod tests {
             script_pubkey: receiver_script.clone(),
         };
 
-        // Create receiver's target transaction
-        let target_tx = Transaction {
-            version: Version::TWO,
-            lock_time: LockTime::ZERO,
-            input: vec![],
-            output: vec![receiver_output.clone()],
-        };
-
         // Set delta such that equal outputs are 9000 sats (10000 - 1000)
         let delta_sats = 1000i64;
-        let equal_output_sats = 10000 - delta_sats; // = 9000 sats
+        let _equal_output_sats = 10000 - delta_sats; // = 9000 sats
 
         // Fee rate: 10 sat/vB
         // Fee for 2 inputs + 3 outputs = 255 vB × 10 = 2550 sats
@@ -2823,7 +2814,7 @@ mod tests {
         // Create proposer UTXO and addresses
         let proposer_internal_key = bdk_wallet::bitcoin::secp256k1::SecretKey::new(&mut rng).x_only_public_key(&secp).0;
         let proposer_script = ScriptBuf::new_p2tr(&secp, proposer_internal_key, None);
-        let proposer_txout = TxOut {
+        let _proposer_txout = TxOut {
             value: proposer_amount,
             script_pubkey: proposer_script,
         };

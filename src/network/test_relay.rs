@@ -4,7 +4,7 @@
 //! It does NOT embed a relay to avoid version conflicts and complexity.
 //! Instead, it provides helpers for working with external test relays.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::time::Duration;
 
 /// Configuration for test relay
