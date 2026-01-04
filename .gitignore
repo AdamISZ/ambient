@@ -50,3 +50,6 @@ seed*.txt
 ambient_test_*
 ambient_kyoto_*
 /tmp/
+
+# Planning docs (internal development notes)
+docs/planning/

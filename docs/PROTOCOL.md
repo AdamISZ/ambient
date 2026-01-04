@@ -75,6 +75,7 @@ The protocol uses **two different key derivations**:
 **Unencrypted Proposal**:
 ```rust
 struct Proposal {
+    tag: [u8; 8],            // Tag for identifying this proposal
     psbt: Psbt,              // Partially-signed by proposer
     tweak_info: TweakInfo,   // Tweak metadata
 }
@@ -91,8 +92,14 @@ struct TweakInfo {
 struct EncryptedProposal {
     ephemeral_pubkey: PublicKey,  // For encryption only
     tag: [u8; 8],                 // Fast matching filter
+    version: u8,                  // Proposal format version
     encrypted_data: Vec<u8>,      // ChaCha20-Poly1305 ciphertext
 }
+```
+
+**Wire Format** (versioned):
+```
+[MAGIC: 4 bytes "SNIC"] [version: 1 byte] [encrypted_data]
 ```
 
 ---
@@ -175,32 +182,35 @@ let candidates = bob.scan_for_snicker_candidates(
 - Value within specified range (e.g., 10k-150k sats)
 - Not already spent
 
-**Database storage**: Candidates stored in `snicker_candidates` table for later use.
+**Candidate source**: Candidates are queried on-demand from the **partial UTXO set** - a filtered set of P2TR outputs tracked from the wallet's creation block onwards. This eliminates the need for a separate candidates database.
 
 ### Phase 3: Opportunity Finding (Proposer)
 
-**Bob matches his UTXOs** with stored candidates:
+**Bob matches his UTXOs** with candidates from partial UTXO set:
 
 ```rust
 // Find opportunities where Bob's UTXO can match with candidates
 let opportunities = bob.find_snicker_opportunities(
-    min_utxo_sats: 75_000,
+    min_utxo_sats: 10_000,
+    max_utxo_sats: 100_000_000,
+    max_block_age: 1000,  // Only recent UTXOs
 ).await?;
 ```
 
 **Opportunity criteria**:
-- Bob's UTXO ≥ minimum threshold (e.g., 75k sats)
-- Candidate UTXO value compatible for creating equal outputs
+- Bob's UTXO ≥ minimum threshold
+- Candidate UTXO value within specified range
+- Candidate UTXO age within scan window (for validation)
 - Sufficient funds to cover fees and create non-dust outputs
+- Candidate not already used in a pending proposal
 
 **Output**: List of `ProposalOpportunity` structs:
 ```rust
 struct ProposalOpportunity {
-    our_outpoint: OutPoint,        // Bob's UTXO
-    our_value: Amount,             // Bob's UTXO value
-    target_tx: Transaction,        // Candidate's transaction
-    target_output_index: usize,    // Which output to co-spend
-    target_value: Amount,          // Candidate's value
+    our_outpoint: OutPoint,    // Bob's UTXO
+    our_value: Amount,         // Bob's UTXO value
+    target_outpoint: OutPoint, // Candidate's UTXO outpoint
+    target_txout: TxOut,       // Candidate's TxOut (value + script)
 }
 ```
 
@@ -245,20 +255,22 @@ let alice_tweaked_pubkey = alice_pubkey + snicker_shared_secret*G;
 
 The PSBT contains:
 
-**Inputs (2)**:
-1. Alice's original output (index 0)
-2. Bob's selected UTXO (index 1)
+**Inputs (2)** - order randomized for privacy:
+- Alice's original UTXO
+- Bob's selected UTXO
 
-**Outputs (3)**:
-1. Alice's equal output (tweaked, index 0) - equal_output_amount
-2. Bob's equal output (index 1) - equal_output_amount
-3. Bob's change output (index 2) - remaining funds
+**Outputs (2 or 3)** - order randomized for privacy:
+- Alice's equal output (tweaked) - equal_output_amount
+- Bob's equal output - equal_output_amount
+- Bob's change output (if above min_change_output_size) - remaining funds
+
+If change is below `min_change_output_size` (default 3000 sats), it is dropped and added to the miner fee, resulting in only 2 outputs.
 
 **Fee structure**:
 ```
 equal_output = alice_original - delta
 total_in = alice_original + bob_original
-total_out = 2 * equal_output + change
+total_out = 2 * equal_output + change (or just 2 * equal_output)
 fees = total_in - total_out
 ```
 
@@ -317,17 +329,16 @@ let encrypted_proposal = EncryptedProposal {
 
 ### Phase 5: Proposal Publication (Proposer)
 
-**Bob publishes the encrypted proposal**:
+**Bob publishes the encrypted proposal** via the configured network backend:
 
 ```rust
-bob.store_snicker_proposal(&encrypted_proposal).await?;
+// Publish to Nostr relays or file-based directory
+let receipt = bob.network.publish_proposal(&encrypted_proposal).await?;
 ```
 
-**Database storage**: Stored in `snicker_proposals` table. In a real deployment, this would be:
-- Posted to a bulletin board service
-- Broadcast via P2P network
-- Uploaded to a coordinator server
-- Stored in a distributed hash table (DHT)
+**Network backends** (configurable):
+- **Nostr** (default): Published to configured relays with optional PoW for spam protection
+- **File-based**: Stored in a shared directory for local testing
 
 ### Phase 6: Proposal Discovery (Receiver)
 
@@ -411,15 +422,16 @@ let psbt = alice.receive(
 // Must have exactly 2 inputs
 assert_eq!(psbt.unsigned_tx.input.len(), 2);
 
-// Must have exactly 3 outputs
-assert_eq!(psbt.unsigned_tx.output.len(), 3);
+// Must have 2 or 3 outputs (change may be dropped)
+assert!(psbt.unsigned_tx.output.len() == 2 || psbt.unsigned_tx.output.len() == 3);
 
-// Find our input (should be index 0)
-let our_input_idx = find_our_input(&psbt, our_utxos)?;
-assert_eq!(our_input_idx, 0, "Our input must be first");
+// Find our input by matching outpoint (order is randomized)
+let our_input_idx = psbt.unsigned_tx.input.iter()
+    .position(|input| our_utxos.iter().any(|u| u.outpoint() == input.previous_output))
+    .ok_or("Our input not found")?;
 
-// Proposer's input should be at index 1
-let proposer_input_idx = 1;
+// Proposer's input is the other one
+let proposer_input_idx = 1 - our_input_idx;
 ```
 
 #### 7.2: SNICKER Tweak Verification
@@ -453,25 +465,28 @@ assert_eq!(actual_tweaked_pubkey, expected_tweaked_pubkey);
 #### 7.3: Equal Outputs Verification
 
 ```rust
-// Outputs at index 0 and 1 should be equal value
-let output0_value = psbt.unsigned_tx.output[0].value;
-let output1_value = psbt.unsigned_tx.output[1].value;
-assert_eq!(output0_value, output1_value, "Equal outputs required");
+// Find our tweaked output by matching script_pubkey (order is randomized)
+let our_output = psbt.unsigned_tx.output.iter()
+    .find(|o| o.script_pubkey == tweak_info.tweaked_output.script_pubkey)
+    .ok_or("Tweaked output not found")?;
 
-// Output 0 should use our tweaked key
-assert_eq!(
-    psbt.unsigned_tx.output[0].script_pubkey,
-    tweaked_output.script_pubkey
-);
+// Find the proposer's equal output (same value, different script)
+let proposer_equal_output = psbt.unsigned_tx.output.iter()
+    .find(|o| o.value == our_output.value &&
+              o.script_pubkey != our_output.script_pubkey)
+    .ok_or("Proposer's equal output not found")?;
+
+// Verify equal values
+assert_eq!(our_output.value, proposer_equal_output.value, "Equal outputs required");
 ```
 
 #### 7.4: Delta Verification
 
 ```rust
-// Calculate actual delta
-let original_value = original_output.value.to_sat() as i64;
-let equal_value = output0_value.to_sat() as i64;
-let delta = original_value - equal_value;
+// Calculate actual delta (how much receiver pays)
+let our_input_value = /* from witness_utxo of our input */;
+let our_output_value = our_output.value.to_sat() as i64;
+let delta = our_input_value as i64 - our_output_value;
 
 // Verify delta is acceptable
 let (min_delta, max_delta) = acceptable_delta_range;
@@ -571,30 +586,35 @@ struct SnickerUtxo {
 
 ### Example Transaction
 
-```
-Inputs:
-  [0] Alice's original UTXO (80k sats)
-  [1] Bob's original UTXO (100k sats)
+Input and output order is **randomized** for privacy. Example with 3 outputs:
 
-Outputs:
-  [0] Alice's equal output (79k sats) - tweaked key
-  [1] Bob's equal output (79k sats)
-  [2] Bob's change output (21.6k sats - fees)
+```
+Inputs (randomized order):
+  [?] Alice's original UTXO (80k sats)
+  [?] Bob's original UTXO (100k sats)
+
+Outputs (randomized order):
+  [?] Alice's equal output (79k sats) - tweaked key
+  [?] Bob's equal output (79k sats)
+  [?] Bob's change output (21.6k sats - fees)
 
 Fees: ~400 sats (2 P2TR inputs + 3 P2TR outputs ≈ 205 vbytes)
 ```
 
+If Bob's change is below `min_change_output_size` (3000 sats), only 2 outputs are created and the change is added to the miner fee.
+
 ### Privacy Properties
 
-**Indistinguishability**: The transaction looks like any 2-input, 3-output payment:
+**Indistinguishability**: The transaction looks like any 2-input, 2-or-3-output payment:
 - Could be payment + change
 - Could be payment + fee bump
 - Could be coinjoin (but which inputs correspond to which outputs?)
 
 **Output Unlinkability**: Observer cannot determine:
-- Which input owns output[0]
-- Which input owns output[1]
-- Output[2] is identifiable as change (different amount)
+- Which input owns which equal-value output
+- Input/output order is randomized, providing no positional clues
+- If 3 outputs: change output (different amount) reveals proposer's side
+- If 2 outputs: maximum ambiguity (both outputs are equal-value)
 
 **Best Case**: If both parties later spend their equal outputs in similar ways, the coinjoin provides long-term privacy.
 
@@ -793,26 +813,20 @@ fn apply_tweak_to_seckey_with_parity(
 
 ### Database Schema
 
-**snicker_candidates**:
+**Note**: Candidates are queried on-demand from the `partial_utxo_set` table (see `partial_utxo_set.rs`). Proposals are distributed via Nostr or file-based networks, not stored locally.
+
+**decrypted_proposals** (received proposals pending action):
 ```sql
-CREATE TABLE snicker_candidates (
-    id INTEGER PRIMARY KEY,
-    block_height INTEGER NOT NULL,
-    txid TEXT NOT NULL,
-    tx_hex TEXT NOT NULL,
-    UNIQUE(txid)
+CREATE TABLE decrypted_proposals (
+    tag BLOB PRIMARY KEY,
+    psbt BLOB NOT NULL,
+    tweak_info BLOB NOT NULL,
+    delta_sats INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending'
 );
 ```
 
-**snicker_proposals**:
-```sql
-CREATE TABLE snicker_proposals (
-    id INTEGER PRIMARY KEY,
-    proposal_data BLOB NOT NULL
-);
-```
-
-**snicker_utxos**:
+**snicker_utxos** (our SNICKER outputs):
 ```sql
 CREATE TABLE snicker_utxos (
     txid TEXT NOT NULL,
@@ -822,28 +836,61 @@ CREATE TABLE snicker_utxos (
     tweaked_privkey BLOB NOT NULL,
     snicker_shared_secret BLOB NOT NULL,
     block_height INTEGER,
+    spent INTEGER DEFAULT 0,
     PRIMARY KEY (txid, vout)
+);
+```
+
+**proposal_pairings** (tracks which UTXOs we've proposed to):
+```sql
+CREATE TABLE proposal_pairings (
+    our_txid TEXT NOT NULL,
+    our_vout INTEGER NOT NULL,
+    target_txid TEXT NOT NULL,
+    target_vout INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (our_txid, our_vout, target_txid, target_vout)
+);
+```
+
+**automation_state** (current automation mode):
+```sql
+CREATE TABLE automation_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    mode TEXT NOT NULL DEFAULT 'proposer',
+    last_coinjoin_height INTEGER NOT NULL DEFAULT 0
+);
+```
+
+**coinjoin_spending** (rate limiting):
+```sql
+CREATE TABLE coinjoin_spending (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp INTEGER NOT NULL,
+    delta_sats INTEGER NOT NULL
 );
 ```
 
 ### Key Functions
 
 **Proposer side** (`manager.rs`):
-- `scan_for_snicker_candidates()` - Find potential targets
+- `get_snicker_candidates()` - Query partial UTXO set for candidates
 - `find_snicker_opportunities()` - Match our UTXOs with candidates
 - `create_snicker_proposal()` - Build, sign, encrypt proposal
+- `network.publish_proposal()` - Publish to Nostr/file network
 
 **Receiver side** (`manager.rs`):
-- `scan_for_our_proposals()` - Find and decrypt proposals for our UTXOs
+- `network.fetch_proposals()` - Fetch proposals from network
+- `try_decrypt_for_utxo()` - Attempt decryption for specific UTXO
 - `accept_snicker_proposal()` - Validate and sign proposal
-- `store_accepted_snicker_utxo()` - Track resulting UTXO
+- `store_snicker_utxo()` - Track resulting UTXO
 
 **Cryptographic operations** (`snicker/tweak.rs`):
 - `calculate_dh_shared_secret()` - ECDH for two keys
 - `apply_taproot_tweak()` - Add tweak to x-only pubkey
 - `apply_tweak_to_seckey_with_parity()` - Add tweak to seckey with parity handling
 - `derive_tweaked_seckey()` - Compute receiver's tweaked private key
-- `encrypt_proposal()` / `decrypt_proposal()` - ChaCha20-Poly1305
+- `encrypt_proposal_v1()` / `decrypt_proposal_v1()` - ChaCha20-Poly1305 with versioning
 - `compute_proposal_tag()` - Fast matching filter
 
 ### Integration with BDK
