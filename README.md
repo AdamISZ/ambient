@@ -50,10 +50,10 @@ From here, we'll start to discuss more technicalities. Ambient is a Bitcoin wall
 
 Under the hood, Ambient includes a **partial UTXO set** feature that enables trustless validation of incoming proposals:
 
-- **Maintains a filtered UTXO set**: Tracks P2TR outputs ≥ 5000 sats from 1000 blocks before wallet creation, forwards
-- **Validates proposer UTXOs**: Verifies that proposer's inputs actually exist and are unspent (so they can't be more than 1000 blocks older than the receiver wallet's birthday)
+- **Maintains a filtered UTXO set**: Tracks P2TR outputs ≥ 3000 sats from the wallet's creation block onwards
+- **Validates proposer UTXOs**: Verifies that proposer's inputs actually exist and are unspent (so they can't be more than ~1000 blocks older than the receiver wallet's birthday)
 - **Prevents spam attacks**: Rejects proposals with fake or spent UTXOs without external API calls
-- **Privacy-preserving**: Downloads all blocks *from its creation* (not from genesis) but stores only filtered UTXOs (~60 MB)
+- **Privacy-preserving**: Downloads all blocks *from its creation* (not from genesis) but stores only filtered UTXOs (tens of MB)
 - **Automatic maintenance**: Updates in real-time as new blocks arrive, self-prunes old data
 
 This "lobotomized full node" approach provides a lot of the security of full validation with the lightweight storage of an SPV client. "A lot" : of course, this is more an SPV model of security inasmuch as you cannot validate locally using only a "slice" of the full utxo set.
@@ -170,10 +170,10 @@ ambient/
 │   ├── wallet_node.rs        # Bitcoin wallet (BDK + Kyoto)
 │   ├── partial_utxo_set.rs   # Partial UTXO set for trustless validation
 │   ├── encryption.rs         # Encrypted in-memory database management
+│   ├── automation.rs         # Automation task and rate limiting
 │   ├── snicker/
 │   │   ├── mod.rs            # SNICKER protocol logic
-│   │   ├── tweak.rs          # Cryptographic primitives (ECDH, tweaking)
-│   │   └── automation.rs     # Automation task and rate limiting
+│   │   └── tweak.rs          # Cryptographic primitives (ECDH, tweaking)
 │   ├── network/              # Proposal broadcast/discovery
 │   │   ├── mod.rs            # Network trait and abstraction
 │   │   ├── nostr.rs          # Nostr network implementation
