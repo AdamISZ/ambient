@@ -1592,9 +1592,6 @@ impl AmbientApp {
                     use crate::config::SnickerAutomation;
 
                     // Parse configuration from UI inputs
-                    let interval_secs = wallet_data.automation_interval_secs
-                        .parse::<u64>()
-                        .unwrap_or(10);
                     let max_sats_per_coinjoin = wallet_data.automation_max_sats_per_coinjoin
                         .parse::<u64>()
                         .unwrap_or(1000);
@@ -1606,7 +1603,6 @@ impl AmbientApp {
                         .unwrap_or(10000);
 
                     let task_config = AutomationConfig {
-                        interval_secs,
                         min_utxo_sats: 75_000, // TODO: Make configurable
                         proposal_delta_sats: 100, // Low default allows ~25 coinjoins/day with 2500 daily limit
                     };

@@ -3,7 +3,8 @@
 //! This test verifies end-to-end automation with:
 //! - Embedded Nostr relay for proposal exchange
 //! - Block-triggered automation on multiple wallets
-//! - Role alternation (Proposer/Receiver)
+//! - Deterministic role assignment for reproducibility
+//! - Transaction logging for verification
 //! - Fund conservation verification
 //!
 //! Run with:
@@ -26,6 +27,7 @@ use ambient::config::{SnickerAutomation, AutomationMode};
 use ambient::network::embedded_relay::EmbeddedRelay;
 use ambient::network::nostr::NostrNetwork;
 use ambient::network::ProposalNetwork;
+use ambient::snicker::{AutomationRole, AutomationState};
 use nostr_sdk::Keys;
 
 // ============================================================
@@ -47,22 +49,37 @@ const MAX_SATS_PER_WEEK: u64 = 100_000;
 // TEST METRICS
 // ============================================================
 
+/// A recorded coinjoin transaction
+#[derive(Debug, Clone)]
+struct CoinjoinRecord {
+    wallet: String,
+    block_height: u32,
+    delta_sats: i64,
+    role: String,
+    txid: String,
+}
+
 struct TestMetrics {
     initial_funding: HashMap<String, u64>,
-    coinjoins_detected: usize,
+    coinjoins: Vec<CoinjoinRecord>,
 }
 
 impl TestMetrics {
     fn new() -> Self {
         Self {
             initial_funding: HashMap::new(),
-            coinjoins_detected: 0,
+            coinjoins: Vec::new(),
         }
     }
 
     fn record_funding(&mut self, wallet: &str, amount: u64) {
         *self.initial_funding.entry(wallet.to_string()).or_insert(0) += amount;
     }
+}
+
+/// Query all coinjoin records from a wallet's database
+fn get_coinjoin_history(mgr: &Manager) -> Vec<(u32, i64, String, String)> {
+    mgr.snicker.get_coinjoin_history().unwrap_or_default()
 }
 
 // ============================================================
@@ -237,6 +254,28 @@ async fn test_nostr_automation() -> Result<()> {
 
     let mut automation_tasks: Vec<AutomationTask> = Vec::new();
 
+    // Set deterministic roles: alternate Proposer/Receiver
+    // This makes the test reproducible
+    let initial_roles = [
+        AutomationRole::Proposer,  // alice - will create proposals
+        AutomationRole::Receiver,  // bob - will receive proposals
+        AutomationRole::Proposer,  // carol - will create proposals
+        AutomationRole::Receiver,  // dave - will receive proposals
+    ];
+
+    let current_height = BITCOIND.get_block_count()? as u32;
+
+    for (i, (name, mgr)) in managers.iter().enumerate() {
+        // Set deterministic role
+        let role = initial_roles[i];
+        let state = AutomationState {
+            role,
+            last_coinjoin_height: current_height,
+        };
+        mgr.snicker.set_automation_state(&state)?;
+        println!("🎭 {} assigned role: {:?}", name, role);
+    }
+
     for (name, mgr) in &managers {
         println!("🤖 Starting automation for {}...", name);
 
@@ -293,11 +332,6 @@ async fn test_nostr_automation() -> Result<()> {
             let balance = mgr.get_balance().await?;
             let snicker_balance = mgr.get_snicker_balance().await?;
             println!("   {}: {} (snicker: {} sats)", name, balance, snicker_balance);
-
-            // Count coinjoins by checking SNICKER UTXOs
-            if snicker_balance > 0 {
-                metrics.coinjoins_detected += 1;
-            }
         }
 
         println!();
@@ -361,12 +395,39 @@ async fn test_nostr_automation() -> Result<()> {
     println!("│  Verification                               │");
     println!("└─────────────────────────────────────────────┘\n");
 
+    // Collect all coinjoin records from all wallets
+    println!("📋 Coinjoin Transaction Log:");
+    println!("   (These should be identical across test runs with same seed)\n");
+
+    let mut all_coinjoins: Vec<CoinjoinRecord> = Vec::new();
+
+    for (name, mgr) in &managers {
+        let history = get_coinjoin_history(mgr);
+        for (height, delta, role, txid) in history {
+            println!("   {} | height={} | delta={:+} sats | role={} | txid={}...",
+                     name, height, delta, role, &txid[..16]);
+            all_coinjoins.push(CoinjoinRecord {
+                wallet: name.clone(),
+                block_height: height,
+                delta_sats: delta,
+                role,
+                txid,
+            });
+        }
+    }
+
+    if all_coinjoins.is_empty() {
+        println!("   (no coinjoins recorded)");
+    }
+
+    let total_coinjoins = all_coinjoins.len();
+    println!("\n   Total coinjoin records: {}", total_coinjoins);
+
     // Check fund conservation
     let max_fee_per_coinjoin = 2000u64;
-    let estimated_coinjoins = total_snicker / 100_000; // rough estimate
-    let max_total_fees = max_fee_per_coinjoin * estimated_coinjoins.max(5);
+    let max_total_fees = max_fee_per_coinjoin * (total_coinjoins as u64).max(5);
 
-    println!("📊 Fund Conservation:");
+    println!("\n📊 Fund Conservation:");
     println!("   Initial funding: {} sats", total_initial);
     println!("   Final balances:  {} sats", total_final);
 
@@ -384,12 +445,21 @@ async fn test_nostr_automation() -> Result<()> {
     // Check SNICKER activity
     println!("\n📊 SNICKER Activity:");
     println!("   Total SNICKER balance: {} sats", total_snicker);
+    println!("   Coinjoin transactions: {}", total_coinjoins);
 
-    let snicker_activity = total_snicker > 0;
+    let snicker_activity = total_coinjoins > 0 || total_snicker > 0;
     if snicker_activity {
         println!("   ✅ SNICKER coinjoins detected");
     } else {
         println!("   ⚠️ No SNICKER coinjoins detected (automation may need more time)");
+    }
+
+    // Log automation state for each wallet
+    println!("\n📊 Final Automation States:");
+    for (name, mgr) in &managers {
+        let state = mgr.snicker.get_automation_state();
+        println!("   {}: role={:?}, last_coinjoin_height={}",
+                 name, state.role, state.last_coinjoin_height);
     }
 
     // Shutdown relay

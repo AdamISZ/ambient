@@ -2269,6 +2269,26 @@ impl Snicker {
         self.get_spending_since_block(current_height, Self::BLOCKS_PER_WEEK)
     }
 
+    /// Get all coinjoin spending records (for testing/debugging)
+    /// Returns Vec of (block_height, delta_sats, role, txid)
+    pub fn get_coinjoin_history(&self) -> Result<Vec<(u32, i64, String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT block_height, delta_sats, role, txid FROM coinjoin_spending ORDER BY block_height"
+        )?;
+
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, u32>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
     /// Check if a proposed coinjoin would exceed spending limits
     /// Returns Ok(true) if within limits, Ok(false) if would exceed
     /// current_height is needed to calculate spending over the last N blocks
