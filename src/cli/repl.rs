@@ -812,7 +812,7 @@ pub async fn repl(
                     println!("   Max sats/coinjoin: {}", config.snicker_automation.max_sats_per_coinjoin);
                     println!("   Max sats/day: {}", config.snicker_automation.max_sats_per_day);
                     println!("   Max sats/week: {}", config.snicker_automation.max_sats_per_week);
-                    println!("   Interval: {} seconds", task_config.interval_secs);
+                    println!("   Trigger: block-arrival");
 
                     task.start(
                         arc.clone(),

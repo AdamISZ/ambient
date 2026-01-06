@@ -1231,21 +1231,22 @@ impl Snicker {
     }
 
     /// Initialize the coinjoin spending table for tracking sats spent on coinjoins
+    /// Uses block_height instead of timestamp for testability and consistency
     fn init_coinjoin_spending_table(conn: &mut Connection) -> Result<()> {
         conn.execute(
             "CREATE TABLE IF NOT EXISTS coinjoin_spending (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp INTEGER NOT NULL,
+                block_height INTEGER NOT NULL,
                 delta_sats INTEGER NOT NULL,
                 role TEXT NOT NULL,
                 txid TEXT NOT NULL
             )",
             [],
         )?;
-        // Index for efficient time-based queries
+        // Index for efficient block-based queries
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_coinjoin_spending_timestamp
-             ON coinjoin_spending(timestamp)",
+            "CREATE INDEX IF NOT EXISTS idx_coinjoin_spending_block_height
+             ON coinjoin_spending(block_height)",
             [],
         )?;
         Ok(())
@@ -1742,21 +1743,28 @@ impl Snicker {
         let total_input_sats: u64 = inputs.iter().map(|(_, _, amt)| amt).sum();
         let fee_sats = total_input_sats.saturating_sub(total_output_sats);
 
-        conn.execute(
+        // Try to insert, but don't fail if table doesn't exist (legacy wallet compatibility)
+        match conn.execute(
             "INSERT OR REPLACE INTO pending_transactions (txid, broadcast_time, total_input_sats, total_output_sats, fee_sats)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             (txid, broadcast_time, total_input_sats as i64, total_output_sats as i64, fee_sats as i64),
-        )?;
-
-        for (spent_txid, spent_vout, amount) in inputs {
-            conn.execute(
-                "INSERT OR REPLACE INTO pending_inputs (spending_txid, spent_txid, spent_vout, amount_sats)
-                 VALUES (?1, ?2, ?3, ?4)",
-                (txid, spent_txid, spent_vout, *amount as i64),
-            )?;
+        ) {
+            Ok(_) => {
+                for (spent_txid, spent_vout, amount) in inputs {
+                    let _ = conn.execute(
+                        "INSERT OR REPLACE INTO pending_inputs (spending_txid, spent_txid, spent_vout, amount_sats)
+                         VALUES (?1, ?2, ?3, ?4)",
+                        (txid, spent_txid, spent_vout, *amount as i64),
+                    );
+                }
+                tracing::debug!("Stored pending transaction {} with {} inputs", txid, inputs.len());
+            }
+            Err(e) if e.to_string().contains("no such table") => {
+                tracing::warn!("Legacy wallet: pending_transactions table missing, skipping tracking");
+            }
+            Err(e) => return Err(e.into()),
         }
 
-        tracing::debug!("Stored pending transaction {} with {} inputs", txid, inputs.len());
         Ok(())
     }
 
@@ -2183,28 +2191,32 @@ impl Snicker {
     // COINJOIN SPENDING TRACKING
     // ============================================================
 
+    /// Approximate blocks per day (144 = 24 hours * 6 blocks/hour)
+    pub const BLOCKS_PER_DAY: u32 = 144;
+    /// Approximate blocks per week (1008 = 144 * 7)
+    pub const BLOCKS_PER_WEEK: u32 = 1008;
+
     /// Record a completed coinjoin and its delta (sats spent/received)
     /// delta_sats > 0 means we paid sats, < 0 means we received sats
+    /// block_height is the current chain tip height when the coinjoin was completed
     pub fn record_coinjoin_spending(
         &self,
         delta_sats: i64,
         role: &str,
         txid: &str,
+        block_height: u32,
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_secs() as i64;
 
         conn.execute(
-            "INSERT INTO coinjoin_spending (timestamp, delta_sats, role, txid)
+            "INSERT INTO coinjoin_spending (block_height, delta_sats, role, txid)
              VALUES (?1, ?2, ?3, ?4)",
-            (timestamp, delta_sats, role, txid),
+            (block_height, delta_sats, role, txid),
         )?;
 
         tracing::info!(
-            "Recorded coinjoin spending: {} sats (role: {}, txid: {})",
-            delta_sats, role, txid
+            "Recorded coinjoin spending: {} sats at block {} (role: {}, txid: {})",
+            delta_sats, block_height, role, txid
         );
         Ok(())
     }
@@ -2215,57 +2227,54 @@ impl Snicker {
         delta_sats: i64,
         role: &str,
         txid: &str,
+        block_height: u32,
     ) -> Result<()> {
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_secs() as i64;
-
         conn.execute(
-            "INSERT INTO coinjoin_spending (timestamp, delta_sats, role, txid)
+            "INSERT INTO coinjoin_spending (block_height, delta_sats, role, txid)
              VALUES (?1, ?2, ?3, ?4)",
-            (timestamp, delta_sats, role, txid),
+            (block_height, delta_sats, role, txid),
         )?;
 
         tracing::info!(
-            "Recorded coinjoin spending: {} sats (role: {}, txid: {})",
-            delta_sats, role, txid
+            "Recorded coinjoin spending: {} sats at block {} (role: {}, txid: {})",
+            delta_sats, block_height, role, txid
         );
         Ok(())
     }
 
-    /// Get total sats spent on coinjoins in the last N seconds
+    /// Get total sats spent on coinjoins in the last N blocks
     /// Only counts positive deltas (where we paid sats)
-    pub fn get_spending_since(&self, seconds: u64) -> Result<u64> {
+    pub fn get_spending_since_block(&self, current_height: u32, blocks_ago: u32) -> Result<u64> {
         let conn = self.conn.lock().unwrap();
-        let cutoff = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_secs() as i64 - seconds as i64;
+        let cutoff_height = current_height.saturating_sub(blocks_ago);
 
         let spent: i64 = conn.query_row(
             "SELECT COALESCE(SUM(CASE WHEN delta_sats > 0 THEN delta_sats ELSE 0 END), 0)
              FROM coinjoin_spending
-             WHERE timestamp >= ?1",
-            [cutoff],
+             WHERE block_height >= ?1",
+            [cutoff_height],
             |row| row.get(0),
         )?;
 
         Ok(spent.max(0) as u64)
     }
 
-    /// Get spending for the last 24 hours
-    pub fn get_spending_last_day(&self) -> Result<u64> {
-        self.get_spending_since(86400) // 24 * 60 * 60
+    /// Get spending for the last ~24 hours (144 blocks)
+    pub fn get_spending_last_day(&self, current_height: u32) -> Result<u64> {
+        self.get_spending_since_block(current_height, Self::BLOCKS_PER_DAY)
     }
 
-    /// Get spending for the last 7 days
-    pub fn get_spending_last_week(&self) -> Result<u64> {
-        self.get_spending_since(604800) // 7 * 24 * 60 * 60
+    /// Get spending for the last ~7 days (1008 blocks)
+    pub fn get_spending_last_week(&self, current_height: u32) -> Result<u64> {
+        self.get_spending_since_block(current_height, Self::BLOCKS_PER_WEEK)
     }
 
     /// Check if a proposed coinjoin would exceed spending limits
     /// Returns Ok(true) if within limits, Ok(false) if would exceed
+    /// current_height is needed to calculate spending over the last N blocks
     pub fn check_spending_limits(
         &self,
+        current_height: u32,
         delta_sats: i64,
         max_per_coinjoin: u64,
         max_per_day: u64,
@@ -2287,22 +2296,22 @@ impl Snicker {
             return Ok(false);
         }
 
-        // Check daily limit
-        let spent_today = self.get_spending_last_day()?;
+        // Check daily limit (last 144 blocks)
+        let spent_today = self.get_spending_last_day(current_height)?;
         if spent_today + delta_u64 > max_per_day {
             tracing::info!(
-                "Would exceed daily limit: {} + {} > {} sats",
-                spent_today, delta_u64, max_per_day
+                "Would exceed daily limit: {} + {} > {} sats (last {} blocks)",
+                spent_today, delta_u64, max_per_day, Self::BLOCKS_PER_DAY
             );
             return Ok(false);
         }
 
-        // Check weekly limit
-        let spent_week = self.get_spending_last_week()?;
+        // Check weekly limit (last 1008 blocks)
+        let spent_week = self.get_spending_last_week(current_height)?;
         if spent_week + delta_u64 > max_per_week {
             tracing::info!(
-                "Would exceed weekly limit: {} + {} > {} sats",
-                spent_week, delta_u64, max_per_week
+                "Would exceed weekly limit: {} + {} > {} sats (last {} blocks)",
+                spent_week, delta_u64, max_per_week, Self::BLOCKS_PER_WEEK
             );
             return Ok(false);
         }

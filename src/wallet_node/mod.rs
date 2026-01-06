@@ -1170,6 +1170,7 @@ impl WalletNode {
                                                     cost_sats as i64,
                                                     "proposer",
                                                     &coinjoin_txid.to_string(),
+                                                    scan_height,
                                                 ) {
                                                     tracing::error!("Failed to record coinjoin spending: {}", e);
                                                 }

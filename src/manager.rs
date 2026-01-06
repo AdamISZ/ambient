@@ -1505,6 +1505,9 @@ impl Manager {
 
         let mut accepted_count = 0;
 
+        // Get current block height for spending limit checks
+        let current_height = self.get_tip_height().await.unwrap_or(0);
+
         for proposal in selected_proposals {
             // Calculate delta for this proposal
             let delta = self.snicker.calculate_delta_from_proposal(&proposal).ok();
@@ -1512,6 +1515,7 @@ impl Manager {
 
             // Check spending limits before accepting
             let within_limits = self.snicker.check_spending_limits(
+                current_height,
                 delta_sats,
                 config.max_sats_per_coinjoin,
                 config.max_sats_per_day,
@@ -1537,6 +1541,7 @@ impl Manager {
                         delta_sats,
                         "receiver",
                         &txid.to_string(),
+                        current_height,
                     ) {
                         tracing::warn!("Failed to record spending: {}", e);
                     }
@@ -1590,9 +1595,13 @@ impl Manager {
             return Ok(0);
         }
 
+        // Get current block height for spending limit checks
+        let current_height = self.get_tip_height().await.unwrap_or(0);
+
         // Check spending limits before creating proposals
         // delta_sats is what we're proposing to pay (positive = we pay)
         let within_limits = self.snicker.check_spending_limits(
+            current_height,
             delta_sats,
             config.max_sats_per_coinjoin,
             config.max_sats_per_day,

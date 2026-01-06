@@ -1,7 +1,7 @@
 //! SNICKER automation background task runner
 //!
-//! Provides a background task that periodically scans for and processes
-//! SNICKER proposals based on user configuration.
+//! Provides a background task that processes SNICKER proposals on each new block.
+//! Automation is triggered by block arrival, not time-based polling.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,8 +11,6 @@ use tokio::task::JoinHandle;
 /// Automation task configuration
 #[derive(Debug, Clone)]
 pub struct AutomationConfig {
-    /// How often to run automation (in seconds)
-    pub interval_secs: u64,
     /// Minimum UTXO size for creating proposals (in sats)
     pub min_utxo_sats: u64,
     /// Delta to use when creating proposals (in sats)
@@ -22,7 +20,6 @@ pub struct AutomationConfig {
 impl Default for AutomationConfig {
     fn default() -> Self {
         Self {
-            interval_secs: 10,  // 10 seconds (for testing - change back to 300 for production)
             min_utxo_sats: 75_000,
             proposal_delta_sats: 100,  // Low default allows ~25 coinjoins/day with 2500 daily limit
         }
@@ -74,7 +71,7 @@ impl AutomationTask {
             use futures::StreamExt;
             use crate::network::ProposalFilter;
 
-            tracing::info!("🤖 SNICKER automation task started (pub-sub mode)");
+            tracing::info!("🤖 SNICKER automation task started (block-triggered mode)");
             tracing::info!("   Mode: {:?}", snicker_config.mode);
             tracing::info!("   Max sats/coinjoin: {}", snicker_config.max_sats_per_coinjoin);
             tracing::info!("   Max sats/day: {}", snicker_config.max_sats_per_day);
@@ -137,14 +134,14 @@ impl AutomationTask {
                 }
             };
 
-            // Step 3: Set up auto-create interval (Advanced mode only)
-            let mut auto_create_interval = tokio::time::interval(Duration::from_secs(task_config.interval_secs));
-            auto_create_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // Step 3: Subscribe to wallet updates (new blocks)
+            let mut block_updates = manager.subscribe_to_updates();
+            let mut last_processed_height: u32 = manager.get_tip_height().await.unwrap_or(0);
 
             // Pin the stream for select! macro
             tokio::pin!(proposal_stream);
 
-            // Main event loop: process proposals and run auto-create
+            // Main event loop: process proposals on new blocks
             loop {
                 tokio::select! {
                     // New proposal arrived on the stream
@@ -198,13 +195,33 @@ impl AutomationTask {
                         }
                     }
 
-                    // Auto-create interval tick (Advanced mode only)
-                    _ = auto_create_interval.tick() => {
+                    // New block arrived - trigger auto-create (Advanced mode only)
+                    update_result = block_updates.recv() => {
                         // Check cancel flag
                         if *cancel_flag.read().await {
                             tracing::info!("🛑 Automation task cancelled");
                             break;
                         }
+
+                        let update = match update_result {
+                            Ok(u) => u,
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                tracing::warn!("Missed {} block updates, continuing...", n);
+                                continue;
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                tracing::info!("Block update channel closed, stopping automation");
+                                break;
+                            }
+                        };
+
+                        // Skip if we've already processed this height (duplicate update)
+                        if update.height <= last_processed_height {
+                            continue;
+                        }
+
+                        tracing::debug!("📦 New block at height {} - running automation cycle", update.height);
+                        last_processed_height = update.height;
 
                         // Only run auto-create in Advanced mode
                         if snicker_config.mode == AutomationMode::Advanced {
@@ -213,9 +230,8 @@ impl AutomationTask {
 
                             // Check receiver timeout and reroll if needed
                             if automation_state.role == crate::snicker::AutomationRole::Receiver {
-                                let current_height = manager.get_tip_height().await.unwrap_or(0);
                                 match manager.snicker.check_receiver_timeout(
-                                    current_height,
+                                    update.height,
                                     snicker_config.receiver_timeout_blocks,
                                 ) {
                                     Ok(Some(new_role)) => {
