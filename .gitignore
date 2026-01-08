@@ -53,3 +53,6 @@ ambient_kyoto_*
 
 # Planning docs (internal development notes)
 docs/planning/
+
+# Claude Code session notes
+CLAUDE.md

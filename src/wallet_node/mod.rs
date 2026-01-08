@@ -1518,9 +1518,9 @@ impl WalletNode {
 
         let conn = self.snicker_conn.lock().unwrap();
 
-        // Pending outgoing: sum of all inputs in pending transactions
+        // Pending outgoing: sum of OUR inputs in pending transactions (not other parties' inputs)
         let pending_outgoing: i64 = conn.query_row(
-            "SELECT COALESCE(SUM(amount_sats), 0) FROM pending_inputs",
+            "SELECT COALESCE(SUM(amount_sats), 0) FROM pending_inputs WHERE is_ours = 1",
             [],
             |row| row.get(0),
         ).unwrap_or(0);

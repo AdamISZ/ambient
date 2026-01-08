@@ -1169,12 +1169,14 @@ impl Snicker {
             [],
         )?;
         // Track which outpoints are spent by pending transactions
+        // is_ours: TRUE if this input belongs to us, FALSE if it's the other party's (e.g., proposer's UTXO in coinjoin)
         conn.execute(
             "CREATE TABLE IF NOT EXISTS pending_inputs (
                 spending_txid TEXT NOT NULL,
                 spent_txid TEXT NOT NULL,
                 spent_vout INTEGER NOT NULL,
                 amount_sats INTEGER NOT NULL,
+                is_ours INTEGER NOT NULL DEFAULT 1,
                 PRIMARY KEY (spent_txid, spent_vout),
                 FOREIGN KEY (spending_txid) REFERENCES pending_transactions(txid) ON DELETE CASCADE
             )",
@@ -1721,7 +1723,7 @@ impl Snicker {
     pub fn store_pending_transaction(
         &self,
         txid: &str,
-        inputs: &[(String, u32, u64)], // (txid, vout, amount_sats)
+        inputs: &[(String, u32, u64, bool)], // (txid, vout, amount_sats, is_ours)
         total_output_sats: u64,
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
@@ -1732,7 +1734,7 @@ impl Snicker {
     pub fn store_pending_transaction_raw(
         conn: &Connection,
         txid: &str,
-        inputs: &[(String, u32, u64)], // (txid, vout, amount_sats)
+        inputs: &[(String, u32, u64, bool)], // (txid, vout, amount_sats, is_ours)
         total_output_sats: u64,
     ) -> Result<()> {
         let broadcast_time = std::time::SystemTime::now()
@@ -1740,7 +1742,7 @@ impl Snicker {
             .unwrap()
             .as_secs() as i64;
 
-        let total_input_sats: u64 = inputs.iter().map(|(_, _, amt)| amt).sum();
+        let total_input_sats: u64 = inputs.iter().map(|(_, _, amt, _)| amt).sum();
         let fee_sats = total_input_sats.saturating_sub(total_output_sats);
 
         // Try to insert, but don't fail if table doesn't exist (legacy wallet compatibility)
@@ -1750,11 +1752,11 @@ impl Snicker {
             (txid, broadcast_time, total_input_sats as i64, total_output_sats as i64, fee_sats as i64),
         ) {
             Ok(_) => {
-                for (spent_txid, spent_vout, amount) in inputs {
+                for (spent_txid, spent_vout, amount, is_ours) in inputs {
                     let _ = conn.execute(
-                        "INSERT OR REPLACE INTO pending_inputs (spending_txid, spent_txid, spent_vout, amount_sats)
-                         VALUES (?1, ?2, ?3, ?4)",
-                        (txid, spent_txid, spent_vout, *amount as i64),
+                        "INSERT OR REPLACE INTO pending_inputs (spending_txid, spent_txid, spent_vout, amount_sats, is_ours)
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                        (txid, spent_txid, spent_vout, *amount as i64, *is_ours as i32),
                     );
                 }
                 tracing::debug!("Stored pending transaction {} with {} inputs", txid, inputs.len());
@@ -1811,9 +1813,9 @@ impl Snicker {
     pub fn get_pending_balance(&self) -> (u64, u64) {
         let conn = self.conn.lock().unwrap();
 
-        // Pending outgoing: sum of all inputs in pending transactions
+        // Pending outgoing: sum of OUR inputs in pending transactions (not other parties' inputs)
         let pending_outgoing: i64 = conn.query_row(
-            "SELECT COALESCE(SUM(amount_sats), 0) FROM pending_inputs",
+            "SELECT COALESCE(SUM(amount_sats), 0) FROM pending_inputs WHERE is_ours = 1",
             [],
             |row| row.get(0),
         ).unwrap_or(0);

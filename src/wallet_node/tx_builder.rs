@@ -228,18 +228,20 @@ impl WalletNode {
         self.broadcast_transaction(tx.clone()).await?;
 
         // Store pending transaction for tracking (confirmed vs pending balance)
-        let inputs: Vec<(String, u32, u64)> = {
+        // All inputs in a vanilla send are ours (is_ours=true)
+        let inputs: Vec<(String, u32, u64, bool)> = {
             let mut inputs = Vec::new();
-            // Add SNICKER inputs
+            // Add SNICKER inputs (ours)
             for (txid_str, vout, amount, _, _) in &selected.snicker_utxos {
-                inputs.push((txid_str.clone(), *vout, *amount));
+                inputs.push((txid_str.clone(), *vout, *amount, true));
             }
-            // Add regular inputs
+            // Add regular inputs (ours)
             for utxo in &selected.regular_utxos {
                 inputs.push((
                     utxo.outpoint.txid.to_string(),
                     utxo.outpoint.vout,
                     utxo.txout.value.to_sat(),
+                    true,
                 ));
             }
             inputs

@@ -1083,15 +1083,17 @@ impl Manager {
 
         // Store pending transaction for tracking (confirmed vs pending balance)
         // Gather input amounts from proposer UTXO and our UTXOs
-        let inputs: Vec<(String, u32, u64)> = tx.input.iter().filter_map(|input| {
+        // is_ours=false for proposer's UTXO (for conflict detection only, not balance tracking)
+        // is_ours=true for our UTXOs (counted in pending outgoing balance)
+        let inputs: Vec<(String, u32, u64, bool)> = tx.input.iter().filter_map(|input| {
             let outpoint = input.previous_output;
-            // Check if it's the proposer's UTXO
+            // Check if it's the proposer's UTXO (not ours)
             if outpoint == proposer_outpoint {
-                return Some((outpoint.txid.to_string(), outpoint.vout, proposer_value));
+                return Some((outpoint.txid.to_string(), outpoint.vout, proposer_value, false));
             }
             // Check if it's one of our UTXOs
             if let Some(utxo) = our_utxos.iter().find(|u| u.outpoint() == outpoint) {
-                return Some((outpoint.txid.to_string(), outpoint.vout, utxo.value().to_sat()));
+                return Some((outpoint.txid.to_string(), outpoint.vout, utxo.value().to_sat(), true));
             }
             None
         }).collect();
@@ -1450,10 +1452,13 @@ impl Manager {
             tracing::debug!("  UTXO: {}:{} ({} sats){}", txid, vout, amount, marker);
         }
 
+        let mut pending_skipped = 0;
+
         for proposal in proposals {
             // Identify which of our UTXOs this proposal consumes
             // by checking which input in the PSBT matches our wallet
             let mut our_utxo_str = None;
+            let mut is_pending_spent = false;
             for input in &proposal.psbt.unsigned_tx.input {
                 let input_txid = input.previous_output.txid.to_string();
                 let input_vout = input.previous_output.vout;
@@ -1465,6 +1470,12 @@ impl Manager {
                 if our_utxos.iter().any(|(txid, vout, _, _)| {
                     txid == &input_txid && *vout == input_vout
                 }) {
+                    // Check if this UTXO is already being spent by a pending transaction
+                    if self.snicker.is_outpoint_pending_spent(&input_txid, input_vout) {
+                        tracing::debug!("⏸️ UTXO {} is already pending-spent, skipping proposal", outpoint_str);
+                        is_pending_spent = true;
+                        break;
+                    }
                     our_utxo_str = Some(outpoint_str.clone());
                     tracing::debug!("✅ Matched UTXO: {}", outpoint_str);
                     break;
@@ -1473,11 +1484,20 @@ impl Manager {
                 }
             }
 
+            if is_pending_spent {
+                pending_skipped += 1;
+                continue;
+            }
+
             if let Some(utxo_str) = our_utxo_str {
                 proposals_by_utxo.entry(utxo_str).or_insert_with(Vec::new).push(proposal);
             } else {
                 stale_proposals += 1;
             }
+        }
+
+        if pending_skipped > 0 {
+            tracing::info!("⏸️ Skipped {} proposals (UTXOs already pending-spent)", pending_skipped);
         }
 
         if stale_proposals > 0 {
