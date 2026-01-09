@@ -225,6 +225,11 @@ impl AutomationTask {
 
                         // Only run auto-create in Advanced mode
                         if snicker_config.mode == AutomationMode::Advanced {
+                            // Clean up stale proposal pairings (older than 24 hours)
+                            if let Err(e) = manager.snicker.cleanup_stale_pairings() {
+                                tracing::warn!("Failed to cleanup stale pairings: {}", e);
+                            }
+
                             // Check automation state - only create proposals in Proposer role
                             let automation_state = manager.snicker.get_automation_state();
 

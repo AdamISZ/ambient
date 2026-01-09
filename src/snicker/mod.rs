@@ -2026,6 +2026,36 @@ impl Snicker {
         }
     }
 
+    /// Stale pairing timeout: 144 blocks ≈ 24 hours
+    pub const STALE_PAIRING_TIMEOUT_SECS: u64 = 86400; // 24 hours
+
+    /// Delete proposal pairings older than the timeout
+    /// Returns number of pairings deleted
+    pub fn cleanup_stale_pairings(&self) -> Result<usize> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64;
+        let cutoff = now - Self::STALE_PAIRING_TIMEOUT_SECS as i64;
+
+        let count = {
+            let conn = self.conn.lock().unwrap();
+            conn.execute(
+                "DELETE FROM proposal_pairings WHERE created_at < ?",
+                [cutoff],
+            )?
+        };
+
+        if count > 0 {
+            tracing::info!(
+                "🧹 Cleaned up {} stale proposal pairings (older than 24 hours)",
+                count
+            );
+            self.flush_db()?;
+        }
+
+        Ok(count)
+    }
+
     // ============================================================
     // AUTOMATION STATE
     // ============================================================
@@ -2180,10 +2210,13 @@ impl Snicker {
     }
 
     /// Get the number of outstanding proposals (for maintaining N proposals)
+    ///
+    /// Counts total proposal pairings, not just distinct source UTXOs.
+    /// This prevents creating unlimited proposals from a single UTXO.
     pub fn count_outstanding_proposals(&self) -> usize {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT COUNT(DISTINCT our_txid || ':' || our_vout) FROM proposal_pairings",
+            "SELECT COUNT(*) FROM proposal_pairings",
             [],
             |row| row.get::<_, i64>(0),
         ).map(|c| c as usize).unwrap_or(0)

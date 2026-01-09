@@ -1171,11 +1171,19 @@ impl Manager {
                 None,
             )?;
 
-            // Sort with SNICKER-pattern UTXOs first (transaction_type = Some("v1"))
+            // Sort with SNICKER-pattern UTXOs first, then by recency (newer = higher priority)
+            // This helps bootstrapping: fresh UTXOs from new participants get proposed to
             utxos.sort_by(|a, b| {
                 let a_is_snicker = a.transaction_type.as_deref() == Some("v1");
                 let b_is_snicker = b.transaction_type.as_deref() == Some("v1");
-                b_is_snicker.cmp(&a_is_snicker) // true > false, so SNICKER first
+                // Primary: SNICKER first
+                match b_is_snicker.cmp(&a_is_snicker) {
+                    std::cmp::Ordering::Equal => {
+                        // Secondary: more recent (higher block_height) first
+                        b.block_height.cmp(&a.block_height)
+                    }
+                    other => other,
+                }
             });
 
             let snicker_count = utxos.iter()
@@ -1686,6 +1694,16 @@ impl Manager {
                         Some(delta_sats),
                         true,
                     ).await?;
+
+                    // Check if we've reached the outstanding proposals target
+                    let outstanding = self.snicker.count_outstanding_proposals();
+                    if outstanding >= config.outstanding_proposals as usize {
+                        tracing::info!(
+                            "📊 Reached target of {} outstanding proposals, stopping",
+                            config.outstanding_proposals
+                        );
+                        break;
+                    }
                 }
                 Err(e) => {
                     tracing::warn!("❌ Failed to auto-create proposal: {}", e);

@@ -80,11 +80,41 @@ pub struct ProposalFilter {
 
 impl Default for ProposalFilter {
     fn default() -> Self {
+        // No time restriction by default - stale proposals are filtered at acceptance
+        // time when we validate the proposer's UTXO is still unspent
         Self {
             since: None,
             until: None,
             min_pow: None,
             limit: Some(1000), // Default limit to prevent unbounded queries
+        }
+    }
+}
+
+impl ProposalFilter {
+    /// Create a filter with no time restriction (fetches all historical proposals)
+    pub fn all_time() -> Self {
+        Self {
+            since: None,
+            until: None,
+            min_pow: None,
+            limit: Some(1000),
+        }
+    }
+
+    /// Create a filter for proposals from the last N hours
+    pub fn last_hours(hours: u64) -> Self {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let since = now.saturating_sub(hours * 3600);
+
+        Self {
+            since: Some(since),
+            until: None,
+            min_pow: None,
+            limit: Some(1000),
         }
     }
 }
