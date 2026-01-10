@@ -87,6 +87,9 @@ pub struct WalletData {
 
     // Display cache (updated periodically from wallet)
     pub utxos: Vec<String>,
+
+    // Transaction history
+    pub transactions_list: Vec<crate::snicker::TransactionHistoryEntry>,
 }
 
 impl Default for WalletData {
@@ -127,6 +130,7 @@ impl Default for WalletData {
             automation_interval_secs: String::from("10"),
             automation_task: None,
             utxos: Vec::new(),
+            transactions_list: Vec::new(),
         }
     }
 }

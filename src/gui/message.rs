@@ -80,7 +80,7 @@ pub enum Message {
 
     // Transaction history
     TransactionsRequested,
-    TransactionsLoaded(Vec<String>), // Placeholder for now
+    TransactionsLoaded(Result<Vec<crate::snicker::TransactionHistoryEntry>, String>),
 
     // SNICKER
     SnickerScanRequested,

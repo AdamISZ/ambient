@@ -42,7 +42,7 @@ use anyhow::{Result, anyhow};
 use zeroize::Zeroizing;
 use bdk_wallet::{
     bitcoin::{Network, OutPoint, Transaction, TxOut, Txid, psbt::Psbt, secp256k1::PublicKey},
-    rusqlite::Connection,
+    rusqlite::{Connection, OptionalExtension},
 };
 use serde::{Serialize, Deserialize};
 
@@ -111,6 +111,27 @@ impl Default for AutomationState {
             last_coinjoin_height: 0,
         }
     }
+}
+
+// ============================================================
+// TRANSACTION HISTORY
+// ============================================================
+
+/// A recorded transaction in our history
+#[derive(Debug, Clone)]
+pub struct TransactionHistoryEntry {
+    /// Transaction ID
+    pub txid: String,
+    /// Full transaction hex
+    pub tx_hex: String,
+    /// Balance change in satoshis (positive = received, negative = sent)
+    pub balance_change_sats: i64,
+    /// Transaction type: 'receive', 'send', 'coinjoin_proposer', 'coinjoin_receiver'
+    pub tx_type: String,
+    /// Block height where the transaction was confirmed
+    pub block_height: u32,
+    /// Unix timestamp of when the transaction was recorded
+    pub timestamp: u64,
 }
 
 // ============================================================
@@ -566,7 +587,20 @@ impl Snicker {
         // Calculate change (initially assuming 3 outputs)
         let total_in = receiver_output.value + proposer_amount;
         let total_out_before_change = equal_output_amount + equal_output_amount;
-        let change_amount = total_in - total_out_before_change - estimated_fee_3_outputs;
+        let required_for_outputs_and_fee = total_out_before_change.to_sat() + estimated_fee_3_outputs.to_sat();
+
+        // Check if we have enough inputs before attempting subtraction
+        if total_in.to_sat() < required_for_outputs_and_fee {
+            return Err(anyhow::anyhow!(
+                "Insufficient funds for proposal: need {} sats but only have {} sats (proposer: {}, receiver: {}, fee: {})",
+                required_for_outputs_and_fee,
+                total_in.to_sat(),
+                proposer_amount.to_sat(),
+                receiver_output.value.to_sat(),
+                estimated_fee_3_outputs.to_sat()
+            ));
+        }
+        let change_amount = Amount::from_sat(total_in.to_sat() - required_for_outputs_and_fee);
 
         // Check if change is below dust limit (cannot create at all)
         if change_amount.to_sat() < 546 {
@@ -861,7 +895,15 @@ impl Snicker {
         for output in &psbt.unsigned_tx.output {
             total_out += output.value;
         }
-        let fee = total_in - total_out;
+
+        // Check for malicious proposal where outputs exceed inputs
+        if total_out > total_in {
+            return Err(anyhow::anyhow!(
+                "Invalid proposal: outputs ({} sats) exceed inputs ({} sats)",
+                total_out.to_sat(), total_in.to_sat()
+            ));
+        }
+        let fee = Amount::from_sat(total_in.to_sat() - total_out.to_sat());
 
         // Estimate transaction size (2 P2TR inputs + 3 P2TR outputs)
         let estimated_vsize = 10 + (2 * 58) + (3 * 43); // ~205 vbytes
@@ -1021,9 +1063,11 @@ impl Snicker {
         Self::init_snicker_utxos_table(conn)?;
         Self::init_automation_log_table(conn)?;
         Self::init_pending_transactions_table(conn)?;
-        Self::init_proposal_pairings_table(conn)?;
         Self::init_automation_state_table(conn)?;
-        Self::init_coinjoin_spending_table(conn)?;
+        Self::init_transaction_history_table(conn)?;
+        // Note: proposal_pairings and coinjoin_spending tables removed
+        // - proposal_pairings: now uses decrypted_proposals directly
+        // - coinjoin_spending: now uses transaction_history.coinjoin_delta
         Ok(())
     }
 
@@ -1062,6 +1106,25 @@ impl Snicker {
              ON decrypted_proposals(our_utxo, counterparty_utxo, role, status)",
             [],
         )?;
+        // Index for proposer coinjoin detection (replaces proposal_pairings table)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_decrypted_our_utxo
+             ON decrypted_proposals(our_utxo)",
+            [],
+        )?;
+        // Migration: add our_utxo_amount column if it doesn't exist
+        // This stores the proposer's input amount for proper cost calculation
+        let has_amount_col: bool = conn.query_row(
+            "SELECT 1 FROM pragma_table_info('decrypted_proposals') WHERE name = 'our_utxo_amount'",
+            [],
+            |_| Ok(true),
+        ).unwrap_or(false);
+        if !has_amount_col {
+            conn.execute(
+                "ALTER TABLE decrypted_proposals ADD COLUMN our_utxo_amount INTEGER",
+                [],
+            )?;
+        }
         Ok(())
     }
 
@@ -1190,33 +1253,7 @@ impl Snicker {
         Ok(())
     }
 
-    /// Initialize the proposal pairings table for tracking which UTXOs have live proposals
-    fn init_proposal_pairings_table(conn: &mut Connection) -> Result<()> {
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS proposal_pairings (
-                our_txid TEXT NOT NULL,
-                our_vout INTEGER NOT NULL,
-                target_txid TEXT NOT NULL,
-                target_vout INTEGER NOT NULL,
-                created_at INTEGER NOT NULL,
-                PRIMARY KEY (our_txid, our_vout, target_txid, target_vout)
-            )",
-            [],
-        )?;
-        // Index for cleanup when target is spent
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_proposal_pairings_target
-             ON proposal_pairings(target_txid, target_vout)",
-            [],
-        )?;
-        // Index for querying by our outpoint
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_proposal_pairings_our
-             ON proposal_pairings(our_txid, our_vout)",
-            [],
-        )?;
-        Ok(())
-    }
+    // Note: init_proposal_pairings_table removed - proposal tracking now uses decrypted_proposals
 
     /// Initialize the automation state table for persisting proposer/receiver mode
     fn init_automation_state_table(conn: &mut Connection) -> Result<()> {
@@ -1232,25 +1269,51 @@ impl Snicker {
         Ok(())
     }
 
-    /// Initialize the coinjoin spending table for tracking sats spent on coinjoins
-    /// Uses block_height instead of timestamp for testability and consistency
-    fn init_coinjoin_spending_table(conn: &mut Connection) -> Result<()> {
+    // Note: init_coinjoin_spending_table removed - coinjoin tracking now uses transaction_history.coinjoin_delta
+
+    /// Initialize the transaction history table for persistent transaction records
+    fn init_transaction_history_table(conn: &mut Connection) -> Result<()> {
         conn.execute(
-            "CREATE TABLE IF NOT EXISTS coinjoin_spending (
+            "CREATE TABLE IF NOT EXISTS transaction_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                txid TEXT UNIQUE NOT NULL,
+                tx_hex TEXT NOT NULL,
+                balance_change_sats INTEGER NOT NULL,
+                tx_type TEXT NOT NULL,
                 block_height INTEGER NOT NULL,
-                delta_sats INTEGER NOT NULL,
-                role TEXT NOT NULL,
-                txid TEXT NOT NULL
+                timestamp INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                coinjoin_delta INTEGER
             )",
             [],
         )?;
-        // Index for efficient block-based queries
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_coinjoin_spending_block_height
-             ON coinjoin_spending(block_height)",
+            "CREATE INDEX IF NOT EXISTS idx_tx_history_block_height
+             ON transaction_history(block_height DESC)",
             [],
         )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tx_history_type
+             ON transaction_history(tx_type)",
+            [],
+        )?;
+
+        // Migration: Add coinjoin_delta column if it doesn't exist
+        let has_coinjoin_delta: Result<bool, _> = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('transaction_history') WHERE name='coinjoin_delta'",
+            [],
+            |row| {
+                let count: i64 = row.get(0)?;
+                Ok(count > 0)
+            },
+        );
+        if !has_coinjoin_delta.unwrap_or(true) {
+            conn.execute(
+                "ALTER TABLE transaction_history ADD COLUMN coinjoin_delta INTEGER",
+                [],
+            )?;
+        }
+
         Ok(())
     }
 
@@ -1373,6 +1436,7 @@ impl Snicker {
         our_utxo: &str,  // "txid:vout"
         counterparty_utxo: &str,  // "txid:vout"
         delta_sats: i64,
+        our_utxo_amount: Option<u64>,  // Our UTXO amount for cost calculation
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
 
@@ -1384,8 +1448,8 @@ impl Snicker {
 
         let rows_affected = conn.execute(
             "INSERT OR IGNORE INTO decrypted_proposals
-             (tag, psbt, tweak_info, role, status, our_utxo, counterparty_utxo, delta_sats, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             (tag, psbt, tweak_info, role, status, our_utxo, counterparty_utxo, delta_sats, created_at, updated_at, our_utxo_amount)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             (
                 &proposal.tag[..],
                 &psbt_bytes,
@@ -1397,6 +1461,7 @@ impl Snicker {
                 delta_sats,
                 timestamp,
                 timestamp,
+                our_utxo_amount.map(|a| a as i64),
             ),
         )?;
 
@@ -1875,7 +1940,21 @@ impl Snicker {
             conflicted_txid
         );
 
-        // First, delete the SNICKER UTXO that was created for this conflicted transaction.
+        // Delete the transaction_history partial record for this conflicted transaction.
+        // This was created when the coinjoin was broadcast but never confirmed.
+        let deleted_history = conn.execute(
+            "DELETE FROM transaction_history WHERE txid = ? AND tx_hex = ''",
+            [conflicted_txid],
+        ).unwrap_or(0);
+
+        if deleted_history > 0 {
+            tracing::info!(
+                "🗑️  Deleted transaction_history partial record for conflicted tx {}",
+                conflicted_txid
+            );
+        }
+
+        // Delete the SNICKER UTXO that was created for this conflicted transaction.
         // The SNICKER UTXO was stored with this txid when the proposal was accepted.
         let deleted_utxos = conn.execute(
             "DELETE FROM snicker_utxos WHERE txid = ?",
@@ -1937,35 +2016,21 @@ impl Snicker {
     }
 
     // ============================================================
-    // PROPOSAL PAIRINGS (tracking UTXOs with live proposals)
+    // PROPOSAL TRACKING (via decrypted_proposals table)
     // ============================================================
+    // Note: proposal_pairings table has been eliminated - we now use
+    // decrypted_proposals directly with role='proposer' and status='pending'
 
     /// Record that we created a proposal pairing our UTXO with a target UTXO
+    /// (No-op: data is already stored in decrypted_proposals when proposal is created)
     pub fn record_proposal_pairing(
         &self,
         our_outpoint: &bdk_wallet::bitcoin::OutPoint,
         target_outpoint: &bdk_wallet::bitcoin::OutPoint,
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
-
-        conn.execute(
-            "INSERT OR IGNORE INTO proposal_pairings (our_txid, our_vout, target_txid, target_vout, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            (
-                our_outpoint.txid.to_string(),
-                our_outpoint.vout,
-                target_outpoint.txid.to_string(),
-                target_outpoint.vout,
-                timestamp,
-            ),
-        )?;
-
+        // Data is now stored in decrypted_proposals when store_decrypted_proposal is called
         tracing::debug!(
-            "Recorded proposal pairing: {}:{} -> {}:{}",
+            "Proposal pairing tracked via decrypted_proposals: {}:{} -> {}:{}",
             our_outpoint.txid, our_outpoint.vout,
             target_outpoint.txid, target_outpoint.vout
         );
@@ -1973,64 +2038,72 @@ impl Snicker {
     }
 
     /// Check if our UTXO has any live proposals (for GUI display)
+    /// Queries decrypted_proposals where our_utxo matches and status is pending
     pub fn has_live_proposals(&self, our_outpoint: &bdk_wallet::bitcoin::OutPoint) -> bool {
+        let our_utxo = format!("{}:{}", our_outpoint.txid, our_outpoint.vout);
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT 1 FROM proposal_pairings WHERE our_txid = ? AND our_vout = ? LIMIT 1",
-            (our_outpoint.txid.to_string(), our_outpoint.vout),
+            "SELECT 1 FROM decrypted_proposals WHERE our_utxo = ? AND status = 'pending' LIMIT 1",
+            [&our_utxo],
             |_| Ok(true),
         ).unwrap_or(false)
     }
 
-    /// Delete all pairings where the target UTXO matches (called when target is spent)
+    /// Invalidate all proposals where the target UTXO matches (called when target is spent)
+    /// Updates status to 'invalidated' in decrypted_proposals
     pub fn delete_pairings_for_target(conn: &Connection, target_txid: &str, target_vout: u32) -> usize {
+        let counterparty_utxo = format!("{}:{}", target_txid, target_vout);
         match conn.execute(
-            "DELETE FROM proposal_pairings WHERE target_txid = ? AND target_vout = ?",
-            (target_txid, target_vout),
+            "UPDATE decrypted_proposals SET status = 'invalidated'
+             WHERE counterparty_utxo = ? AND status = 'pending'",
+            [&counterparty_utxo],
         ) {
             Ok(count) => {
                 if count > 0 {
                     tracing::debug!(
-                        "Deleted {} proposal pairings for spent target {}:{}",
+                        "Invalidated {} proposals for spent target {}:{}",
                         count, target_txid, target_vout
                     );
                 }
                 count
             }
             Err(e) => {
-                tracing::warn!("Failed to delete proposal pairings: {}", e);
+                tracing::warn!("Failed to invalidate proposals: {}", e);
                 0
             }
         }
     }
 
-    /// Delete all pairings where our UTXO matches (called when our UTXO is spent)
+    /// Invalidate all proposals where our UTXO matches (called when our UTXO is spent)
+    /// Updates status to 'spent' in decrypted_proposals (coinjoin likely completed)
     pub fn delete_pairings_for_our_utxo(conn: &Connection, our_txid: &str, our_vout: u32) -> usize {
+        let our_utxo = format!("{}:{}", our_txid, our_vout);
         match conn.execute(
-            "DELETE FROM proposal_pairings WHERE our_txid = ? AND our_vout = ?",
-            (our_txid, our_vout),
+            "UPDATE decrypted_proposals SET status = 'spent'
+             WHERE our_utxo = ? AND status = 'pending'",
+            [&our_utxo],
         ) {
             Ok(count) => {
                 if count > 0 {
                     tracing::debug!(
-                        "Deleted {} proposal pairings for spent UTXO {}:{}",
+                        "Marked {} proposals as spent for UTXO {}:{}",
                         count, our_txid, our_vout
                     );
                 }
                 count
             }
             Err(e) => {
-                tracing::warn!("Failed to delete proposal pairings: {}", e);
+                tracing::warn!("Failed to update proposal status: {}", e);
                 0
             }
         }
     }
 
-    /// Stale pairing timeout: 144 blocks ≈ 24 hours
+    /// Stale proposal timeout: 144 blocks ≈ 24 hours
     pub const STALE_PAIRING_TIMEOUT_SECS: u64 = 86400; // 24 hours
 
-    /// Delete proposal pairings older than the timeout
-    /// Returns number of pairings deleted
+    /// Mark stale proposals as expired
+    /// Returns number of proposals marked stale
     pub fn cleanup_stale_pairings(&self) -> Result<usize> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
@@ -2040,14 +2113,15 @@ impl Snicker {
         let count = {
             let conn = self.conn.lock().unwrap();
             conn.execute(
-                "DELETE FROM proposal_pairings WHERE created_at < ?",
+                "UPDATE decrypted_proposals SET status = 'stale'
+                 WHERE created_at < ? AND status = 'pending'",
                 [cutoff],
             )?
         };
 
         if count > 0 {
             tracing::info!(
-                "🧹 Cleaned up {} stale proposal pairings (older than 24 hours)",
+                "🧹 Marked {} stale proposals as expired (older than 24 hours)",
                 count
             );
             self.flush_db()?;
@@ -2211,20 +2285,22 @@ impl Snicker {
 
     /// Get the number of outstanding proposals (for maintaining N proposals)
     ///
-    /// Counts total proposal pairings, not just distinct source UTXOs.
+    /// Counts pending proposer proposals in decrypted_proposals.
     /// This prevents creating unlimited proposals from a single UTXO.
     pub fn count_outstanding_proposals(&self) -> usize {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT COUNT(*) FROM proposal_pairings",
+            "SELECT COUNT(*) FROM decrypted_proposals WHERE role = 'proposer' AND status = 'pending'",
             [],
             |row| row.get::<_, i64>(0),
         ).map(|c| c as usize).unwrap_or(0)
     }
 
     // ============================================================
-    // COINJOIN SPENDING TRACKING
+    // COINJOIN SPENDING TRACKING (via transaction_history)
     // ============================================================
+    // Note: coinjoin_spending table has been eliminated - we now use
+    // transaction_history.tx_type and transaction_history.coinjoin_delta
 
     /// Approximate blocks per day (144 = 24 hours * 6 blocks/hour)
     pub const BLOCKS_PER_DAY: u32 = 144;
@@ -2234,6 +2310,8 @@ impl Snicker {
     /// Record a completed coinjoin and its delta (sats spent/received)
     /// delta_sats > 0 means we paid sats, < 0 means we received sats
     /// block_height is the current chain tip height when the coinjoin was completed
+    ///
+    /// This now updates/inserts to transaction_history instead of coinjoin_spending
     pub fn record_coinjoin_spending(
         &self,
         delta_sats: i64,
@@ -2242,21 +2320,13 @@ impl Snicker {
         block_height: u32,
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-
-        conn.execute(
-            "INSERT INTO coinjoin_spending (block_height, delta_sats, role, txid)
-             VALUES (?1, ?2, ?3, ?4)",
-            (block_height, delta_sats, role, txid),
-        )?;
-
-        tracing::info!(
-            "Recorded coinjoin spending: {} sats at block {} (role: {}, txid: {})",
-            delta_sats, block_height, role, txid
-        );
-        Ok(())
+        Self::record_coinjoin_spending_static(&conn, delta_sats, role, txid, block_height)
     }
 
     /// Record coinjoin spending (static version for use with raw connection)
+    /// Creates or updates transaction_history with coinjoin info.
+    /// If record exists: updates tx_type and coinjoin_delta
+    /// If not: creates partial record (will be completed when tx confirms)
     pub fn record_coinjoin_spending_static(
         conn: &Connection,
         delta_sats: i64,
@@ -2264,17 +2334,105 @@ impl Snicker {
         txid: &str,
         block_height: u32,
     ) -> Result<()> {
+        let tx_type = format!("coinjoin_{}", role);
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        // Try to update existing record first
+        // IMPORTANT: Also update balance_change_sats because BDK may have calculated it wrong
+        // (BDK doesn't know about SNICKER UTXO inputs, so it might think we just received funds)
+        // balance_change = -delta_sats (positive delta = we paid, so balance goes down)
+        let balance_change = -delta_sats;
+        let rows_updated = conn.execute(
+            "UPDATE transaction_history
+             SET tx_type = ?1, coinjoin_delta = ?2, balance_change_sats = ?4
+             WHERE txid = ?3 AND (tx_type = 'send' OR tx_type = 'receive' OR coinjoin_delta IS NULL)",
+            (&tx_type, delta_sats, txid, balance_change),
+        )?;
+
+        if rows_updated > 0 {
+            tracing::info!(
+                "Updated transaction {} as {} (delta: {} sats, balance_change: {} sats)",
+                txid, tx_type, delta_sats, balance_change
+            );
+            return Ok(());
+        }
+
+        // Check if already recorded as coinjoin (don't override)
+        let existing: Option<String> = conn.query_row(
+            "SELECT tx_type FROM transaction_history WHERE txid = ?",
+            [txid],
+            |row| row.get(0),
+        ).optional()?;
+
+        if let Some(existing_type) = existing {
+            if existing_type.starts_with("coinjoin_") {
+                tracing::debug!(
+                    "Coinjoin already recorded for txid {} as {} (skipped)",
+                    txid, existing_type
+                );
+                return Ok(());
+            }
+        }
+
+        // No record exists - create partial record for pending coinjoin
+        // balance_change = -delta_sats (delta > 0 means we paid, so balance goes down)
+        let balance_change = -delta_sats;
         conn.execute(
-            "INSERT INTO coinjoin_spending (block_height, delta_sats, role, txid)
-             VALUES (?1, ?2, ?3, ?4)",
-            (block_height, delta_sats, role, txid),
+            "INSERT OR IGNORE INTO transaction_history
+             (txid, tx_hex, balance_change_sats, tx_type, block_height, timestamp, created_at, coinjoin_delta)
+             VALUES (?1, '', ?2, ?3, ?4, ?5, ?5, ?6)",
+            (txid, balance_change, &tx_type, block_height, timestamp, delta_sats),
         )?;
 
         tracing::info!(
-            "Recorded coinjoin spending: {} sats at block {} (role: {}, txid: {})",
+            "Recorded pending coinjoin: {} sats at block {} (role: {}, txid: {})",
             delta_sats, block_height, role, txid
         );
         Ok(())
+    }
+
+    /// Get the role for a coinjoin transaction (if it's a coinjoin)
+    /// Returns Some("proposer") or Some("receiver") if found, None otherwise
+    pub fn get_coinjoin_role_static(conn: &Connection, txid: &str) -> Result<Option<String>> {
+        let tx_type: Option<String> = conn.query_row(
+            "SELECT tx_type FROM transaction_history WHERE txid = ?",
+            [txid],
+            |row| row.get(0),
+        ).optional()?;
+
+        // Extract role from tx_type (e.g., "coinjoin_proposer" -> "proposer")
+        Ok(tx_type.and_then(|t| {
+            if t.starts_with("coinjoin_") {
+                Some(t.strip_prefix("coinjoin_").unwrap().to_string())
+            } else {
+                None
+            }
+        }))
+    }
+
+    /// Get both role and delta for a coinjoin transaction (if it's a coinjoin)
+    /// Returns Some((role, delta_sats)) if found, None otherwise
+    /// The delta represents the balance change: negative = we paid, positive = we received
+    pub fn get_coinjoin_info_static(conn: &Connection, txid: &str) -> Result<Option<(String, i64)>> {
+        let result: Option<(String, Option<i64>)> = conn.query_row(
+            "SELECT tx_type, coinjoin_delta FROM transaction_history WHERE txid = ?",
+            [txid],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?;
+
+        // Extract role and delta if this is a coinjoin
+        Ok(result.and_then(|(tx_type, delta_opt)| {
+            if tx_type.starts_with("coinjoin_") {
+                let role = tx_type.strip_prefix("coinjoin_").unwrap().to_string();
+                let delta = delta_opt.unwrap_or(0);
+                Some((role, delta))
+            } else {
+                None
+            }
+        }))
     }
 
     /// Get total sats spent on coinjoins in the last N blocks
@@ -2284,9 +2442,9 @@ impl Snicker {
         let cutoff_height = current_height.saturating_sub(blocks_ago);
 
         let spent: i64 = conn.query_row(
-            "SELECT COALESCE(SUM(CASE WHEN delta_sats > 0 THEN delta_sats ELSE 0 END), 0)
-             FROM coinjoin_spending
-             WHERE block_height >= ?1",
+            "SELECT COALESCE(SUM(CASE WHEN coinjoin_delta > 0 THEN coinjoin_delta ELSE 0 END), 0)
+             FROM transaction_history
+             WHERE tx_type LIKE 'coinjoin_%' AND block_height >= ?1",
             [cutoff_height],
             |row| row.get(0),
         )?;
@@ -2309,14 +2467,19 @@ impl Snicker {
     pub fn get_coinjoin_history(&self) -> Result<Vec<(u32, i64, String, String)>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT block_height, delta_sats, role, txid FROM coinjoin_spending ORDER BY block_height"
+            "SELECT block_height, coinjoin_delta, tx_type, txid
+             FROM transaction_history
+             WHERE tx_type LIKE 'coinjoin_%' AND coinjoin_delta IS NOT NULL
+             ORDER BY block_height"
         )?;
 
         let rows = stmt.query_map([], |row| {
+            let tx_type: String = row.get(2)?;
+            let role = tx_type.strip_prefix("coinjoin_").unwrap_or("unknown").to_string();
             Ok((
                 row.get::<_, u32>(0)?,
                 row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
+                role,
                 row.get::<_, String>(3)?,
             ))
         })?;
@@ -2372,6 +2535,234 @@ impl Snicker {
         }
 
         Ok(true)
+    }
+
+    // ============================================================
+    // TRANSACTION HISTORY
+    // ============================================================
+
+    /// Record a confirmed transaction in the history
+    /// Uses INSERT OR IGNORE to avoid duplicates
+    pub fn record_transaction(
+        &self,
+        txid: &str,
+        tx_hex: &str,
+        balance_change_sats: i64,
+        tx_type: &str,
+        block_height: u32,
+        timestamp: u64,
+    ) -> Result<bool> {
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64;
+
+        let conn = self.conn.lock().unwrap();
+        let rows_affected = conn.execute(
+            "INSERT OR IGNORE INTO transaction_history
+             (txid, tx_hex, balance_change_sats, tx_type, block_height, timestamp, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            (
+                txid,
+                tx_hex,
+                balance_change_sats,
+                tx_type,
+                block_height,
+                timestamp as i64,
+                created_at,
+            ),
+        )?;
+
+        if rows_affected > 0 {
+            tracing::info!(
+                "📝 Recorded transaction {} (type: {}, change: {} sats, height: {})",
+                &txid[..8.min(txid.len())],
+                tx_type,
+                balance_change_sats,
+                block_height
+            );
+        }
+
+        Ok(rows_affected > 0)
+    }
+
+    /// Record a transaction (static version for use with raw connection)
+    /// If a partial record exists (from pending coinjoin), updates it with full info
+    pub fn record_transaction_static(
+        conn: &Connection,
+        txid: &str,
+        tx_hex: &str,
+        balance_change_sats: i64,
+        tx_type: &str,
+        block_height: u32,
+        timestamp: u64,
+    ) -> Result<bool> {
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64;
+
+        // Check if a partial record exists (from pending coinjoin - has empty tx_hex)
+        let partial_exists: bool = conn.query_row(
+            "SELECT 1 FROM transaction_history WHERE txid = ? AND tx_hex = '' LIMIT 1",
+            [txid],
+            |_| Ok(true),
+        ).unwrap_or(false);
+
+        if partial_exists {
+            // Update partial record with full info, preserving coinjoin tx_type and delta
+            let rows_affected = conn.execute(
+                "UPDATE transaction_history
+                 SET tx_hex = ?1, block_height = ?2, timestamp = ?3
+                 WHERE txid = ?4",
+                (tx_hex, block_height, timestamp as i64, txid),
+            )?;
+
+            if rows_affected > 0 {
+                // Get the preserved tx_type for logging
+                let final_type: String = conn.query_row(
+                    "SELECT tx_type FROM transaction_history WHERE txid = ?",
+                    [txid],
+                    |row| row.get(0),
+                ).unwrap_or_else(|_| tx_type.to_string());
+
+                tracing::info!(
+                    "📝 Updated pending coinjoin {} (type: {}, height: {})",
+                    &txid[..8.min(txid.len())],
+                    final_type,
+                    block_height
+                );
+            }
+            return Ok(rows_affected > 0);
+        }
+
+        // No partial record - insert new
+        let rows_affected = conn.execute(
+            "INSERT OR IGNORE INTO transaction_history
+             (txid, tx_hex, balance_change_sats, tx_type, block_height, timestamp, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            (
+                txid,
+                tx_hex,
+                balance_change_sats,
+                tx_type,
+                block_height,
+                timestamp as i64,
+                created_at,
+            ),
+        )?;
+
+        if rows_affected > 0 {
+            tracing::info!(
+                "📝 Recorded transaction {} (type: {}, change: {} sats, height: {})",
+                &txid[..8.min(txid.len())],
+                tx_type,
+                balance_change_sats,
+                block_height
+            );
+        }
+
+        Ok(rows_affected > 0)
+    }
+
+    /// Check if a transaction is already recorded
+    pub fn is_transaction_recorded(&self, txid: &str) -> bool {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT 1 FROM transaction_history WHERE txid = ? LIMIT 1",
+            [txid],
+            |_| Ok(true),
+        ).unwrap_or(false)
+    }
+
+    /// Check if a transaction is fully recorded (static version)
+    /// Returns false for partial records (pending coinjoins with empty tx_hex)
+    pub fn is_transaction_recorded_static(conn: &Connection, txid: &str) -> bool {
+        conn.query_row(
+            "SELECT 1 FROM transaction_history WHERE txid = ? AND tx_hex != '' LIMIT 1",
+            [txid],
+            |_| Ok(true),
+        ).unwrap_or(false)
+    }
+
+    /// Update the transaction type for an existing transaction (static version)
+    /// Used when we discover a transaction was a coinjoin after initial recording
+    pub fn update_transaction_type_static(conn: &Connection, txid: &str, tx_type: &str) -> Result<()> {
+        // Check if already recorded as a coinjoin role - never overwrite coinjoin roles
+        // (e.g., never change receiver to proposer or vice versa)
+        let existing_type: Option<String> = conn.query_row(
+            "SELECT tx_type FROM transaction_history WHERE txid = ?",
+            [txid],
+            |row| row.get(0),
+        ).optional()?;
+
+        if let Some(existing) = &existing_type {
+            if existing.starts_with("coinjoin_") {
+                tracing::debug!(
+                    "Skipping tx_type update for {}: already recorded as {} (wanted {})",
+                    txid, existing, tx_type
+                );
+                return Ok(());
+            }
+        }
+
+        conn.execute(
+            "UPDATE transaction_history SET tx_type = ? WHERE txid = ?",
+            (tx_type, txid),
+        )?;
+        Ok(())
+    }
+
+    /// Get transaction history ordered by block height (newest first)
+    pub fn get_transaction_history(&self) -> Result<Vec<TransactionHistoryEntry>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT txid, tx_hex, balance_change_sats, tx_type, block_height, timestamp
+             FROM transaction_history
+             ORDER BY block_height DESC, id DESC"
+        )?;
+
+        let rows = stmt.query_map([], |row| {
+            Ok(TransactionHistoryEntry {
+                txid: row.get(0)?,
+                tx_hex: row.get(1)?,
+                balance_change_sats: row.get(2)?,
+                tx_type: row.get(3)?,
+                block_height: row.get(4)?,
+                timestamp: row.get::<_, i64>(5)? as u64,
+            })
+        })?;
+
+        let mut entries = Vec::new();
+        for row in rows {
+            entries.push(row?);
+        }
+
+        Ok(entries)
+    }
+
+    /// Get a single transaction by txid
+    pub fn get_transaction_by_txid(&self, txid: &str) -> Result<Option<TransactionHistoryEntry>> {
+        let conn = self.conn.lock().unwrap();
+        let result = conn.query_row(
+            "SELECT txid, tx_hex, balance_change_sats, tx_type, block_height, timestamp
+             FROM transaction_history WHERE txid = ?",
+            [txid],
+            |row| {
+                Ok(TransactionHistoryEntry {
+                    txid: row.get(0)?,
+                    tx_hex: row.get(1)?,
+                    balance_change_sats: row.get(2)?,
+                    tx_type: row.get(3)?,
+                    block_height: row.get(4)?,
+                    timestamp: row.get::<_, i64>(5)? as u64,
+                })
+            },
+        );
+
+        match result {
+            Ok(entry) => Ok(Some(entry)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     // ============================================================

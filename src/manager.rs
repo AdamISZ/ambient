@@ -561,6 +561,7 @@ impl Manager {
             &our_utxo_str,
             &target_utxo_str,
             delta_sats,
+            Some(opportunity.our_value.to_sat()),  // Store our UTXO amount for cost calculation
         ).await?;
 
         // Record the pairing for tracking "at risk" UTXOs
@@ -639,6 +640,7 @@ impl Manager {
                     &our_utxo_str,
                     &proposer_utxo_str,
                     delta,
+                    Some(utxo.amount()),  // Store our UTXO amount
                 ).await?;
 
                 tracing::info!("💾 Stored decrypted proposal with delta {} sats", delta);
@@ -1081,6 +1083,25 @@ impl Manager {
         // Broadcast the transaction
         let txid = self.broadcast_transaction(tx.clone()).await?;
 
+        // Record coinjoin spending immediately (before block scan can detect it)
+        // This ensures receiver role is recorded correctly even if they also have
+        // pending proposer entries in decrypted_proposals from Advanced mode
+        let delta_sats = self.snicker.calculate_delta_from_proposal(&proposal).unwrap_or(0);
+        let current_height = self.get_tip_height().await.unwrap_or(0);
+        if let Err(e) = self.snicker.record_coinjoin_spending(
+            delta_sats,
+            "receiver",
+            &txid.to_string(),
+            current_height,
+        ) {
+            tracing::warn!("Failed to record receiver coinjoin spending: {}", e);
+        } else {
+            tracing::info!(
+                "📝 Recorded coinjoin spending: {} sats (receiver) for tx {}",
+                delta_sats, txid
+            );
+        }
+
         // Store pending transaction for tracking (confirmed vs pending balance)
         // Gather input amounts from proposer UTXO and our UTXOs
         // is_ours=false for proposer's UTXO (for conflict detection only, not balance tracking)
@@ -1229,6 +1250,11 @@ impl Manager {
     /// List all unspent SNICKER UTXOs
     pub async fn list_snicker_utxos(&self) -> Result<Vec<crate::snicker::SnickerUtxo>> {
         self.snicker.list_snicker_utxos().await
+    }
+
+    /// Get transaction history
+    pub fn get_transaction_history(&self) -> Result<Vec<crate::snicker::TransactionHistoryEntry>> {
+        self.snicker.get_transaction_history()
     }
 
     /// Store a SNICKER UTXO after accepting a proposal and broadcasting
@@ -1559,20 +1585,11 @@ impl Manager {
             }
 
             // Accept and broadcast the proposal
+            // Note: coinjoin_spending is recorded inside accept_and_broadcast_snicker_proposal
             match self.accept_and_broadcast_snicker_proposal(&proposal.tag, delta_range).await {
                 Ok(txid) => {
                     accepted_count += 1;
                     tracing::info!("✅ Auto-accepted proposal {} → txid: {}", hex::encode(proposal.tag), txid);
-
-                    // Record spending for this coinjoin
-                    if let Err(e) = self.snicker.record_coinjoin_spending(
-                        delta_sats,
-                        "receiver",
-                        &txid.to_string(),
-                        current_height,
-                    ) {
-                        tracing::warn!("Failed to record spending: {}", e);
-                    }
 
                     // Mark proposal as broadcast to avoid re-processing
                     self.snicker.update_proposal_status(&proposal.tag, "broadcast").await?;

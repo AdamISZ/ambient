@@ -538,10 +538,11 @@ impl AmbientApp {
                         // Close the modal
                         self.active_modal = None;
 
-                        // Fetch initial balance and auto-start automation (if enabled)
+                        // Fetch initial balance, transactions, and auto-start automation
                         // Automation is enabled by default, so this will start it
                         return Task::batch([
                             Task::done(Message::SyncRequested),
+                            Task::done(Message::TransactionsRequested),
                             Task::done(Message::AutomationStart),
                         ]);
                     }
@@ -962,6 +963,35 @@ impl AmbientApp {
                 Task::none()
             }
 
+            Message::TransactionsRequested => {
+                // Fetch transaction history from database
+                if let AppState::WalletLoaded { manager, .. } = &self.state {
+                    let manager_clone = manager.clone();
+                    return Task::perform(
+                        async move {
+                            manager_clone.get_transaction_history()
+                                .map_err(|e| e.to_string())
+                        },
+                        Message::TransactionsLoaded,
+                    );
+                }
+                Task::none()
+            }
+
+            Message::TransactionsLoaded(result) => {
+                if let AppState::WalletLoaded { wallet_data, .. } = &mut self.state {
+                    match result {
+                        Ok(transactions) => {
+                            wallet_data.transactions_list = transactions;
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to load transaction history: {}", e);
+                        }
+                    }
+                }
+                Task::none()
+            }
+
             Message::BlockchainUpdate(update) => {
                 // Event-driven update from Kyoto (new block, transaction, etc.)
                 if let AppState::WalletLoaded { manager, wallet_data } = &mut self.state {
@@ -973,32 +1003,36 @@ impl AmbientApp {
                     tracing::info!("📊 Blockchain update: height={}, balance={} sats",
                                   update.height, update.balance_sats);
 
-                    // Fetch updated UTXOs list
+                    // Fetch updated UTXOs list and refresh transactions
                     let manager_clone = manager.clone();
                     let rt_handle = self.tokio_runtime.handle().clone();
 
-                    return Task::perform(
-                        async move {
-                            rt_handle.spawn(async move {
-                                manager_clone.list_unspent_with_status().await
-                            }).await.unwrap()
-                        },
-                        |utxos_result| {
-                            let utxos = match utxos_result {
-                                Ok(list) => list,
-                                Err(e) => {
-                                    tracing::error!("Failed to fetch UTXOs: {}", e);
-                                    Vec::new()
+                    return Task::batch([
+                        Task::perform(
+                            async move {
+                                rt_handle.spawn(async move {
+                                    manager_clone.list_unspent_with_status().await
+                                }).await.unwrap()
+                            },
+                            |utxos_result| {
+                                let utxos = match utxos_result {
+                                    Ok(list) => list,
+                                    Err(e) => {
+                                        tracing::error!("Failed to fetch UTXOs: {}", e);
+                                        Vec::new()
+                                    }
+                                };
+                                Message::WalletDataUpdated {
+                                    balance: None, // Balance already updated
+                                    pending_outgoing: 0, // Will be fetched on next full sync
+                                    pending_incoming: 0,
+                                    utxos,
                                 }
-                            };
-                            Message::WalletDataUpdated {
-                                balance: None, // Balance already updated
-                                pending_outgoing: 0, // Will be fetched on next full sync
-                                pending_incoming: 0,
-                                utxos,
                             }
-                        }
-                    );
+                        ),
+                        // Also refresh transaction history
+                        Task::done(Message::TransactionsRequested),
+                    ]);
                 }
                 Task::none()
             }

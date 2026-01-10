@@ -34,7 +34,7 @@ pub fn view(manager: &Arc<Manager>, data: &WalletData) -> Element<'static, Messa
         WalletTab::Overview => view_overview(&wallet_name_owned, data),
         WalletTab::Send => view_send(data),
         WalletTab::Receive => view_receive(data),
-        WalletTab::Transactions => view_transactions(),
+        WalletTab::Transactions => view_transactions(data),
         WalletTab::Snicker => view_snicker(data),
     };
 
@@ -458,14 +458,87 @@ fn view_receive(data: &WalletData) -> Element<'static, Message> {
 }
 
 /// Transactions tab - transaction history
-fn view_transactions() -> Element<'static, Message> {
-    column![
-        text("Transaction list coming soon...").size(16),
+fn view_transactions(data: &WalletData) -> Element<'static, Message> {
+    let header = row![
+        text("Transactions").size(20),
+        iced::widget::horizontal_space(),
         button("Refresh")
             .on_press(Message::TransactionsRequested)
             .padding(10),
     ]
-    .spacing(20)
+    .spacing(10)
+    .align_y(iced::Alignment::Center);
+
+    if data.transactions_list.is_empty() {
+        return column![
+            header,
+            container(
+                text("No transactions recorded yet. Transactions will appear here as they are confirmed.")
+                    .size(14)
+            )
+            .padding(20)
+        ]
+        .spacing(20)
+        .into();
+    }
+
+    // Build transaction list using the column! pattern (like opp_list)
+    let mut tx_column = column![].spacing(5);
+
+    for tx in &data.transactions_list {
+        // Format txid: first 8...last 8
+        let txid_short = if tx.txid.len() > 16 {
+            format!("{}...{}", &tx.txid[..8], &tx.txid[tx.txid.len()-8..])
+        } else {
+            tx.txid.clone()
+        };
+
+        // Format balance change with sign and color
+        let balance_str = if tx.balance_change_sats >= 0 {
+            format!("+{} sats", tx.balance_change_sats)
+        } else {
+            format!("{} sats", tx.balance_change_sats)
+        };
+
+        let balance_color = if tx.balance_change_sats >= 0 {
+            Color::from_rgb(0.0, 0.6, 0.0) // Green for positive
+        } else {
+            Color::from_rgb(0.8, 0.0, 0.0) // Red for negative
+        };
+
+        // Format tx_type
+        let type_text: String = match tx.tx_type.as_str() {
+            "receive" => "Receive".to_string(),
+            "send" => "Send".to_string(),
+            "coinjoin_proposer" => "CoinJoin (Proposer)".to_string(),
+            "coinjoin_receiver" => "CoinJoin (Receiver)".to_string(),
+            other => other.to_string(),
+        };
+
+        let txid_for_copy = tx.txid.clone();
+
+        tx_column = tx_column.push(
+            row![
+                text(txid_short).size(12),
+                text(balance_str).size(12).color(balance_color),
+                text(type_text).size(12),
+                text(format!("Block {}", tx.block_height)).size(12),
+                button("Copy")
+                    .on_press(Message::CopyToClipboard(txid_for_copy))
+                    .padding(5),
+            ]
+            .spacing(15)
+        );
+    }
+
+    column![
+        header,
+        text(format!("{} transaction(s)", data.transactions_list.len())).size(14),
+        scrollable(tx_column)
+            .direction(Direction::Vertical(Scrollbar::default()))
+            .height(Length::Fixed(400.0)),
+    ]
+    .spacing(15)
     .into()
 }
 

@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
+use tracing::Instrument;
 
 /// Automation task configuration
 #[derive(Debug, Clone)]
@@ -66,6 +67,10 @@ impl AutomationTask {
         // Reset cancel flag
         let cancel_flag = self.cancel_flag.clone();
         *cancel_flag.write().await = false;
+
+        // Get wallet name for logging context
+        let wallet_name = manager.wallet_node.name().to_string();
+        let wallet_span = tracing::info_span!("wallet", name = %wallet_name);
 
         let handle = tokio::spawn(async move {
             use futures::StreamExt;
@@ -311,7 +316,7 @@ impl AutomationTask {
             }
 
             tracing::info!("🤖 SNICKER automation task stopped");
-        });
+        }.instrument(wallet_span));
 
         self.task_handle = Some(handle);
     }
