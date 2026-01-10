@@ -821,8 +821,14 @@ CREATE TABLE decrypted_proposals (
     tag BLOB PRIMARY KEY,
     psbt BLOB NOT NULL,
     tweak_info BLOB NOT NULL,
+    role TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    our_utxo TEXT NOT NULL,
+    counterparty_utxo TEXT NOT NULL,
     delta_sats INTEGER NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending'
+    our_utxo_amount INTEGER,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
 );
 ```
 
@@ -870,6 +876,25 @@ CREATE TABLE coinjoin_spending (
     delta_sats INTEGER NOT NULL
 );
 ```
+
+**transaction_history** (wallet transaction audit log):
+```sql
+CREATE TABLE transaction_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    txid TEXT UNIQUE NOT NULL,
+    tx_hex TEXT NOT NULL,
+    balance_change_sats INTEGER NOT NULL,
+    tx_type TEXT NOT NULL,
+    block_height INTEGER NOT NULL,
+    timestamp INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    coinjoin_delta INTEGER
+);
+```
+
+- `tx_type`: "receive", "send", "coinjoin_proposer", "coinjoin_receiver"
+- `coinjoin_delta`: For coinjoins, the delta amount (what receiver pays)
+- `our_utxo_amount` (in decrypted_proposals): Stores input UTXO amount at proposal time for accurate cost calculation
 
 ### Key Functions
 

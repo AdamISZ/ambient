@@ -147,6 +147,7 @@ CREATE TABLE decrypted_proposals (
     our_utxo TEXT NOT NULL,
     counterparty_utxo TEXT NOT NULL,
     delta_sats INTEGER NOT NULL,
+    our_utxo_amount INTEGER,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );
@@ -165,6 +166,7 @@ CREATE INDEX idx_utxo_pair ON decrypted_proposals(our_utxo, counterparty_utxo, r
 - `our_utxo` - Our UTXO in format "txid:vout"
 - `counterparty_utxo` - Counterparty UTXO in format "txid:vout"
 - `delta_sats` - Net change in satoshis (positive = gain, negative = loss)
+- `our_utxo_amount` - Amount of our input UTXO in satoshis (for accurate cost calculation)
 - `created_at` - Unix timestamp when proposal was created/received
 - `updated_at` - Unix timestamp of last status change
 
@@ -262,6 +264,57 @@ CREATE INDEX idx_automation_log_action ON automation_log(action_type, timestamp)
 **Indexes:**
 - `idx_automation_log_timestamp` - Chronological queries
 - `idx_automation_log_action` - Filter by action type
+
+---
+
+#### Table: `transaction_history`
+
+**Purpose:** Records all confirmed transactions affecting the wallet balance, providing a complete audit log for user accounting.
+
+**Schema:**
+```sql
+CREATE TABLE transaction_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    txid TEXT UNIQUE NOT NULL,
+    tx_hex TEXT NOT NULL,
+    balance_change_sats INTEGER NOT NULL,
+    tx_type TEXT NOT NULL,
+    block_height INTEGER NOT NULL,
+    timestamp INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    coinjoin_delta INTEGER
+);
+
+CREATE INDEX idx_tx_history_block_height ON transaction_history(block_height DESC);
+CREATE INDEX idx_tx_history_type ON transaction_history(tx_type);
+```
+
+**Columns:**
+- `id` - Auto-incrementing record ID
+- `txid` - Transaction ID (hex string)
+- `tx_hex` - Full serialized transaction (hex string, empty for pending coinjoins)
+- `balance_change_sats` - Net balance change in satoshis (positive = received, negative = sent)
+- `tx_type` - Transaction type: "receive", "send", "coinjoin_proposer", "coinjoin_receiver"
+- `block_height` - Block height where confirmed
+- `timestamp` - Unix timestamp when recorded
+- `created_at` - Unix timestamp when record was created
+- `coinjoin_delta` - For coinjoins: the delta amount (what receiver pays); NULL for regular txs
+
+**Transaction Types:**
+- `receive` - Regular receive (funds coming in)
+- `send` - Regular send (funds going out)
+- `coinjoin_proposer` - We created and sent a SNICKER proposal that was accepted
+- `coinjoin_receiver` - We accepted a SNICKER proposal from someone else
+
+**Recording Logic:**
+- Regular transactions are recorded during block scanning
+- Coinjoin transactions are initially recorded as pending (empty `tx_hex`) when broadcast
+- Pending records are updated with full transaction data when confirmed
+- Stale pending records are cleaned up when a conflicting transaction confirms
+
+**Indexes:**
+- `idx_tx_history_block_height` - Fast ordering by recency
+- `idx_tx_history_type` - Filter by transaction type
 
 ---
 
