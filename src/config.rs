@@ -355,16 +355,49 @@ impl Config {
             let contents = fs::read_to_string(&config_path)
                 .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
 
-            let config: Config = toml::from_str(&contents)
+            let mut config: Config = toml::from_str(&contents)
                 .with_context(|| format!("Failed to parse config file: {}", config_path.display()))?;
+
+            // Apply network-specific defaults for unset values
+            config.apply_network_defaults();
 
             tracing::info!("📝 Loaded config from: {}", config_path.display());
             Ok(config)
         } else {
             tracing::info!("📝 No config file found, creating default at: {}", config_path.display());
-            let config = Self::default();
+            let mut config = Self::default();
+            config.apply_network_defaults();
             config.save()?;
             Ok(config)
+        }
+    }
+
+    /// Apply network-specific default values
+    ///
+    /// For signet, use the dedicated Ambient relay with PoW requirement.
+    /// This is called after loading to adjust defaults based on network.
+    fn apply_network_defaults(&mut self) {
+        match self.network {
+            Network::Signet => {
+                // Use dedicated Ambient relay for signet if no relays configured
+                if self.proposal_network.nostr_relays.is_empty()
+                   || self.proposal_network.nostr_relays == default_nostr_relays() {
+                    self.proposal_network.nostr_relays = vec![
+                        "ws://34.135.189.101:7777".to_string(),
+                    ];
+                }
+                // Set PoW difficulty for signet relay (requires 16 bits)
+                if self.proposal_network.nostr_pow_difficulty.is_none()
+                   || self.proposal_network.nostr_pow_difficulty == default_nostr_pow_difficulty() {
+                    self.proposal_network.nostr_pow_difficulty = Some(16);
+                }
+            }
+            Network::Regtest => {
+                // Regtest typically uses file-based or local relay, no changes needed
+            }
+            Network::Mainnet => {
+                // Mainnet uses default public relays
+            }
         }
     }
 
