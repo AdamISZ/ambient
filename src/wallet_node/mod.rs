@@ -2188,14 +2188,17 @@ impl WalletNode {
     /// Uses the FeeEstimator to get real-time fee estimates from mempool.space.
     /// Falls back to 10 sat/vB if estimation fails.
     pub async fn get_fee_rate(&self) -> bdk_wallet::bitcoin::FeeRate {
+        // Minimum rate as u64 (ceil of MIN_FEE_RATE_SAT_VB)
+        let min_rate = (crate::MIN_FEE_RATE_SAT_VB as f64).ceil() as u64;
+
         // Estimate for 6 block confirmation (~1 hour)
         match self.fee_estimator.estimate(6).await {
             Ok(rate) => {
                 tracing::info!("📊 Using estimated fee rate: {:.2} sat/vB for ~6 blocks", rate);
-                // Convert f64 to u64, handling edge cases
-                let rate_sat_vb = if rate < 1.0 {
-                    tracing::warn!("Fee rate {:.2} sat/vB too low, using minimum 1 sat/vB", rate);
-                    1
+                // Convert f64 to u64, enforcing minimum
+                let rate_sat_vb = if rate < crate::MIN_FEE_RATE_SAT_VB as f64 {
+                    tracing::warn!("Fee rate {:.2} sat/vB too low, using minimum {} sat/vB", rate, min_rate);
+                    min_rate
                 } else {
                     rate.ceil() as u64  // Round up to ensure confirmation
                 };

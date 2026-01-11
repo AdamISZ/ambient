@@ -368,6 +368,29 @@ fn view_send(data: &WalletData) -> Element<'static, Message> {
     let send_amount = data.send_amount.clone();
     let send_fee_rate = data.send_fee_rate.clone();
 
+    // Warning when send_all_mode is active
+    let send_all_warning: Element<'static, Message> = if data.send_all_mode {
+        container(
+            text("Note: Send All will spend all UTXOs including SNICKER outputs. This may reduce privacy gained from coinjoins.")
+                .size(13)
+        )
+        .style(|_theme| container::Style {
+            background: Some(iced::Background::Color(iced::Color::from_rgb(1.0, 0.95, 0.8))),
+            border: iced::Border {
+                color: iced::Color::from_rgb(0.9, 0.7, 0.3),
+                width: 1.0,
+                radius: 4.0.into(),
+            },
+            ..Default::default()
+        })
+        .padding(10)
+        .width(Length::Fixed(600.0))
+        .into()
+    } else {
+        // Empty container when not in send_all_mode
+        container(text("")).into()
+    };
+
     column![
         column![
             text("Recipient Address").size(16),
@@ -388,9 +411,11 @@ fn view_send(data: &WalletData) -> Element<'static, Message> {
             ].spacing(10)
         ].spacing(5),
 
+        send_all_warning,
+
         column![
             text("Fee Rate (sat/vB)").size(16),
-            text_input("1.0", &send_fee_rate)
+            text_input("1.3", &send_fee_rate)
                 .on_input(Message::SendFeeRateChanged)
                 .width(Length::Fixed(200.0)),
         ].spacing(5),

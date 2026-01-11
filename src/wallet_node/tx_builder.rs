@@ -216,6 +216,9 @@ impl WalletNode {
         amount_sats: u64,
         fee_rate_sat_vb: f32,
     ) -> Result<Txid> {
+        // Enforce minimum fee rate to ensure transaction is accepted
+        let fee_rate_sat_vb = fee_rate_sat_vb.max(crate::MIN_FEE_RATE_SAT_VB);
+
         // Use hybrid approach: SNICKER UTXOs first, then regular UTXOs as needed
         info!("💰 Using hybrid UTXO selection (SNICKER + regular as needed)");
 

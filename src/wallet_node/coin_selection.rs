@@ -29,6 +29,7 @@ impl WalletNode {
     /// - Prefers using a SINGLE SNICKER UTXO to preserve coinjoin privacy
     /// - Co-spending multiple SNICKER UTXOs defeats the privacy purpose
     /// - Falls back to regular UTXOs if no single SNICKER UTXO is sufficient
+    /// - Exception: "Send All" case uses ALL UTXOs (caller should warn user)
     pub(crate) async fn select_utxos_hybrid(
         &self,
         amount_sats: u64,
@@ -55,8 +56,41 @@ impl WalletNode {
         let total_snicker_available: u64 = snicker_utxos.iter().map(|u| u.2).sum();
         info!("💰 SNICKER UTXOs available: {} sats in {} UTXOs", total_snicker_available, snicker_utxos.len());
 
+        // Get regular UTXOs from BDK (need this for total calculation)
+        let all_regular: Vec<_> = {
+            let wallet = self.wallet.lock().await;
+            wallet.list_unspent().collect()
+        };
+        let total_regular_available: u64 = all_regular.iter().map(|u| u.txout.value.to_sat()).sum();
+        let total_available = total_snicker_available + total_regular_available;
+
+        info!("💰 Regular UTXOs available: {} sats in {} UTXOs", total_regular_available, all_regular.len());
+
         // Rough estimate for fee calculation
         let estimated_fee_per_input = (150.0 * fee_rate_sat_vb) as u64;
+        let total_inputs_all = snicker_utxos.len() + all_regular.len();
+        let estimated_fee_all = estimated_fee_per_input * total_inputs_all as u64;
+
+        // SEND-ALL DETECTION: If requested amount is close to total available, use all UTXOs
+        // "Close" means within the estimated fee range (user wants to drain wallet)
+        let is_send_all = amount_sats + estimated_fee_all >= total_available;
+
+        if is_send_all && total_inputs_all > 0 {
+            info!("⚠️  SEND-ALL detected: using ALL {} UTXOs ({} SNICKER + {} regular)",
+                  total_inputs_all, snicker_utxos.len(), all_regular.len());
+
+            if !snicker_utxos.is_empty() && !all_regular.is_empty() {
+                info!("⚠️  WARNING: Mixing SNICKER and regular UTXOs reduces coinjoin privacy!");
+            }
+
+            return Ok(SelectedUtxos {
+                snicker_utxos,
+                regular_utxos: all_regular,
+                total_snicker: total_snicker_available,
+                total_regular: total_regular_available,
+            });
+        }
+
         let total_needed = amount_sats + estimated_fee_per_input;
 
         // IMPROVED SELECTION LOGIC: Prefer using only ONE SNICKER UTXO
@@ -64,7 +98,7 @@ impl WalletNode {
         // Strategy:
         // 1. Try to find ONE SNICKER UTXO that can cover the payment
         // 2. If no single SNICKER UTXO is enough, use regular UTXOs only
-        // 3. Only use multiple SNICKER UTXOs as a last resort (user must confirm separately)
+        // 3. Only use multiple SNICKER UTXOs as a last resort (send-all case above)
 
         let (selected_snicker, snicker_contribution) = if !snicker_utxos.is_empty() {
             // Sort SNICKER UTXOs by amount descending (prefer largest)
@@ -93,11 +127,6 @@ impl WalletNode {
             info!("💰 SNICKER UTXOs cover {} sats, need {} more from regular UTXOs",
                   snicker_contribution, shortage);
 
-            // Get regular UTXOs from BDK
-            let wallet = self.wallet.lock().await;
-            let all_regular: Vec<_> = wallet.list_unspent().collect();
-            drop(wallet);
-
             // Sort by value descending (prefer larger UTXOs)
             let mut sorted_regular = all_regular;
             sorted_regular.sort_by(|a, b| b.txout.value.cmp(&a.txout.value));
@@ -121,7 +150,7 @@ impl WalletNode {
 
             if snicker_contribution + regular_total < amount_sats {
                 return Err(anyhow!("Insufficient funds: have {} sats (SNICKER: {}, regular: {}), need {} + fees",
-                    snicker_contribution + regular_total, snicker_contribution, regular_total, amount_sats));
+                    snicker_contribution + regular_total, total_snicker_available, regular_total, amount_sats));
             }
 
             info!("✅ Selected {} regular UTXOs contributing {} sats",

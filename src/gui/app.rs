@@ -1146,7 +1146,7 @@ impl AmbientApp {
                     // If in send-all mode, recalculate the amount with new fee rate
                     if wallet_data.send_all_mode && !wallet_data.send_address.is_empty() {
                         let address = wallet_data.send_address.clone();
-                        let fee_rate_val = fee_rate.parse::<f32>().unwrap_or(1.0).max(0.1);
+                        let fee_rate_val = fee_rate.parse::<f32>().unwrap_or(crate::MIN_FEE_RATE_SAT_VB).max(crate::MIN_FEE_RATE_SAT_VB);
                         let manager_clone = manager.clone();
                         let rt_handle = self.tokio_runtime.handle().clone();
 
@@ -1195,8 +1195,8 @@ impl AmbientApp {
                     // Enable send-all mode - will recalculate on fee rate changes
                     wallet_data.send_all_mode = true;
 
-                    // Parse fee rate (default to 1.0 if empty or invalid)
-                    let fee_rate = fee_rate_str.parse::<f32>().unwrap_or(1.0).max(0.1);
+                    // Parse fee rate (enforce minimum)
+                    let fee_rate = fee_rate_str.parse::<f32>().unwrap_or(crate::MIN_FEE_RATE_SAT_VB).max(crate::MIN_FEE_RATE_SAT_VB);
 
                     let manager_clone = manager.clone();
                     let rt_handle = self.tokio_runtime.handle().clone();
@@ -1255,14 +1255,14 @@ impl AmbientApp {
                         }
                     };
 
-                    // Parse fee rate
+                    // Parse fee rate (enforce minimum)
                     let fee_rate = match fee_rate_str.parse::<f32>() {
                         Ok(rate) => {
                             if rate <= 0.0 {
                                 eprintln!("❌ Fee rate must be positive");
                                 return Task::none();
                             }
-                            rate
+                            rate.max(crate::MIN_FEE_RATE_SAT_VB)
                         }
                         Err(_) => {
                             eprintln!("❌ Invalid fee rate: {}", fee_rate_str);

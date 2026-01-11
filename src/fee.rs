@@ -253,7 +253,7 @@ impl FeeEstimator {
                 match target_blocks {
                     1 => 5.0,
                     2..=6 => 2.0,
-                    _ => 1.0,
+                    _ => crate::MIN_FEE_RATE_SAT_VB as f64,
                 }
             }
         }
