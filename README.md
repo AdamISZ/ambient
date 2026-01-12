@@ -3,17 +3,17 @@
 [![Build](https://github.com/AdamISZ/ambient/actions/workflows/ci.yml/badge.svg)](https://github.com/AdamISZ/ambient/actions/workflows/ci.yml)
 [![Tests](https://img.shields.io/github/actions/workflow/status/AdamISZ/ambient/ci.yml?label=tests)](https://github.com/AdamISZ/ambient/actions/workflows/ci.yml)
 
-A light-client Bitcoin wallet that automatically creates coinjoins in the background.
+A light-client Bitcoin wallet for Linux desktop that automatically creates coinjoins in the background.
 
 ---
 
-## Warning: Work in Progress
+## Warning: Work in Progress - currently still pre-release
 
-**This project is experimental and not ready for production use.**
+**This project is experimental and not ready for production use. Currently ready for testing on signet (set the network in the settings when you start the app)**
 
-Do not use with real funds. The protocol, implementation, and APIs are subject to change.
+Do not use with real funds. Though it's functional, it's not ready for that and there will be no coinjoins anyway!
 
-(Also note that the development process is making extensive use of LLM tech for rapid coding, which means it needs a lot more careful review; however a lot of testing infrastructure is being developed to avoid the potential for hallucinatory failure.)
+(Also note that the development process is making extensive use of LLM tech for rapid coding (almost all Claude), which means a lot of testing infrastructure and continuous review and manual tests are ongoing.)
 
 ---
 
@@ -25,15 +25,19 @@ Pre-built AppImage executables will be available from the [Releases](https://git
 
 ```bash
 # Download the AppImage (when available)
-wget https://github.com/AdamISZ/ambient/releases/download/vX.X.X/Ambient-x86_64.AppImage
+wget https://github.com/AdamISZ/ambient/releases/download/vX.X.X/ambient-x86_64.AppImage
+
+# Check hash
+wget https://github.com/AdamISZ/ambient/releases/download/vX.X.X/ambient-x86_64.AppImage.sha256
+sha256sum -c ambient-gui-x86_64.AppImage.sha256
 
 # Verify signature (recommended)
-wget https://github.com/AdamISZ/ambient/releases/download/vX.X.X/Ambient-x86_64.AppImage.sig
-gpg --verify Ambient-x86_64.AppImage.sig Ambient-x86_64.AppImage
+wget https://github.com/AdamISZ/ambient/releases/download/vX.X.X/ambient-x86_64.AppImage.asc
+gpg --verify ambient-x86_64.AppImage.asc ambient-x86_64.AppImage
 
 # Make executable and run
-chmod +x Ambient-x86_64.AppImage
-./Ambient-x86_64.AppImage
+chmod +x ambient-x86_64.AppImage
+./ambient-x86_64.AppImage
 ```
 
 **Build from Source:** See [docs/BUILDING.md](docs/BUILDING.md)
@@ -50,7 +54,7 @@ chmod +x Ambient-x86_64.AppImage
     PROPOSER (Alice)                              RECEIVER (Bob)
     ================                              ==============
 
-    1. Scans blockchain for
+    1. Scans blocks for
        potential partners
               │
               ▼
@@ -88,17 +92,17 @@ chmod +x Ambient-x86_64.AppImage
 
 Your wallet randomly alternates between these roles, making transaction analysis harder.
 
-This is a light client wallet, using compact filters, so you can start it immediately without a full node. But it doesn't have the same security properties, as a full node, either.
+This is a light client wallet, using compact filters, so you can start it immediately without a full node (note the first run will take a while to sync up the most recent 1000 blocks). But it doesn't have the same security properties, as a full node, either.
 
 Pay attention to the main tradeoff you have to accept for being able to passively coinjoin without any effort or attention: **you must keep the wallet folder, not only the seedphrase**. If you lose the wallet folder (which contains an encrypted dataset), you *can* still recover your funds with just the seedphrase, but it will require using a full node and could be a slow process. So don't!
 
-There are other small quirks: it's taproot only (which isn't a negative), but it's also the case that since your wallet is proposing coinjoins in the background occasionally, you might get a payment conflicted with a coinjoin that happens to occur at the same time; you'll never lose money this way, but a time sensitive payment could be delayed. This will be exceptionally rare and the interface warns you to use a higher fee if it's actually important, but, something to know.
+There are other small quirks: it's taproot only, but it's also the case that since your wallet is proposing coinjoins in the background occasionally, you might get a payment conflicted with a coinjoin that happens to occur at the same time; you'll never lose money this way, but a time sensitive payment could be delayed. This will be exceptionally rare and the interface warns you to use a higher fee if it's actually important, but, something to know.
 
 Finally, there are fees to pay for the coinjoins, albeit small ones. Your wallet can both receive and pay for the coinjoin itself, but the net effect over time will be very slightly negative; check the Settings for the restriction on how many sats you're willing to lose per day, week and per individual transaction.
 
 ### So what do I get out of these coinjoins?
 
-Not *that* much: any individual coinjoin does very little to make your coins' history more private. SNICKER coinjoins are *not* steganographic (i.e. it's obvious that they are coinjoins), but since they have equal-outputs, they unambiguously *do* increase your "anonymity set" (the crowd you're mixing with). This wallet always *both* proposes *and* receives, which helps a lot: no one can trace your coins through 10 such transactions *just* by assuming your behaviour follows one of those two patterns: your "role" is random. The intention is that **over a long time, with no actual effort from the user except having the wallet open some of the time, the privacy effect is quite significant**. That's about the best you can achieve here; it's not a tool to anonymize 10 BTC next week.
+Not *that* much: any individual coinjoin does very little to make your coins' history more private. SNICKER coinjoins are *not* steganographic (i.e. it's obvious that they are coinjoins), but since they have equal-outputs, they unambiguously *do* increase your "anonymity set" (the crowd you're mixing with). This wallet always *both* proposes *and* receives, randomly switching between the two, which helps a lot: no one can trace your coins through 10 such transactions *just* by assuming your behaviour follows one of those two patterns. The intention is that **over a long time, with no actual effort from the user except having the wallet open some of the time, the privacy effect is quite significant**. That's about the best you can achieve here; it's not a tool to anonymize 10 BTC next week.
 
 ---
 
@@ -108,9 +112,9 @@ Not *that* much: any individual coinjoin does very little to make your coins' hi
 
 ---
 
-## Uses
+## Underlying tech
 
-- [BDK (Bitcoin Dev Kit)](https://bitcoindevkit.org/)
+- [BDK (Bitcoin Dev Kit)](https://bitcoindevkit.org/) (for "vanilla" utxos/transactions)
 - [Kyoto](https://github.com/rustaceanrob/kyoto) (BIP157/158 light client)
 - [Iced](https://github.com/iced-rs/iced) (GUI framework)
 - [Nostr](https://github.com/rust-nostr/nostr) (proposal broadcast)
