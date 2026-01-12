@@ -2092,21 +2092,23 @@ impl AmbientApp {
 
                     text("").size(15), // spacer
 
-                    // Seed phrase display
-                    container(
-                        text(mnemonic).size(16)
-                    )
-                    .style(|_theme| iced::widget::container::Style {
-                        background: Some(iced::Background::Color(iced::Color::from_rgb(0.1, 0.1, 0.15))),
-                        border: iced::Border {
-                            color: iced::Color::from_rgb(0.3, 0.3, 0.4),
-                            width: 1.0,
-                            radius: 4.0.into(),
-                        },
-                        ..Default::default()
-                    })
-                    .padding(15)
-                    .width(Length::Fixed(500.0)),
+                    // Seed phrase display (read-only text_input for selectability)
+                    text_input("", &mnemonic)
+                        .size(16)
+                        .width(Length::Fixed(500.0))
+                        .style(|_theme, _status| iced::widget::text_input::Style {
+                            background: iced::Background::Color(iced::Color::from_rgb(0.1, 0.1, 0.15)),
+                            border: iced::Border {
+                                color: iced::Color::from_rgb(0.3, 0.3, 0.4),
+                                width: 1.0,
+                                radius: 4.0.into(),
+                            },
+                            icon: iced::Color::TRANSPARENT,
+                            placeholder: iced::Color::from_rgb(0.5, 0.5, 0.5),
+                            value: iced::Color::from_rgb(0.9, 0.9, 0.9),
+                            selection: iced::Color::from_rgb(0.3, 0.4, 0.6),
+                        })
+                        .padding(15),
 
                     text("").size(15), // spacer
 
