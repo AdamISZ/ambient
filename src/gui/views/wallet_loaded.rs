@@ -375,10 +375,10 @@ fn view_send(data: &WalletData) -> Element<'static, Message> {
                 .size(13)
         )
         .style(|_theme| container::Style {
-            background: Some(iced::Background::Color(iced::Color::from_rgb(1.0, 0.95, 0.8))),
+            background: None,
             border: iced::Border {
                 color: iced::Color::from_rgb(0.9, 0.7, 0.3),
-                width: 1.0,
+                width: 2.0,
                 radius: 4.0.into(),
             },
             ..Default::default()

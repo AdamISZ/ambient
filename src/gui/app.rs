@@ -205,6 +205,12 @@ impl AmbientApp {
 
             Message::CloseModal => {
                 self.active_modal = None;
+                // If we're in error state, go back to NoWallet
+                if matches!(self.state, AppState::Error { .. }) {
+                    self.state = AppState::NoWallet {
+                        available_wallets: Vec::new(),
+                    };
+                }
                 Task::none()
             }
 

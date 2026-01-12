@@ -186,6 +186,15 @@ impl WalletNode {
         password: &str,
     ) -> Result<(Self, Mnemonic)> {
         let (wallet_dir, wallet_db_enc_path, snicker_db_enc_path, mnemonic_path) = Self::wallet_paths(name, network_str)?;
+
+        // CRITICAL: Refuse to overwrite existing wallet - this could destroy funds!
+        if wallet_dir.exists() {
+            return Err(anyhow!(
+                "Wallet '{}' already exists at {}. Choose a different name or delete the existing wallet first.",
+                name, wallet_dir.display()
+            ));
+        }
+
         fs::create_dir_all(&wallet_dir)?;
 
         let gen: GeneratedKey<_, Tap> =

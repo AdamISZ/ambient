@@ -115,10 +115,14 @@ impl ProposalNetwork for NostrNetwork {
         let tag_hex = hex::encode(&proposal.tag);
 
         // Build event with tags for filtering
+        // IMPORTANT: Kind 38383 is a parameterized replaceable event (NIP-33).
+        // We MUST set a unique "d" tag per proposal, otherwise the relay will
+        // replace all proposals from the same pubkey with only the latest one.
         let event_builder = EventBuilder::new(
             Kind::Custom(SNICKER_PROPOSAL_KIND),
             content
         )
+        .tag(Tag::identifier(tag_hex.clone())) // "d" tag - unique per proposal
         .tag(Tag::custom(
             TagKind::Custom(std::borrow::Cow::Borrowed("snicker_tag")),
             vec![tag_hex.clone()]
