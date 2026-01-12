@@ -310,10 +310,6 @@ fn view_overview(wallet_name: &str, data: &WalletData) -> Element<'static, Messa
         )
         .padding(20),
 
-        button("Sync Wallet")
-            .on_press(Message::SyncRequested)
-            .padding(15),
-
         {
             if let Some(ref addr) = data.last_address {
                 let addr_copy = addr.clone();
