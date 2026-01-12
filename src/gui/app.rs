@@ -23,6 +23,10 @@ pub struct AmbientApp {
     showing_settings: bool,
     edited_config: Option<Config>,
     settings_advanced_expanded: bool,
+    // Seed phrase viewing state
+    show_seed_modal: bool,
+    show_seed_password: String,
+    show_seed_result: Option<Result<String, String>>,
 }
 
 impl AmbientApp {
@@ -49,6 +53,9 @@ impl AmbientApp {
                 showing_settings: false,
                 edited_config: None,
                 settings_advanced_expanded: false,
+                show_seed_modal: false,
+                show_seed_password: String::new(),
+                show_seed_result: None,
             },
             Task::none(),
         )
@@ -796,6 +803,77 @@ impl AmbientApp {
 
             Message::SettingsSaved(_result) => {
                 // TODO: Handle save result (show success/error message)
+                Task::none()
+            }
+
+            // === Seed phrase viewing ===
+            Message::ShowSeedRequested => {
+                // Only allow if wallet is loaded
+                if matches!(self.state, AppState::WalletLoaded { .. }) {
+                    self.show_seed_modal = true;
+                    self.show_seed_password = String::new();
+                    self.show_seed_result = None;
+                }
+                Task::none()
+            }
+
+            Message::ShowSeedPasswordChanged(password) => {
+                self.show_seed_password = password;
+                Task::none()
+            }
+
+            Message::ShowSeedPasswordSubmit => {
+                // Try to decrypt the mnemonic with the provided password
+                if let AppState::WalletLoaded { manager, .. } = &self.state {
+                    let wallet_name = manager.wallet_node.name().to_string();
+                    let network = self.config.network.as_str().to_string();
+                    let password = self.show_seed_password.clone();
+
+                    return Task::perform(
+                        async move {
+                            // Get wallet paths and decrypt mnemonic
+                            let project_dirs = directories::ProjectDirs::from("org", "code", "ambient")
+                                .ok_or_else(|| "Cannot determine project dir".to_string())?;
+                            let mnemonic_path = project_dirs
+                                .data_local_dir()
+                                .join(&network)
+                                .join(&wallet_name)
+                                .join("mnemonic.enc");
+
+                            if !mnemonic_path.exists() {
+                                return Err("Mnemonic file not found".to_string());
+                            }
+
+                            let encrypted = std::fs::read(&mnemonic_path)
+                                .map_err(|e| format!("Failed to read mnemonic file: {}", e))?;
+
+                            let decrypted = crate::encryption::WalletEncryption::decrypt_file(&encrypted, &password)
+                                .map_err(|e| format!("Wrong password or corrupted file: {}", e))?;
+
+                            let mnemonic = std::str::from_utf8(&decrypted)
+                                .map_err(|e| format!("Invalid mnemonic encoding: {}", e))?
+                                .trim()
+                                .to_string();
+
+                            Ok(mnemonic)
+                        },
+                        Message::ShowSeedResult
+                    );
+                }
+                Task::none()
+            }
+
+            Message::ShowSeedResult(result) => {
+                self.show_seed_result = Some(result);
+                // Clear password from memory after use
+                self.show_seed_password.clear();
+                Task::none()
+            }
+
+            Message::ShowSeedClose => {
+                self.show_seed_modal = false;
+                self.show_seed_password.clear();
+                self.show_seed_result = None;
                 Task::none()
             }
 
@@ -1834,11 +1912,20 @@ impl AmbientApp {
         if self.showing_settings {
             if let Some(ref edited_config) = self.edited_config {
                 let wallet_loaded = matches!(self.state, AppState::WalletLoaded { .. });
-                return crate::gui::views::settings::view(
+                let settings_view = crate::gui::views::settings::view(
                     edited_config,
                     wallet_loaded,
                     self.settings_advanced_expanded,
                 );
+                // Apply seed modal overlay if showing
+                return if self.show_seed_modal {
+                    crate::gui::widgets::modal_overlay(
+                        settings_view,
+                        self.render_seed_modal()
+                    )
+                } else {
+                    settings_view
+                };
             }
         }
 
@@ -1891,11 +1978,172 @@ impl AmbientApp {
         };
 
         // Overlay modal if active
-        if let Some(ref modal) = self.active_modal {
+        let view_with_modal = if let Some(ref modal) = self.active_modal {
             crate::gui::widgets::modal_overlay(main_view, modal.render())
         } else {
             main_view
+        };
+
+        // Overlay seed phrase modal if showing
+        if self.show_seed_modal {
+            crate::gui::widgets::modal_overlay(
+                view_with_modal,
+                self.render_seed_modal()
+            )
+        } else {
+            view_with_modal
         }
+    }
+
+    /// Render the seed phrase viewing modal
+    fn render_seed_modal(&self) -> Element<'_, Message> {
+        use widget::{column, container, text, text_input, button, row};
+        use iced::Length;
+
+        let content: Element<'_, Message> = match &self.show_seed_result {
+            None => {
+                // Password entry screen
+                column![
+                    text("View Recovery Seed").size(24),
+                    text("").size(10), // spacer
+
+                    // Warning box
+                    container(
+                        column![
+                            text("Security Warning").size(16),
+                            text("").size(5),
+                            text("Your seed phrase gives complete access to your wallet.").size(13),
+                            text("Never share it with anyone or enter it on websites.").size(13),
+                        ]
+                        .spacing(2)
+                    )
+                    .style(|_theme| iced::widget::container::Style {
+                        background: None,
+                        border: iced::Border {
+                            color: iced::Color::from_rgb(0.9, 0.5, 0.2),
+                            width: 2.0,
+                            radius: 4.0.into(),
+                        },
+                        ..Default::default()
+                    })
+                    .padding(15)
+                    .width(Length::Fixed(450.0)),
+
+                    text("").size(15), // spacer
+
+                    text("Enter your wallet password to view seed:").size(14),
+                    text_input("Password", &self.show_seed_password)
+                        .secure(true)
+                        .on_input(Message::ShowSeedPasswordChanged)
+                        .on_submit(Message::ShowSeedPasswordSubmit)
+                        .width(Length::Fixed(300.0)),
+
+                    text("").size(15), // spacer
+
+                    row![
+                        button("Show Seed")
+                            .on_press(Message::ShowSeedPasswordSubmit)
+                            .padding(10),
+                        button("Cancel")
+                            .on_press(Message::ShowSeedClose)
+                            .padding(10),
+                    ]
+                    .spacing(15),
+                ]
+                .spacing(8)
+                .into()
+            }
+
+            Some(Ok(mnemonic)) => {
+                // Seed display screen with prominent warning
+                let mnemonic = mnemonic.clone();
+                column![
+                    text("Your Recovery Seed").size(24),
+                    text("").size(10), // spacer
+
+                    // SNICKER warning box
+                    container(
+                        column![
+                            text("Important: SNICKER Recovery Note").size(16),
+                            text("").size(5),
+                            text("This seed phrase can recover your regular Bitcoin UTXOs.").size(13),
+                            text("").size(3),
+                            text("SNICKER coinjoin outputs use tweaked keys. Recovery from").size(13),
+                            text("seed alone is possible but requires scanning the blockchain").size(13),
+                            text("(potentially with a full node) - this feature is not yet").size(13),
+                            text("implemented.").size(13),
+                            text("").size(3),
+                            text("For easy recovery, keep a backup of your wallet files").size(13),
+                            text("(the encrypted database) along with your password.").size(13),
+                        ]
+                        .spacing(2)
+                    )
+                    .style(|_theme| iced::widget::container::Style {
+                        background: Some(iced::Background::Color(iced::Color::from_rgb(0.15, 0.1, 0.1))),
+                        border: iced::Border {
+                            color: iced::Color::from_rgb(0.8, 0.3, 0.3),
+                            width: 2.0,
+                            radius: 4.0.into(),
+                        },
+                        ..Default::default()
+                    })
+                    .padding(15)
+                    .width(Length::Fixed(500.0)),
+
+                    text("").size(15), // spacer
+
+                    // Seed phrase display
+                    container(
+                        text(mnemonic).size(16)
+                    )
+                    .style(|_theme| iced::widget::container::Style {
+                        background: Some(iced::Background::Color(iced::Color::from_rgb(0.1, 0.1, 0.15))),
+                        border: iced::Border {
+                            color: iced::Color::from_rgb(0.3, 0.3, 0.4),
+                            width: 1.0,
+                            radius: 4.0.into(),
+                        },
+                        ..Default::default()
+                    })
+                    .padding(15)
+                    .width(Length::Fixed(500.0)),
+
+                    text("").size(15), // spacer
+
+                    button("Close")
+                        .on_press(Message::ShowSeedClose)
+                        .padding(10),
+                ]
+                .spacing(8)
+                .into()
+            }
+
+            Some(Err(error)) => {
+                // Error screen
+                let error = error.clone();
+                column![
+                    text("Error").size(24),
+                    text("").size(10),
+                    text(error).size(14),
+                    text("").size(15),
+                    row![
+                        button("Try Again")
+                            .on_press(Message::ShowSeedRequested)
+                            .padding(10),
+                        button("Close")
+                            .on_press(Message::ShowSeedClose)
+                            .padding(10),
+                    ]
+                    .spacing(15),
+                ]
+                .spacing(8)
+                .into()
+            }
+        };
+
+        container(content)
+            .padding(20)
+            .into()
     }
 }
 

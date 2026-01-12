@@ -235,6 +235,22 @@ pub fn view(edited_config: &Config, wallet_loaded: bool, advanced_expanded: bool
                     ].spacing(8).into()
                 ),
 
+                // === WALLET SECURITY SECTION ===
+                section_header("Wallet Security"),
+
+                setting_row(
+                    "Recovery Seed",
+                    "View your 12-word recovery phrase",
+                    if wallet_loaded {
+                        button("Show Seed Phrase")
+                            .on_press(Message::ShowSeedRequested)
+                            .padding(8)
+                            .into()
+                    } else {
+                        text("Load wallet first").size(14).into()
+                    }
+                ),
+
                 // === ADVANCED SECTION (Collapsible) ===
                 collapsible_section_header("Advanced", advanced_expanded),
 

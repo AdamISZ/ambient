@@ -134,6 +134,13 @@ pub enum Message {
     SettingsClose,                         // Close settings view (cancel)
     SettingsToggleAdvanced,                // Toggle advanced section visibility
 
+    // Seed phrase viewing
+    ShowSeedRequested,                     // User clicked "Show Seed Phrase" button
+    ShowSeedPasswordChanged(String),       // Password input changed
+    ShowSeedPasswordSubmit,                // User submitted password to view seed
+    ShowSeedResult(Result<String, String>), // Result of decrypting seed (mnemonic or error)
+    ShowSeedClose,                         // Close the seed viewing modal
+
     // Automation
     AutomationToggleEnabled,  // Toggle enable/disable
     AutomationStart,
