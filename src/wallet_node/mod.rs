@@ -146,6 +146,10 @@ pub struct WalletNode {
     snicker_db: crate::encryption::EncryptedMemoryDb,
     /// Partial UTXO set for trustless proposer UTXO validation
     pub partial_utxo_set: Arc<Mutex<PartialUtxoSet>>,
+    /// Lock file handle - held for duration of wallet lifetime to prevent concurrent access
+    /// Uses OS-level flock() which is automatically released on process exit/crash
+    #[allow(dead_code)]
+    lock_file: std::fs::File,
 }
 
 /// Selected UTXOs for spending (hybrid selection result)
@@ -257,6 +261,10 @@ impl WalletNode {
         let (wallet_dir, wallet_db_enc_path, snicker_db_enc_path, mnemonic_path) =
             Self::wallet_paths(name, network_str)?;
         fs::create_dir_all(&wallet_dir)?; // okay if already exists
+
+        // Acquire exclusive lock on wallet directory FIRST
+        // This prevents concurrent access from multiple instances
+        let lock_file = Self::acquire_wallet_lock(&wallet_dir, name)?;
 
         // Decrypt mnemonic
         let mnemonic: Mnemonic = if mnemonic_path.exists() {
@@ -407,6 +415,7 @@ impl WalletNode {
             snicker_db,
             fee_estimator,
             partial_utxo_set,
+            lock_file,
         })
     }
 
@@ -434,6 +443,38 @@ impl WalletNode {
         let mnemonic_path = wallet_dir.join("mnemonic.enc");
 
         Ok((wallet_dir, wallet_db_path, snicker_db_path, mnemonic_path))
+    }
+
+    /// Acquire an exclusive lock on the wallet directory.
+    /// Returns a File handle that must be kept alive for the duration of wallet use.
+    /// Uses OS-level flock() which is automatically released on process exit/crash.
+    fn acquire_wallet_lock(wallet_dir: &std::path::Path, name: &str) -> Result<std::fs::File> {
+        use fs2::FileExt;
+
+        let lock_path = wallet_dir.join(".lock");
+        let lock_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| format!("Failed to open lock file at {:?}", lock_path))?;
+
+        // Try to acquire exclusive lock (non-blocking)
+        match lock_file.try_lock_exclusive() {
+            Ok(()) => {
+                tracing::info!("🔒 Acquired exclusive lock on wallet '{}'", name);
+                Ok(lock_file)
+            }
+            Err(e) => {
+                Err(anyhow!(
+                    "Wallet '{}' is already open in another instance. \
+                     Close the other instance first, or if this is an error, \
+                     delete the lock file at {:?}. ({})",
+                    name, lock_path, e
+                ))
+            }
+        }
     }
 
     fn load_or_create_wallet(

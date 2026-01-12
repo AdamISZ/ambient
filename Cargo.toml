@@ -28,6 +28,9 @@ dialoguer = "0.11"
 
 # Temp file handling
 tempfile = "3"
+
+# File locking for wallet lock
+fs2 = "0.4"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1.0"
 clap = { version = "4", features = ["derive"] }
