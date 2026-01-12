@@ -6,7 +6,7 @@ license = "MIT OR Apache-2.0"
 
 [features]
 default = []
-gui = ["iced", "async-std", "rfd", "qrcode"]
+gui = ["iced", "async-std", "rfd", "qrcode", "image"]
 test-utils = ["nostr-relay-builder", "nostr-lmdb"]
 
 [dependencies]
@@ -63,6 +63,8 @@ async-std = { version = "1.12", optional = true }
 rfd = { version = "0.15", optional = true, default-features = false, features = ["gtk3", "async-std"] }
 # QR code generation for receive addresses
 qrcode = { version = "0.14", optional = true }
+# Image decoding for window icon
+image = { version = "0.25", optional = true, default-features = false, features = ["png"] }
 
 # Test utilities (optional, for embedded relay)
 nostr-relay-builder = { git = "https://github.com/rust-nostr/nostr", package = "nostr-relay-builder", optional = true }

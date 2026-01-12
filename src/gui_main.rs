@@ -47,7 +47,10 @@ async fn main() -> iced::Result {
     // Respects RUST_LOG environment variable, defaults to INFO level
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info"))
-        .add_directive("bdk_kyoto=warn".parse().unwrap());
+        .add_directive("bdk_kyoto=warn".parse().unwrap())
+        // Suppress verbose iced INFO logging (especially window attributes with icon bytes)
+        .add_directive("iced_winit=warn".parse().unwrap())
+        .add_directive("iced_wgpu=warn".parse().unwrap());
 
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer()
