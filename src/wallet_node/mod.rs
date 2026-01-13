@@ -318,6 +318,10 @@ impl WalletNode {
                 snicker_db_enc_path
             ));
         };
+
+        // Run migrations on existing database
+        crate::snicker::Snicker::run_migrations(&snicker_conn_raw);
+
         let snicker_conn = Arc::new(std::sync::Mutex::new(snicker_conn_raw));
 
         // NOTE: We no longer subscribe to SNICKER scripts via Kyoto

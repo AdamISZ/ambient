@@ -1,9 +1,11 @@
 name: Release
 
+# DISABLED: Manual releases for now (no bitcoind in CI for integration tests)
+# To re-enable: change 'disabled-v*' back to 'v*'
 on:
   push:
     tags:
-      - 'v*'
+      - 'disabled-v*'
   workflow_dispatch:
     inputs:
       tag:

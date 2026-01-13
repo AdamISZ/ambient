@@ -1071,6 +1071,47 @@ impl Snicker {
         Ok(())
     }
 
+    /// Run database migrations on an existing database (called when loading a wallet)
+    pub fn run_migrations(conn: &Connection) {
+        Self::fix_orphaned_pending_utxos(conn);
+    }
+
+    /// Fix SNICKER UTXOs that are stuck in "pending" status but whose spending transaction
+    /// no longer exists in pending_transactions (e.g., it was cleaned up after a conflict).
+    /// This is a one-time migration that also serves as a safety net for edge cases.
+    fn fix_orphaned_pending_utxos(conn: &Connection) {
+        // Check if both required tables exist (handles legacy wallets)
+        let tables_exist: bool = conn.query_row(
+            "SELECT COUNT(*) = 2 FROM sqlite_master WHERE type = 'table' AND name IN ('snicker_utxos', 'pending_transactions')",
+            [],
+            |row| row.get(0),
+        ).unwrap_or(false);
+
+        if !tables_exist {
+            return;
+        }
+
+        // Find and fix orphaned pending UTXOs:
+        // - status = 'pending' (marked as being spent)
+        // - spent_in_txid is set (references the spending tx)
+        // - but that txid doesn't exist in pending_transactions (was cleaned up or never existed)
+        let fixed = conn.execute(
+            "UPDATE snicker_utxos
+             SET status = 'unspent', spent_in_txid = NULL, pending_since = NULL
+             WHERE status = 'pending'
+               AND spent_in_txid IS NOT NULL
+               AND spent_in_txid NOT IN (SELECT txid FROM pending_transactions)",
+            [],
+        ).unwrap_or(0);
+
+        if fixed > 0 {
+            tracing::warn!(
+                "🔧 Fixed {} orphaned SNICKER UTXO(s) stuck in 'pending' status (restored to 'unspent')",
+                fixed
+            );
+        }
+    }
+
     /// Removed: encrypted proposals table no longer used
     /// Proposals are decrypted at storage time and stored directly in decrypted_proposals
 
@@ -1979,6 +2020,21 @@ impl Snicker {
             "DELETE FROM pending_transactions WHERE txid = ?",
             [conflicted_txid],
         )?;
+
+        // Restore any SNICKER UTXOs that were marked "pending" for this conflicted tx.
+        // These INPUT UTXOs were never actually spent (the spending tx was conflicted out),
+        // so they should be available for future spending.
+        let restored_utxos = conn.execute(
+            "UPDATE snicker_utxos SET status = 'unspent', spent_in_txid = NULL, pending_since = NULL WHERE spent_in_txid = ?",
+            [conflicted_txid],
+        ).unwrap_or(0);
+
+        if restored_utxos > 0 {
+            tracing::info!(
+                "🔄 Restored {} SNICKER UTXO(s) from pending to unspent (conflicted tx {})",
+                restored_utxos, conflicted_txid
+            );
+        }
 
         tracing::info!("✅ Cleaned up conflicted transaction {}", conflicted_txid);
         Ok(())
