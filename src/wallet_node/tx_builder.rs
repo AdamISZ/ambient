@@ -454,8 +454,9 @@ impl WalletNode {
             script_pubkey: address.script_pubkey(),
         }];
 
-        // Add change output if any
-        if change_amount > 0 {
+        // Add change output if above dust threshold (dust goes to miner fee instead)
+        const DUST_THRESHOLD: u64 = 3000;
+        if change_amount >= DUST_THRESHOLD {
             let mut wallet = self.wallet.lock().await;
             let mut conn = self.conn.lock().await;
             let change_addr = wallet.reveal_next_address(KeychainKind::Internal);
@@ -467,6 +468,8 @@ impl WalletNode {
                 script_pubkey: change_addr.script_pubkey(),
             });
             info!("💸 Change output: {} sats to {}", change_amount, change_addr.address);
+        } else if change_amount > 0 {
+            info!("💸 Change {} sats below dust threshold, adding to fee", change_amount);
         }
 
         let unsigned_tx = bdk_wallet::bitcoin::Transaction {
@@ -666,8 +669,9 @@ impl WalletNode {
             script_pubkey: address.script_pubkey(),
         }];
 
-        // Add change output if any
-        if change_amount > 0 {
+        // Add change output if above dust threshold (dust goes to miner fee instead)
+        const DUST_THRESHOLD: u64 = 3000;
+        if change_amount >= DUST_THRESHOLD {
             let mut wallet = self.wallet.lock().await;
             let mut conn = self.conn.lock().await;
             let change_addr = wallet.reveal_next_address(KeychainKind::Internal);
@@ -679,6 +683,8 @@ impl WalletNode {
                 script_pubkey: change_addr.script_pubkey(),
             });
             info!("💸 Change output: {} sats to {}", change_amount, change_addr.address);
+        } else if change_amount > 0 {
+            info!("💸 Change {} sats below dust threshold, adding to fee", change_amount);
         }
 
         // Create unsigned transaction
