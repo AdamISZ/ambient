@@ -571,17 +571,8 @@ impl Snicker {
         }
         let equal_output_amount = Amount::from_sat(equal_output_sats as u64);
 
-        // Estimate transaction weight: 2 P2TR inputs + variable outputs
-        // Overhead: version(4) + locktime(4) + #inputs(1) + #outputs(1) = 10 bytes non-witness = 40 WU
-        //           + segwit flag/marker(2) witness bytes = 2 WU
-        //           Total overhead: 42 WU
-        // Per P2TR input: txid(32) + vout(4) + scriptsig_len(1) + sequence(4) = 41 bytes non-witness = 164 WU
-        //                 + witness: stack_count(1) + sig_len(1) + sig(64) = 66 bytes witness = 66 WU
-        //                 Total per input: 230 WU
-        // Per P2TR output: amount(8) + script_len(1) + scriptpubkey(34) = 43 bytes non-witness = 172 WU
-        // Formula: (42 + 230*num_inputs + 172*num_outputs + 3) / 4  (the +3 ensures rounding up)
-        let weight_units_3_outputs = 42 + (230 * 2) + (172 * 3); // = 1018 WU
-        let estimated_vsize_3_outputs = (weight_units_3_outputs + 3) / 4; // = 255 vbytes
+        // Estimate transaction size: 2 P2TR inputs + 3 P2TR outputs (with change)
+        let estimated_vsize_3_outputs = crate::utils::estimate_p2tr_tx_vbytes(2, 3);
         let estimated_fee_3_outputs = fee_rate.fee_vb(estimated_vsize_3_outputs)
             .ok_or_else(|| anyhow::anyhow!("Fee calculation overflow"))?;
 
@@ -620,8 +611,7 @@ impl Snicker {
             );
 
             // Recalculate fee for 2-output transaction (no change)
-            let weight_units_2_outputs = 42 + (230 * 2) + (172 * 2); // = 846 WU
-            let estimated_vsize_2_outputs = (weight_units_2_outputs + 3) / 4; // = 212 vbytes
+            let estimated_vsize_2_outputs = crate::utils::estimate_p2tr_tx_vbytes(2, 2);
             let estimated_fee_2_outputs = fee_rate.fee_vb(estimated_vsize_2_outputs)
                 .ok_or_else(|| anyhow::anyhow!("Fee calculation overflow"))?;
 
@@ -907,7 +897,7 @@ impl Snicker {
         let fee = Amount::from_sat(total_in.to_sat() - total_out.to_sat());
 
         // Estimate transaction size (2 P2TR inputs + 3 P2TR outputs)
-        let estimated_vsize = 10 + (2 * 58) + (3 * 43); // ~205 vbytes
+        let estimated_vsize = crate::utils::estimate_p2tr_tx_vbytes(2, 3);
 
         // Calculate fee rate
         let fee_rate_sat_vb = fee.to_sat() / estimated_vsize;

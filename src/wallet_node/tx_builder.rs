@@ -333,19 +333,13 @@ impl WalletNode {
             return Ok(0);
         }
 
-        // Calculate output size based on destination address type
-        let script_pubkey = address.script_pubkey();
-        let output_size = 8 + script_pubkey.len(); // 8 bytes for amount + script length
-
         // Calculate transaction size in vbytes
-        // Taproot inputs: ~57.5 vbytes each (outpoint: 36, script: 1, sequence: 4, witness: ~65/4)
+        let script_pubkey = address.script_pubkey();
         let num_inputs = regular_utxos.len() + snicker_utxos.len();
-        let base_size = 4 + 1 + 1 + 4; // version + input_count + output_count + locktime
-        let input_size = num_inputs as f32 * 57.5; // Each Taproot input
-        let total_vbytes = base_size as f32 + input_size + output_size as f32;
+        let total_vbytes = crate::utils::estimate_spend_tx_vbytes(num_inputs, script_pubkey.len());
 
         // Calculate fee
-        let fee = (total_vbytes * fee_rate_sat_vb).ceil() as u64;
+        let fee = (total_vbytes as f32 * fee_rate_sat_vb).ceil() as u64;
 
         // Maximum sendable is total input minus fee
         if fee >= total_input {
