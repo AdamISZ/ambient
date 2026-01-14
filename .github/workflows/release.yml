@@ -17,7 +17,9 @@ env:
 
 jobs:
   build-appimage:
-    runs-on: ubuntu-latest
+    # Use Ubuntu 20.04 for glibc 2.31 compatibility (same as Debian Bullseye)
+    # This allows the AppImage to run on older distros
+    runs-on: ubuntu-20.04
 
     steps:
       - uses: actions/checkout@v4

@@ -1,13 +1,17 @@
 #!/bin/bash
 # build-appimage.sh - Automated AppImage builder for Ambient Wallet
 # See docs/APPIMAGE_BUILD.md for detailed documentation
+#
+# Uses linuxdeploy with GTK plugin to bundle dependencies properly.
+# Build on Ubuntu 20.04 (glibc 2.31) for broad compatibility.
 
 set -e  # Exit on error
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APPDIR="/tmp/ambient-appimage"
 OUTPUT_FILE="${PROJECT_ROOT}/ambient-gui-x86_64.AppImage"
-APPIMAGETOOL="/tmp/appimagetool"
+LINUXDEPLOY="/tmp/linuxdeploy-x86_64.AppImage"
+LINUXDEPLOY_GTK="/tmp/linuxdeploy-plugin-gtk.sh"
 
 echo "🏗️  Building Ambient Wallet AppImage..."
 echo "📍 Project root: $PROJECT_ROOT"
@@ -71,19 +75,44 @@ echo "🔗 Creating AppRun..."
 cd "$APPDIR"
 ln -sf usr/bin/ambient-gui AppRun
 
-# Step 7: Download appimagetool (if needed)
-if [ ! -f "$APPIMAGETOOL" ]; then
-    echo "⬇️  Downloading appimagetool..."
+# Step 7: Download linuxdeploy and GTK plugin (if needed)
+if [ ! -f "$LINUXDEPLOY" ]; then
+    echo "⬇️  Downloading linuxdeploy..."
     wget -q --show-progress \
-        https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage \
-        -O "$APPIMAGETOOL"
-    chmod +x "$APPIMAGETOOL"
+        https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage \
+        -O "$LINUXDEPLOY"
+    chmod +x "$LINUXDEPLOY"
 fi
 
-# Step 8: Package AppImage
-echo "📦 Packaging AppImage..."
+if [ ! -f "$LINUXDEPLOY_GTK" ]; then
+    echo "⬇️  Downloading linuxdeploy GTK plugin..."
+    wget -q --show-progress \
+        https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-gtk/master/linuxdeploy-plugin-gtk.sh \
+        -O "$LINUXDEPLOY_GTK"
+    chmod +x "$LINUXDEPLOY_GTK"
+fi
+
+# Step 8: Package AppImage with GTK bundled
+echo "📦 Packaging AppImage (bundling GTK dependencies)..."
 rm -f "$OUTPUT_FILE"
-"$APPIMAGETOOL" "$APPDIR" "$OUTPUT_FILE" 2>&1 | grep -E "(Success|Error|embedding)"
+cd "$PROJECT_ROOT"
+
+# Set GTK version and output path for linuxdeploy
+export DEPLOY_GTK_VERSION=3
+export OUTPUT="$OUTPUT_FILE"
+
+# Ensure linuxdeploy can find the GTK plugin
+export PATH="/tmp:$PATH"
+
+# Run linuxdeploy with GTK plugin
+# This bundles GTK and all its dependencies into the AppImage
+"$LINUXDEPLOY" \
+    --appdir "$APPDIR" \
+    --executable "$APPDIR/usr/bin/ambient-gui" \
+    --desktop-file "$APPDIR/ambient-gui.desktop" \
+    --icon-file "$APPDIR/ambient-gui.png" \
+    --plugin gtk \
+    --output appimage
 
 # Step 9: Verify
 echo ""
