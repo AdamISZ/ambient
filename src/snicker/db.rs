@@ -446,34 +446,6 @@ pub fn is_outpoint_pending_spent(conn: &Connection, txid: &str, vout: u32) -> bo
     ).is_ok()
 }
 
-/// Get all pending spent outpoints (for UTXO list display)
-pub fn get_pending_spent_outpoints(conn: &Connection) -> Vec<(String, u32, u64, String)> {
-    let mut stmt = match conn.prepare(
-        "SELECT spent_txid, spent_vout, amount_sats, spending_txid FROM pending_inputs"
-    ) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
-
-    let mut result = Vec::new();
-    let mut rows = match stmt.query([]) {
-        Ok(r) => r,
-        Err(_) => return Vec::new(),
-    };
-
-    while let Ok(Some(row)) = rows.next() {
-        if let (Ok(txid), Ok(vout), Ok(amount), Ok(spending_txid)) = (
-            row.get::<_, String>(0),
-            row.get::<_, u32>(1),
-            row.get::<_, i64>(2),
-            row.get::<_, String>(3),
-        ) {
-            result.push((txid, vout, amount as u64, spending_txid));
-        }
-    }
-    result
-}
-
 /// Get pending balance info: (pending_outgoing_sats, pending_incoming_snicker_sats)
 pub fn get_pending_balance(conn: &Connection) -> (u64, u64) {
     // Pending outgoing: sum of OUR inputs in pending transactions (not other parties' inputs)
@@ -641,16 +613,6 @@ pub fn record_proposal_pairing(
     );
 
     Ok(())
-}
-
-/// Check if we have any live (pending) proposals for the given UTXO
-pub fn has_live_proposals(conn: &Connection, our_outpoint: &bdk_wallet::bitcoin::OutPoint) -> bool {
-    let our_utxo = format!("{}:{}", our_outpoint.txid, our_outpoint.vout);
-    conn.query_row(
-        "SELECT 1 FROM decrypted_proposals WHERE our_utxo = ? AND role = 'proposer' AND status = 'pending' LIMIT 1",
-        [&our_utxo],
-        |_| Ok(()),
-    ).is_ok()
 }
 
 /// Delete pairings where the target UTXO was spent
@@ -1110,18 +1072,4 @@ pub fn get_action_count_since(
         |row| row.get(0),
     )?;
     Ok(count as usize)
-}
-
-/// Check if rate limit would be exceeded for an action type
-pub fn check_rate_limit(
-    conn: &Connection,
-    action_type: &str,
-    max_per_hour: usize,
-) -> Result<bool> {
-    let one_hour_ago = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_secs() as i64 - 3600;
-
-    let count = get_action_count_since(conn, action_type, one_hour_ago)?;
-    Ok(count < max_per_hour)
 }

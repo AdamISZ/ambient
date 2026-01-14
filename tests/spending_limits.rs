@@ -4,7 +4,6 @@ mod common;
 use common::BITCOIND;
 
 use ambient::manager::Manager;
-use ambient::snicker::Snicker;
 
 // ============================================================
 // TEST CONFIGURATION

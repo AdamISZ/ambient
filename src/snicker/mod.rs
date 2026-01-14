@@ -48,7 +48,7 @@ use std::str::FromStr;
 use anyhow::Result;
 use zeroize::Zeroizing;
 use bdk_wallet::{
-    bitcoin::{Network, OutPoint, Transaction, TxOut, Txid, psbt::Psbt, secp256k1::PublicKey},
+    bitcoin::{Network, OutPoint, TxOut, Txid, psbt::Psbt, secp256k1::PublicKey},
     rusqlite::Connection,
 };
 use serde::{Serialize, Deserialize};
@@ -67,10 +67,6 @@ pub struct ProposalFlags(pub u32);
 impl ProposalFlags {
     /// No flags set (current default)
     pub const NONE: u32 = 0x00000000;
-
-    pub fn new(flags: u32) -> Self {
-        ProposalFlags(flags)
-    }
 
     pub fn none() -> Self {
         ProposalFlags(Self::NONE)
@@ -1198,34 +1194,6 @@ impl Snicker {
         Ok(delta)
     }
 
-    /// Extract proposer's UTXO from a proposal's PSBT
-    /// Uses TweakInfo to identify the receiver's input, and returns the other input as proposer's
-    pub fn extract_proposer_utxo(&self, proposal: &Proposal) -> Result<String> {
-        // Use TweakInfo to identify the receiver's input (by matching script_pubkey)
-        let receiver_script = &proposal.tweak_info.original_output.script_pubkey;
-
-        // Find receiver's input index by matching script_pubkey in witness_utxo
-        let receiver_input_idx = proposal.psbt.inputs.iter().position(|inp| {
-            inp.witness_utxo.as_ref()
-                .map(|utxo| &utxo.script_pubkey == receiver_script)
-                .unwrap_or(false)
-        }).ok_or_else(|| anyhow::anyhow!("Could not find receiver's input in PSBT"))?;
-
-        // The other input is the proposer's (PSBT always has exactly 2 inputs)
-        let proposer_input_idx = if receiver_input_idx == 0 { 1 } else { 0 };
-
-        let proposer_input = proposal.psbt.unsigned_tx.input.get(proposer_input_idx)
-            .ok_or_else(|| anyhow::anyhow!("Proposer input not found in PSBT"))?;
-
-        Ok(format!("{}:{}", proposer_input.previous_output.txid, proposer_input.previous_output.vout))
-    }
-
-    /// Extract receiver's UTXO from a proposal's tweak info
-    pub fn extract_receiver_utxo(&self, _proposal: &Proposal, target_tx: &Transaction, output_index: usize) -> Result<String> {
-        let txid = target_tx.compute_txid();
-        Ok(format!("{}:{}", txid, output_index))
-    }
-
     /// Store a SNICKER UTXO after accepting a proposal
     pub async fn store_snicker_utxo(
         &self,
@@ -1379,12 +1347,6 @@ impl Snicker {
         db::is_outpoint_pending_spent(&conn, txid, vout)
     }
 
-    /// Get all pending spent outpoints (for UTXO list display)
-    pub fn get_pending_spent_outpoints(&self) -> Vec<(String, u32, u64, String)> {
-        let conn = self.conn.lock().unwrap();
-        db::get_pending_spent_outpoints(&conn)
-    }
-
     /// Get pending balance info: (pending_outgoing_sats, pending_incoming_snicker_sats)
     pub fn get_pending_balance(&self) -> (u64, u64) {
         let conn = self.conn.lock().unwrap();
@@ -1433,13 +1395,6 @@ impl Snicker {
             target_outpoint.txid, target_outpoint.vout
         );
         Ok(())
-    }
-
-    /// Check if our UTXO has any live proposals (for GUI display)
-    /// Queries decrypted_proposals where our_utxo matches and status is pending
-    pub fn has_live_proposals(&self, our_outpoint: &bdk_wallet::bitcoin::OutPoint) -> bool {
-        let conn = self.conn.lock().unwrap();
-        db::has_live_proposals(&conn, our_outpoint)
     }
 
     /// Invalidate all proposals where the target UTXO matches (called when target is spent)
@@ -1736,17 +1691,6 @@ impl Snicker {
             .as_secs() as i64 - seconds_ago;
         let count = db::get_action_count_since(&conn, action_type, since_timestamp)?;
         Ok(count as u32)
-    }
-
-    /// Check if we're within rate limit for a specific action
-    pub async fn check_rate_limit(
-        &self,
-        action_type: &str,
-        max_per_day: u32,
-    ) -> Result<bool> {
-        // Calculate per-hour limit from per-day limit (roughly)
-        let count = self.get_action_count_since(action_type, 86400).await?;  // 24 hours
-        Ok(count < max_per_day)
     }
 
     // ============================================================
@@ -2235,7 +2179,7 @@ mod tests {
         let flags = ProposalFlags::none();
         assert_eq!(flags.0, 0x00000000);
 
-        let flags = ProposalFlags::new(0x12345678);
+        let flags = ProposalFlags(0x12345678);
         assert_eq!(flags.0, 0x12345678);
 
         let flags = ProposalFlags(ProposalFlags::NONE);
