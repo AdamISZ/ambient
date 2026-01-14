@@ -908,7 +908,7 @@ impl WalletNode {
                                 let txid_str = canonical_tx.tx_node.txid.to_string();
 
                                 // Skip if already recorded
-                                if crate::snicker::Snicker::is_transaction_recorded_static(&snicker_conn_guard, &txid_str) {
+                                if crate::snicker::db::is_transaction_recorded(&snicker_conn_guard, &txid_str) {
                                     continue;
                                 }
 
@@ -917,7 +917,7 @@ impl WalletNode {
 
                                 // Check if this is a coinjoin - if so, use delta from coinjoin_spending
                                 // (BDK's sent_and_received doesn't see SNICKER tweaked outputs)
-                                let (balance_change, tx_type) = match crate::snicker::Snicker::get_coinjoin_info_static(&snicker_conn_guard, &txid_str) {
+                                let (balance_change, tx_type) = match crate::snicker::db::get_coinjoin_info(&snicker_conn_guard, &txid_str) {
                                     Ok(Some((role, delta_sats))) => {
                                         // For coinjoins, delta_sats is what we paid (positive = cost)
                                         // balance_change should be negative when we paid
@@ -944,7 +944,7 @@ impl WalletNode {
                                     .unwrap_or(0);
 
                                 // Record the transaction
-                                if let Err(e) = crate::snicker::Snicker::record_transaction_static(
+                                if let Err(e) = crate::snicker::db::record_transaction(
                                     &snicker_conn_guard,
                                     &txid_str,
                                     &tx_hex,
@@ -1233,13 +1233,13 @@ impl WalletNode {
                                     let conn = snicker_conn.lock().unwrap();
                                     let txid_str = coinjoin_txid.to_string();
 
-                                    let already_recorded = crate::snicker::Snicker::get_coinjoin_role_static(&conn, &txid_str)
+                                    let already_recorded = crate::snicker::db::get_coinjoin_role(&conn, &txid_str)
                                         .ok()
                                         .flatten()
                                         .is_some();
 
                                     if !already_recorded {
-                                        if let Err(e) = crate::snicker::Snicker::record_coinjoin_spending_static(
+                                        if let Err(e) = crate::snicker::db::record_coinjoin_spending(
                                             &conn,
                                             cost_sats as i64,
                                             "proposer",
@@ -1249,7 +1249,7 @@ impl WalletNode {
                                             tracing::error!("Failed to record proposer coinjoin spending: {}", e);
                                         }
                                         // Update transaction type in history
-                                        if let Err(e) = crate::snicker::Snicker::update_transaction_type_static(
+                                        if let Err(e) = crate::snicker::db::update_transaction_type(
                                             &conn,
                                             &txid_str,
                                             "coinjoin_proposer",
@@ -1261,13 +1261,13 @@ impl WalletNode {
 
                                     // Role flip
                                     let conn = snicker_conn.lock().unwrap();
-                                    let current_state = crate::snicker::Snicker::get_automation_state_static(&conn);
+                                    let current_state = crate::snicker::db::get_automation_state(&conn);
                                     let new_role = crate::snicker::AutomationRole::coin_flip();
                                     let new_state = crate::snicker::AutomationState {
                                         role: new_role,
                                         last_coinjoin_height: scan_height,
                                     };
-                                    if let Err(e) = crate::snicker::Snicker::set_automation_state_static(&conn, &new_state) {
+                                    if let Err(e) = crate::snicker::db::set_automation_state(&conn, &new_state) {
                                         tracing::error!("Failed to save automation state after proposer coinjoin: {}", e);
                                     } else {
                                         tracing::info!(
@@ -1358,7 +1358,7 @@ impl WalletNode {
 
                                                     // CONFLICT DETECTION: Check if this outpoint was expected
                                                     // to be spent by one of our pending transactions
-                                                    if let Some(our_pending_txid) = crate::snicker::Snicker::get_pending_tx_for_input_static(
+                                                    if let Some(our_pending_txid) = crate::snicker::db::get_pending_tx_for_input(
                                                         &conn, &txid_str, outpoint.vout
                                                     ) {
                                                         // Find what transaction actually spent this outpoint
@@ -1374,7 +1374,7 @@ impl WalletNode {
                                                                             "💥 Conflict detected: input {}:{} spent by {} (we expected {})",
                                                                             txid_str, outpoint.vout, actual_spending_txid, our_pending_txid
                                                                         );
-                                                                        if let Err(e) = crate::snicker::Snicker::remove_conflicted_transaction_static(
+                                                                        if let Err(e) = crate::snicker::db::remove_conflicted_transaction(
                                                                             &conn, &our_pending_txid
                                                                         ) {
                                                                             tracing::error!("Failed to clean up conflicted tx: {}", e);
@@ -1423,13 +1423,13 @@ impl WalletNode {
                                                 let txid_str = coinjoin_txid.to_string();
 
                                                 // Check if already recorded (e.g., as receiver)
-                                                let already_recorded = crate::snicker::Snicker::get_coinjoin_role_static(&conn, &txid_str)
+                                                let already_recorded = crate::snicker::db::get_coinjoin_role(&conn, &txid_str)
                                                     .ok()
                                                     .flatten()
                                                     .is_some();
 
                                                 if !already_recorded {
-                                                    if let Err(e) = crate::snicker::Snicker::record_coinjoin_spending_static(
+                                                    if let Err(e) = crate::snicker::db::record_coinjoin_spending(
                                                         &conn,
                                                         cost_sats as i64,
                                                         "proposer",
@@ -1439,7 +1439,7 @@ impl WalletNode {
                                                         tracing::error!("Failed to record coinjoin spending: {}", e);
                                                     }
                                                     // Update transaction type in history (may have been recorded as "send")
-                                                    if let Err(e) = crate::snicker::Snicker::update_transaction_type_static(
+                                                    if let Err(e) = crate::snicker::db::update_transaction_type(
                                                         &conn,
                                                         &txid_str,
                                                         "coinjoin_proposer",
@@ -1456,13 +1456,13 @@ impl WalletNode {
                                             let conn = snicker_conn.lock().unwrap();
                                             if coinjoin_detected {
                                                 // Read current state, flip role
-                                                let current_state = crate::snicker::Snicker::get_automation_state_static(&conn);
+                                                let current_state = crate::snicker::db::get_automation_state(&conn);
                                                 let new_role = crate::snicker::AutomationRole::coin_flip();
                                                 let new_state = crate::snicker::AutomationState {
                                                     role: new_role,
                                                     last_coinjoin_height: scan_height,
                                                 };
-                                                if let Err(e) = crate::snicker::Snicker::set_automation_state_static(&conn, &new_state) {
+                                                if let Err(e) = crate::snicker::db::set_automation_state(&conn, &new_state) {
                                                     tracing::error!("Failed to update automation state after coinjoin: {}", e);
                                                 } else {
                                                     tracing::info!(

@@ -319,8 +319,8 @@ async fn test_spending_limits() -> Result<()> {
     println!("   ✅ PASSED: Daily limit correctly enforced");
 
     // Mine 144 blocks to reset daily window
-    println!("\n⛏️  Mining {} blocks to reset daily limit window...", Snicker::BLOCKS_PER_DAY);
-    BITCOIND.mine_blocks(Snicker::BLOCKS_PER_DAY as u64)?;
+    println!("\n⛏️  Mining {} blocks to reset daily limit window...", ambient::snicker::BLOCKS_PER_DAY);
+    BITCOIND.mine_blocks(ambient::snicker::BLOCKS_PER_DAY as u64)?;
 
     let new_height = BITCOIND.get_block_count()? as u32;
     let (a, b) = tokio::join!(
@@ -411,8 +411,8 @@ async fn test_spending_limits() -> Result<()> {
     println!("   ✅ PASSED: Weekly limit correctly enforced");
 
     // Verify that another daily reset doesn't help (still blocked by weekly)
-    println!("\n⛏️  Mining {} more blocks (another daily reset)...", Snicker::BLOCKS_PER_DAY);
-    BITCOIND.mine_blocks(Snicker::BLOCKS_PER_DAY as u64)?;
+    println!("\n⛏️  Mining {} more blocks (another daily reset)...", ambient::snicker::BLOCKS_PER_DAY);
+    BITCOIND.mine_blocks(ambient::snicker::BLOCKS_PER_DAY as u64)?;
 
     let new_height = BITCOIND.get_block_count()? as u32;
     let (a, b) = tokio::join!(
