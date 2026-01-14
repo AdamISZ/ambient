@@ -26,7 +26,7 @@ pub fn calculate_dh_shared_secret(
     shared.secret_bytes()
 }
 
-/// Extract the taproot internal public key from a P2TR output
+/// Extract the taproot external public key from a P2TR output
 ///
 /// # Arguments
 /// * `output` - The P2TR transaction output
@@ -77,8 +77,6 @@ pub fn apply_taproot_tweak(
     // original_pubkey_xonly is the BIP86 output key (already taproot tweaked)
     // We only need to apply the SNICKER tweak: tweaked_pubkey = output_pubkey + tweak*G
 
-    // Convert x-only pubkey to a full public key
-    // For x-only keys in BIP340, we ALWAYS use even Y parity
     let mut pubkey_bytes = [0u8; 33];
     pubkey_bytes[0] = 0x02; // Even parity
     pubkey_bytes[1..].copy_from_slice(original_pubkey_xonly);
@@ -86,14 +84,11 @@ pub fn apply_taproot_tweak(
     let pubkey = PublicKey::from_slice(&pubkey_bytes)
         .map_err(|e| anyhow!("Invalid public key: {}", e))?;
 
-    // Convert tweak to scalar
     let tweak_scalar = Scalar::from_be_bytes(*tweak)
         .map_err(|_| anyhow!("Invalid tweak scalar"))?;
 
-    // Add tweak to public key: tweaked_pubkey = pubkey + tweak*G
     let tweaked_pubkey = pubkey.add_exp_tweak(&secp, &tweak_scalar)?;
 
-    // CRITICAL: Extract x-only coordinate and ensure even Y parity
     // XOnlyPublicKey automatically uses the even-Y version
     let tweaked_xonly = XOnlyPublicKey::from(tweaked_pubkey);
     let tweaked_xonly_bytes = tweaked_xonly.serialize();
@@ -103,9 +98,17 @@ pub fn apply_taproot_tweak(
 
 /// Create a tweaked P2TR output using DH shared secret
 ///
-/// This is the core SNICKER operation for the proposer: given the receiver's
-/// original output and the proposer's secret key, create a new output with the tweaked key.
+/// This is the main operation in snicker for the proposer:
+/// use your own key and the output's key to do DH, then
+/// tweak the output with the DH secret.
 ///
+/// An important detail: this creates an output with a fixed
+/// amount that is the same as the input (original_output);
+/// in fact, we will edit this amount after this is called,
+/// because the snicker output value is not the same as the
+/// input utxo's value. So the amount is a starting value
+/// that later gets tweaked. A bit confusing, but it works.
+/// 
 /// # Arguments
 /// * `original_output` - The receiver's original P2TR output
 /// * `proposer_seckey` - The proposer's secret key
@@ -118,19 +121,15 @@ pub fn create_tweaked_output(
     proposer_seckey: &SecretKey,
     receiver_pubkey: &PublicKey,
 ) -> Result<(TxOut, [u8; 32])> {
-    // Extract receiver's x-only pubkey from the output
     let receiver_pubkey_xonly = extract_taproot_pubkey(original_output)?;
 
-    // Calculate DH shared secret (proposer's perspective)
     let shared_secret = calculate_dh_shared_secret(proposer_seckey, receiver_pubkey);
 
-    // Apply tweak to create new pubkey
     let tweaked_pubkey_xonly = apply_taproot_tweak(&receiver_pubkey_xonly, &shared_secret)?;
 
-    // Create new P2TR scriptPubkey with tweaked key
     let tweaked_script = create_p2tr_script(&tweaked_pubkey_xonly);
 
-    // Create new output with same value
+    // Create new output with same value (see docstring)
     let tweaked_output = TxOut {
         value: original_output.value,
         script_pubkey: tweaked_script,
@@ -144,6 +143,9 @@ pub fn create_tweaked_output(
 /// The receiver verifies that the tweaked output was correctly created
 /// using their key and the proposer's public key.
 ///
+/// Important note: this is ONLY checking the scriptPubKey,
+/// and not the amount, deliberately.
+/// 
 /// # Arguments
 /// * `original_output` - Their original output
 /// * `tweaked_output` - The proposed tweaked output
@@ -158,25 +160,16 @@ pub fn verify_tweaked_output(
     receiver_seckey: &SecretKey,
     proposer_pubkey: &PublicKey,
 ) -> Result<[u8; 32]> {
-    // Extract original pubkey
     let original_pubkey_xonly = extract_taproot_pubkey(original_output)?;
 
-    // Calculate DH shared secret (receiver's perspective)
     let shared_secret = calculate_dh_shared_secret(receiver_seckey, proposer_pubkey);
 
-    // Apply tweak to original pubkey
     let expected_tweaked_pubkey = apply_taproot_tweak(&original_pubkey_xonly, &shared_secret)?;
 
-    // Verify the tweaked output has the expected pubkey
     let actual_tweaked_pubkey = extract_taproot_pubkey(tweaked_output)?;
 
     if expected_tweaked_pubkey != actual_tweaked_pubkey {
         return Err(anyhow!("Tweaked output pubkey mismatch"));
-    }
-
-    // Verify value is the same
-    if original_output.value != tweaked_output.value {
-        return Err(anyhow!("Tweaked output value mismatch"));
     }
 
     Ok(shared_secret)
@@ -202,14 +195,12 @@ pub fn apply_tweak_to_seckey_with_parity(
 ) -> Result<SecretKey> {
     let secp = Secp256k1::new();
 
-    // Apply tweak: tweaked_seckey = seckey + tweak
     let mut tweaked = seckey.add_tweak(tweak)?;
 
-    // Check parity of resulting public key
+    // TODO is there some kind of XOnlyPublicKey::from_secret_key() we can use here?
     let pubkey = PublicKey::from_secret_key(&secp, &tweaked);
     let has_odd_y = pubkey.serialize()[0] == 0x03;
 
-    // If odd parity, negate to match x-only (even parity) convention
     if has_odd_y {
         tweaked = tweaked.negate();
     }
@@ -222,7 +213,7 @@ pub fn apply_tweak_to_seckey_with_parity(
 /// The receiver needs to derive their tweaked private key to sign
 /// the SNICKER transaction with the tweaked output.
 ///
-/// tweaked_seckey = original_seckey + tweak
+/// tweaked_seckey = original_seckey + tweak (modulo parity)
 ///
 /// # Arguments
 /// * `receiver_seckey` - Their original secret key
@@ -243,11 +234,10 @@ pub fn derive_tweaked_seckey(
 
     let mut tweaked_seckey = receiver_seckey.add_tweak(&tweak_scalar)?;
 
-    // After adding the SNICKER scalar, check if resulting pubkey has even Y parity
-    // X-only keys always assume even Y, so if odd, negate the private key
+    // parity check after addition:
     let tweaked_pubkey = tweaked_seckey.public_key(&secp);
     let parity = tweaked_pubkey.serialize()[0];
-    if parity == 0x03 {  // Odd Y coordinate
+    if parity == 0x03 {
         tweaked_seckey = tweaked_seckey.negate();
     }
 

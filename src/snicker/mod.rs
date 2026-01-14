@@ -46,6 +46,7 @@ use bdk_wallet::{
 };
 use serde::{Serialize, Deserialize};
 
+
 // ============================================================
 // AUTOMATION STATE
 // ============================================================
@@ -911,8 +912,7 @@ impl Snicker {
         // Calculate fee rate
         let fee_rate_sat_vb = fee.to_sat() / estimated_vsize;
 
-        // Require at least 1 sat/vbyte (very conservative minimum)
-        if fee_rate_sat_vb < 1 {
+        if (fee_rate_sat_vb as f32) < crate::MIN_FEE_RATE_SAT_VB {
             return Err(anyhow::anyhow!(
                 "Fee rate too low: {} sat/vb (fee {} sats, estimated size {} vbytes)",
                 fee_rate_sat_vb, fee.to_sat(), estimated_vsize
