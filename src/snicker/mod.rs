@@ -208,44 +208,6 @@ pub fn wrap_proposal_blob(version: u8, encrypted_data: &[u8]) -> Vec<u8> {
     wrapped
 }
 
-// ============================================================
-// SNICKER TRANSACTION FILTERS
-// ============================================================
-
-/// Check if a transaction is a potential SNICKER candidate
-///
-/// A transaction is a candidate if it has at least one P2TR output
-/// within the specified size range.
-///
-/// # Arguments
-/// * `tx` - The transaction to check
-/// * `size_min` - Minimum output value in satoshis
-/// * `size_max` - Maximum output value in satoshis
-///
-/// # Returns
-/// `true` if the transaction has at least one qualifying P2TR output
-pub fn is_snicker_candidate(tx: &Transaction, size_min: u64, size_max: u64) -> bool {
-    let txid = tx.compute_txid();
-    let mut found_match = false;
-
-    for (vout, output) in tx.output.iter().enumerate() {
-        let is_p2tr = output.script_pubkey.is_p2tr();
-        let amount = output.value.to_sat();
-        let in_range = amount >= size_min && amount <= size_max;
-
-        if is_p2tr && in_range {
-            tracing::info!("✅ Candidate match: {}:{} ({} sats, range {}-{})",
-                txid, vout, amount, size_min, size_max);
-            found_match = true;
-        } else if is_p2tr {
-            tracing::debug!("⏭️  Skipping P2TR output {}:{} ({} sats, out of range {}-{})",
-                txid, vout, amount, size_min, size_max);
-        }
-    }
-
-    found_match
-}
-
 /// Information about a key tweak applied to create a SNICKER output
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TweakInfo {

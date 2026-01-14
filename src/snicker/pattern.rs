@@ -13,6 +13,8 @@ use bdk_wallet::bitcoin::Transaction;
 /// - 1 output with different value (proposer's change)
 ///
 /// Note: Output ordering is not considered as it is randomized.
+/// 
+/// TODO: this ignores the possibility of no-change, which is not zero probability.
 pub fn is_likely_snicker_transaction(tx: &Transaction) -> bool {
     // Must have at least 2 inputs and exactly 3 outputs
     if tx.input.len() < 2 || tx.output.len() != 3 {
