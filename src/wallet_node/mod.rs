@@ -1702,7 +1702,7 @@ impl WalletNode {
                 tracing::warn!("    This could mean:");
                 tracing::warn!("    • UTXO older than our scan window");
                 tracing::warn!("    • UTXO doesn't exist (fake)");
-                tracing::warn!("    • UTXO < 5000 sats (below our filter)");
+                tracing::warn!("    • UTXO < {} sats (below our filter)", crate::config::MIN_UTXO_SIZE);
 
                 let config = crate::config::Config::load()?;
                 match config.partial_utxo_set.validation_mode {

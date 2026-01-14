@@ -324,9 +324,6 @@ impl Snicker {
     /// Returns the unsigned PSBT if validation passes - caller should sign and broadcast.
     /// If validation fails, returns an error.
     ///
-    /// The receiver never communicates back to the proposer - they simply choose
-    /// whether to broadcast the final transaction or not.
-    ///
     /// # Arguments
     /// * `proposal` - The SNICKER proposal to evaluate
     /// * `our_utxos` - Our wallet's UTXOs (for finding which input belongs to us)
@@ -421,16 +418,8 @@ impl Snicker {
         }
         let change_amount = Amount::from_sat(total_in.to_sat() - required_for_outputs_and_fee);
 
-        // Check if change is below dust limit (cannot create at all)
-        if change_amount.to_sat() < 546 {
-            return Err(anyhow::anyhow!(
-                "Insufficient proposer funds: change would be dust ({} sats)",
-                change_amount.to_sat()
-            ));
-        }
-
         // Build outputs vector - drop change if below min_change_output_size
-        let (outputs, actual_fee) = if change_amount.to_sat() < min_change_output_size {
+        let (mut outputs, actual_fee) = if change_amount.to_sat() < min_change_output_size {
             // Change is above dust but below min_change_output_size - drop it and bump fee
             tracing::info!(
                 "💸 Change output {} sats is below min_change_output_size {} sats - dropping and bumping miner fee",
@@ -482,7 +471,6 @@ impl Snicker {
 
         // Randomize output order for privacy
         let mut rng = rand::thread_rng();
-        let mut outputs = outputs; // Make mutable for shuffle
         outputs.shuffle(&mut rng);
 
         Ok((outputs, actual_fee))

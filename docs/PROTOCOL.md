@@ -21,9 +21,9 @@ This document describes the complete end-to-end SNICKER protocol as implemented 
 
 SNICKER enables two parties to create a coinjoin transaction without direct communication. The **proposer** (Bob) creates a partially-signed transaction proposal and encrypts it using the **receiver's** (Alice) public key. The receiver discovers and decrypts proposals meant for them, validates them, and decides whether to sign and broadcast.
 
-### Key Innovation: Recoverable Tweaks
+### Recoverable Tweaks
 
-This implementation uses the **proposer's input public key** (not an ephemeral key) for the SNICKER tweak. This critical design choice enables **wallet recovery from seed phrase alone** by allowing receivers to scan spent UTXOs and re-derive tweaked outputs.
+This implementation uses the **proposer's input public key** (not an ephemeral key) for the SNICKER tweak. This enables **wallet recovery from seed phrase alone** by allowing receivers to scan spent UTXOs and re-derive tweaked outputs.
 
 ### Non-Interactive Property
 
@@ -34,27 +34,32 @@ Once the proposer publishes an encrypted proposal:
 
 ---
 
-## Key Concepts
+## Concepts
 
 ### 1. BIP86 Taproot Wallets
 
-Both parties use BIP86 (keypath-only) Taproot wallets:
+BIP86 is not part of the *protocol* of course, but written here for completeness of technical review.
+
+P2TR/taproot *is* part of the protocol, since we scan for and agree on coinjoins with
+only this script type; this is for public tweaking.
+
+Wallets use BIP86 (keypath-only) Taproot wallets:
 - Derivation path: `m/86'/0'/0'/0/*` (external addresses)
 - Output format: P2TR (Pay-to-Taproot)
-- Internal key tweaked by: `output_key = internal_key + hash(internal_key)*G`
+- Internal key tweaked by: `output_key = internal_key + tagged_hash("TapTweak", internal_key || merkle_root) * G`
 
-### 2. Key Tweaking
+Note that here we describe taproot (BIP341)'s *own* tweaking.
+
+### 2. Further Key Tweaking
 
 SNICKER applies an additional tweak on top of the BIP86 taproot tweak:
 
 ```
-Step 1 (BIP86):  output_key = internal_key + taproot_tweak*G
+Step 1 (BIP86):  output_key = internal_key + taproot_tweak*G (simplified version)
 Step 2 (SNICKER): final_key = output_key + snicker_tweak*G
 ```
 
-Where:
-- `taproot_tweak = SHA256(tag || internal_key)` (BIP341)
-- `snicker_tweak = ECDH(proposer_input_seckey, receiver_output_pubkey)`
+Where `snicker_tweak = ECDH(proposer_input_seckey, receiver_output_pubkey)`
 
 ### 3. Separate Encryption vs. Tweak Keys
 
@@ -97,10 +102,7 @@ struct EncryptedProposal {
 }
 ```
 
-**Wire Format** (versioned):
-```
-[MAGIC: 4 bytes "SNIC"] [version: 1 byte] [encrypted_data]
-```
+**Serialization**: JSON (via serde)
 
 ---
 
@@ -177,12 +179,12 @@ let candidates = bob.scan_for_snicker_candidates(
 ).await?;
 ```
 
-**Candidate criteria**:
+**Candidate basic criteria**:
 - Output is P2TR (Taproot)
 - Value within specified range (e.g., 10k-150k sats)
 - Not already spent
 
-**Candidate source**: Candidates are queried on-demand from the **partial UTXO set** - a filtered set of P2TR outputs tracked from the wallet's creation block onwards. This eliminates the need for a separate candidates database.
+**Candidate sourcing**: Candidates are queried on-demand from the **partial UTXO set** - a filtered set of P2TR outputs tracked from the wallet's creation block onwards.
 
 ### Phase 3: Opportunity Finding (Proposer)
 
@@ -203,6 +205,12 @@ let opportunities = bob.find_snicker_opportunities(
 - Candidate UTXO age within scan window (for validation)
 - Sufficient funds to cover fees and create non-dust outputs
 - Candidate not already used in a pending proposal
+
+**Candidate prioritization**
+
+Even with the pre-mentioned amount filter and basic sanity checks, the number of possible candidates may be very large. For this reason, proposal creation **prioritizes utxos from transactions that fit the SNICKER pattern**. This is used as a signal that the candidate is exponentially more likely to accept the proposal, as it is likely using a SNICKER wallet (Ambient, or otherwise).
+
+A secondary prioritization filter is recency of creation of the candidate utxo.
 
 **Output**: List of `ProposalOpportunity` structs:
 ```rust
@@ -276,7 +284,7 @@ fees = total_in - total_out
 
 With delta=1000:
 - Alice pays: `alice_original - equal_output = delta = 1000` sats
-- Bob pays: remaining fees
+- Bob pays: remaining fees, so (network fee - delta)
 
 #### 4.4: Sign Proposer's Input
 
@@ -284,7 +292,7 @@ With delta=1000:
 // Bob signs his input (index 1) with his wallet
 wallet.sign(&mut psbt)?;
 
-// PSBT now has:
+// PSBT now has (e.g., remember randomization):
 // - Input 0 (Alice): unsigned
 // - Input 1 (Bob): signed ✓
 ```
