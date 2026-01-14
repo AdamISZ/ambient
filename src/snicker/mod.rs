@@ -45,7 +45,7 @@ mod validation_tests;
 use std::sync::{Arc, Mutex};
 use std::str::FromStr;
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use zeroize::Zeroizing;
 use bdk_wallet::{
     bitcoin::{Network, OutPoint, Transaction, TxOut, Txid, psbt::Psbt, secp256k1::PublicKey},
@@ -56,10 +56,6 @@ use serde::{Serialize, Deserialize};
 // ============================================================
 // SNICKER PROPOSAL VERSIONING
 // ============================================================
-
-/// Magic bytes identifying a SNICKER proposal: "SNIC" in ASCII
-/// Used to prevent false positives when scanning files/network data
-pub const SNICKER_MAGIC: [u8; 4] = [0x53, 0x4E, 0x49, 0x43];
 
 /// Current proposal format version
 pub const SNICKER_VERSION_V1: u8 = 0x01;
@@ -72,12 +68,6 @@ impl ProposalFlags {
     /// No flags set (current default)
     pub const NONE: u32 = 0x00000000;
 
-    // (Imaginary examples!) Reserved for future features:
-    // pub const FEATURE_RBF: u32           = 0x00000001; // Opt-in RBF
-    // pub const FEATURE_TAPROOT_ONLY: u32  = 0x00000002; // All inputs are Taproot
-    // pub const FEATURE_BATCH: u32         = 0x00000004; // Part of batch proposal
-    // pub const FEATURE_TIME_LOCKED: u32   = 0x00000008; // Contains time locks
-
     pub fn new(flags: u32) -> Self {
         ProposalFlags(flags)
     }
@@ -85,45 +75,6 @@ impl ProposalFlags {
     pub fn none() -> Self {
         ProposalFlags(Self::NONE)
     }
-}
-
-/// Validate proposal header (magic + version)
-/// Returns the version if valid, or an error
-pub fn validate_proposal_header(bytes: &[u8]) -> Result<u8> {
-    if bytes.len() < 5 {
-        return Err(anyhow!("Proposal too short (need at least 5 bytes for header)"));
-    }
-
-    // Check magic bytes
-    if &bytes[0..4] != SNICKER_MAGIC {
-        return Err(anyhow!(
-            "Invalid magic bytes: expected 'SNIC' (0x534E4943), got {:02x}{:02x}{:02x}{:02x}",
-            bytes[0], bytes[1], bytes[2], bytes[3]
-        ));
-    }
-
-    let version = bytes[4];
-
-    // Validate version
-    match version {
-        SNICKER_VERSION_V1 => Ok(version),
-        _ => Err(anyhow!("Unsupported proposal version: 0x{:02x}", version)),
-    }
-}
-
-/// Extract proposal blob (after magic+version header)
-pub fn extract_proposal_blob(bytes: &[u8]) -> Result<Vec<u8>> {
-    validate_proposal_header(bytes)?;
-    Ok(bytes[5..].to_vec())
-}
-
-/// Prepend magic+version to proposal blob for transmission/storage
-pub fn wrap_proposal_blob(version: u8, encrypted_data: &[u8]) -> Vec<u8> {
-    let mut wrapped = Vec::with_capacity(5 + encrypted_data.len());
-    wrapped.extend_from_slice(&SNICKER_MAGIC);
-    wrapped.push(version);
-    wrapped.extend_from_slice(encrypted_data);
-    wrapped
 }
 
 /// Information about a key tweak applied to create a SNICKER output
@@ -2280,81 +2231,6 @@ mod tests {
     // ============================================================
 
     #[test]
-    fn test_magic_bytes_constant() {
-        assert_eq!(SNICKER_MAGIC, [0x53, 0x4E, 0x49, 0x43]); // "SNIC"
-        assert_eq!(SNICKER_VERSION_V1, 0x01);
-    }
-
-    #[test]
-    fn test_validate_proposal_header_valid() {
-        let mut data = Vec::new();
-        data.extend_from_slice(&SNICKER_MAGIC);
-        data.push(SNICKER_VERSION_V1);
-        data.extend_from_slice(&[0xAA; 10]); // Some encrypted data
-
-        let result = validate_proposal_header(&data);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), SNICKER_VERSION_V1);
-    }
-
-    #[test]
-    fn test_validate_proposal_header_too_short() {
-        let data = vec![0x53, 0x4E, 0x49]; // Only 3 bytes
-        let result = validate_proposal_header(&data);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("too short"));
-    }
-
-    #[test]
-    fn test_validate_proposal_header_invalid_magic() {
-        let mut data = Vec::new();
-        data.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]); // Wrong magic
-        data.push(SNICKER_VERSION_V1);
-        data.extend_from_slice(&[0xAA; 10]);
-
-        let result = validate_proposal_header(&data);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Invalid magic bytes"));
-    }
-
-    #[test]
-    fn test_validate_proposal_header_unknown_version() {
-        let mut data = Vec::new();
-        data.extend_from_slice(&SNICKER_MAGIC);
-        data.push(0x99); // Unknown version
-        data.extend_from_slice(&[0xAA; 10]);
-
-        let result = validate_proposal_header(&data);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Unsupported proposal version"));
-    }
-
-    #[test]
-    fn test_extract_proposal_blob() {
-        let mut data = Vec::new();
-        data.extend_from_slice(&SNICKER_MAGIC);
-        data.push(SNICKER_VERSION_V1);
-        let encrypted_data = vec![0xAA, 0xBB, 0xCC, 0xDD];
-        data.extend_from_slice(&encrypted_data);
-
-        let result = extract_proposal_blob(&data);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), encrypted_data);
-    }
-
-    #[test]
-    fn test_wrap_proposal_blob() {
-        let encrypted_data = vec![0xAA, 0xBB, 0xCC, 0xDD];
-        let wrapped = wrap_proposal_blob(SNICKER_VERSION_V1, &encrypted_data);
-
-        // Should be: magic (4) + version (1) + data (4) = 9 bytes
-        assert_eq!(wrapped.len(), 9);
-        assert_eq!(&wrapped[0..4], &SNICKER_MAGIC);
-        assert_eq!(wrapped[4], SNICKER_VERSION_V1);
-        assert_eq!(&wrapped[5..], &encrypted_data[..]);
-    }
-
-    #[test]
     fn test_proposal_flags_creation() {
         let flags = ProposalFlags::none();
         assert_eq!(flags.0, 0x00000000);
@@ -2364,15 +2240,6 @@ mod tests {
 
         let flags = ProposalFlags(ProposalFlags::NONE);
         assert_eq!(flags.0, 0);
-    }
-
-    #[test]
-    fn test_round_trip_wrap_extract() {
-        let original_data = vec![0x01, 0x02, 0x03, 0x04, 0x05];
-        let wrapped = wrap_proposal_blob(SNICKER_VERSION_V1, &original_data);
-        let extracted = extract_proposal_blob(&wrapped).unwrap();
-
-        assert_eq!(extracted, original_data);
     }
 
     #[test]
