@@ -1813,13 +1813,13 @@ fn test_build_equal_outputs_insufficient_funds() {
         vout: 0,
     };
 
-    // Proposer has barely enough to cover one equal output (insufficient!)
-    // Total in: 100,000 + 98,500 = 198,500
+    // Proposer doesn't have enough to cover outputs + fee
+    // Total in: 100,000 + 98,000 = 198,000
     // Total out: 99,000 + 99,000 = 198,000
-    // Fee: ~410 sats
-    // Change: 198,500 - 198,000 - 410 = 90 sats (below 546 dust limit!)
+    // Fee (3-output estimate): ~490 sats
+    // Required: 198,000 + 490 = 198,490 > 198,000 total_in → insufficient!
     let proposer_txout = TxOut {
-        value: Amount::from_sat(98_900), // Change: 198,900-198,000-410 = 490 sats (below 546)
+        value: Amount::from_sat(98_000),
         script_pubkey: ScriptBuf::new_p2tr(&secp, proposer_key, None),
     };
 
