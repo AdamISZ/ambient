@@ -1397,8 +1397,9 @@ impl Snicker {
         db::delete_pairings_for_our_utxo(conn, our_txid, our_vout)
     }
 
-    /// Stale proposal timeout: 144 blocks ≈ 24 hours
-    pub const STALE_PAIRING_TIMEOUT_SECS: u64 = 86400; // 24 hours
+    /// Stale proposal timeout: ~3 blocks ≈ 30 minutes
+    /// Note: Aggressive for signet testing; consider 86400 (24h) for mainnet
+    pub const STALE_PAIRING_TIMEOUT_SECS: u64 = 1800; // 30 minutes
 
     /// Mark stale proposals as expired
     /// Returns number of proposals marked stale

@@ -21,12 +21,12 @@
 //! - Strong password (user responsibility)
 //! - Memory-hard KDF (Argon2id with 16MB memory, 1 iteration)
 //!
-//! ## TODOs for v2
+//! ## TODOs
 //! - [ ] Password strength validation/enforcement
 //! - [ ] Per-spending-event decryption
 //! - [ ] Password change functionality
-//! - [ ] In-memory database decryption
-//! - [ ] Secure memory zeroing (zeroize crate)
+//! - [x] In-memory database decryption (databases load into :memory: SQLite)
+//! - [ ] Secure memory zeroing for password-derived encryption keys (bitcoin keys use zeroize, encryption keys don't)
 
 use anyhow::{anyhow, Result};
 use argon2::{

@@ -671,11 +671,12 @@ pub fn delete_pairings_for_our_utxo(conn: &Connection, our_txid: &str, our_vout:
     updated
 }
 
-/// Cleanup stale pairings (older than 24 hours)
+/// Cleanup stale pairings (older than 30 minutes)
+/// Note: Aggressive timeout for signet testing; consider increasing for mainnet
 pub fn cleanup_stale_pairings(conn: &Connection) -> Result<usize> {
     let cutoff = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
-        .as_secs() as i64 - 86400; // 24 hours
+        .as_secs() as i64 - 1800; // 30 minutes (signet); consider 86400 (24h) for mainnet
 
     let deleted = conn.execute(
         "DELETE FROM decrypted_proposals WHERE status = 'pending' AND created_at < ?",

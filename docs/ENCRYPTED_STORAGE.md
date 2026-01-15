@@ -48,9 +48,9 @@ All three files are encrypted using **ChaCha20-Poly1305** with keys derived from
 **Algorithm:** ChaCha20-Poly1305 AEAD (Authenticated Encryption with Associated Data)
 
 **Key Derivation:** Argon2id
-- Memory: 64 MB (65536 KB)
-- Iterations: 3
-- Parallelism: 4 threads
+- Memory: 16 MB (16384 KB)
+- Iterations: 1
+- Parallelism: 1 thread
 - Output: 32 bytes (256 bits)
 
 **File Format:**
@@ -92,7 +92,7 @@ witch collapse practice feed shame open despair creek road again ice least
 **Security:**
 - 128 bits of entropy
 - Derivation path: BIP86 (Taproot)
-- Used to derive all wallet keys
+- Used to derive all vanilla (non-snicker) wallet keys
 
 ---
 
@@ -126,7 +126,7 @@ Wallet descriptors for key derivation.
 
 **Purpose:** Stores SNICKER-specific transaction data, proposals, and automation state
 
-This database contains three main tables (plus partial_utxo_set managed separately):
+This database contains seven tables (plus partial_utxo_set managed separately):
 
 **Note:** Candidate scanning has been eliminated - candidates are now queried on-demand from the `partial_utxo_set` database which is maintained separately from the encrypted SNICKER database.
 
@@ -155,6 +155,7 @@ CREATE TABLE decrypted_proposals (
 CREATE INDEX idx_decrypted_status ON decrypted_proposals(status);
 CREATE INDEX idx_decrypted_delta ON decrypted_proposals(delta_sats);
 CREATE INDEX idx_utxo_pair ON decrypted_proposals(our_utxo, counterparty_utxo, role, status);
+CREATE INDEX idx_decrypted_our_utxo ON decrypted_proposals(our_utxo);
 ```
 
 **Columns:**
@@ -162,7 +163,7 @@ CREATE INDEX idx_utxo_pair ON decrypted_proposals(our_utxo, counterparty_utxo, r
 - `psbt` - Partially Signed Bitcoin Transaction (serialized)
 - `tweak_info` - Cryptographic tweak data for proposal
 - `role` - Either "proposer" or "receiver"
-- `status` - Current state: "pending", "accepted", "rejected", "broadcast", "confirmed"
+- `status` - Current state: "pending", "accepted", "rejected", "broadcast", "confirmed", "target_spent", "our_utxo_spent"
 - `our_utxo` - Our UTXO in format "txid:vout"
 - `counterparty_utxo` - Counterparty UTXO in format "txid:vout"
 - `delta_sats` - Net change in satoshis (positive = gain, negative = loss)
@@ -173,13 +174,19 @@ CREATE INDEX idx_utxo_pair ON decrypted_proposals(our_utxo, counterparty_utxo, r
 **Status Flow:**
 ```
 pending → accepted → broadcast → confirmed
-        ↘ rejected
+   │    ↘ rejected
+   │
+   ├──→ target_spent    (counterparty's UTXO spent by different tx)
+   └──→ our_utxo_spent  (our UTXO spent - coinjoin completed or conflict)
+
+Stale pending proposals are periodically cleaned up (deleted).
 ```
 
 **Indexes:**
 - `idx_decrypted_status` - Fast filtering by status
 - `idx_decrypted_delta` - Fast filtering by profitability
 - `idx_utxo_pair` - Fast lookups by UTXO combination
+- `idx_decrypted_our_utxo` - Fast lookups by our UTXO
 
 ---
 
@@ -197,12 +204,12 @@ CREATE TABLE snicker_utxos (
     tweaked_privkey BLOB NOT NULL,
     snicker_shared_secret BLOB NOT NULL,
     block_height INTEGER,
-    spent BOOLEAN DEFAULT 0,
+    status TEXT DEFAULT 'unspent',
     spent_in_txid TEXT,
     PRIMARY KEY (txid, vout)
 );
 
-CREATE INDEX idx_snicker_utxos_spent ON snicker_utxos(spent);
+CREATE INDEX idx_snicker_utxos_status ON snicker_utxos(status);
 ```
 
 **Columns:**
@@ -213,16 +220,16 @@ CREATE INDEX idx_snicker_utxos_spent ON snicker_utxos(spent);
 - `tweaked_privkey` - Private key after ECDH tweak (32 bytes, encrypted)
 - `snicker_shared_secret` - ECDH shared secret (32 bytes, encrypted)
 - `block_height` - Block where UTXO was confirmed (NULL if unconfirmed)
-- `spent` - Whether UTXO has been spent (0 or 1)
+- `status` - UTXO status: "unspent", "spent", or "pending_spend"
 - `spent_in_txid` - Transaction that spent this UTXO (NULL if unspent)
 
-**Critical Security Note:**
-- `tweaked_privkey` and `snicker_shared_secret` are **highly sensitive**
-- Database encryption is essential
-- Required to spend SNICKER UTXOs
+**Note:**
+`tweaked_privkey` and `snicker_shared_secret` are funds-controlling secrets, hence encryption is needed.
+
+Also the data in this table is required to spend these utxos - see SNICKER_RECOVERY.md for more on this.
 
 **Indexes:**
-- `idx_snicker_utxos_spent` - Fast filtering of unspent UTXOs
+- `idx_snicker_utxos_status` - Fast filtering by status
 
 ---
 
@@ -267,9 +274,90 @@ CREATE INDEX idx_automation_log_action ON automation_log(action_type, timestamp)
 
 ---
 
+#### Table: `pending_transactions`
+
+**Purpose:** Tracks transactions that have been broadcast but not yet confirmed.
+
+**Schema:**
+```sql
+CREATE TABLE pending_transactions (
+    txid TEXT PRIMARY KEY,
+    broadcast_time INTEGER NOT NULL,
+    total_input_sats INTEGER NOT NULL,
+    total_output_sats INTEGER NOT NULL,
+    fee_sats INTEGER NOT NULL
+);
+```
+
+**Columns:**
+- `txid` - Transaction ID (primary key)
+- `broadcast_time` - Unix timestamp when transaction was broadcast
+- `total_input_sats` - Sum of all input values
+- `total_output_sats` - Sum of all output values
+- `fee_sats` - Transaction fee (inputs - outputs)
+
+---
+
+#### Table: `pending_inputs`
+
+**Purpose:** Tracks which UTXOs are being spent by pending (unconfirmed) transactions.
+
+**Schema:**
+```sql
+CREATE TABLE pending_inputs (
+    spending_txid TEXT NOT NULL,
+    spent_txid TEXT NOT NULL,
+    spent_vout INTEGER NOT NULL,
+    amount_sats INTEGER NOT NULL,
+    is_ours INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (spent_txid, spent_vout),
+    FOREIGN KEY (spending_txid) REFERENCES pending_transactions(txid) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_pending_inputs_spending_txid ON pending_inputs(spending_txid);
+```
+
+**Columns:**
+- `spending_txid` - Transaction ID of the spending transaction
+- `spent_txid` - Transaction ID of the UTXO being spent
+- `spent_vout` - Output index of the UTXO being spent
+- `amount_sats` - Amount of the UTXO in satoshis
+- `is_ours` - Whether this is our UTXO (1) or counterparty's (0)
+
+**Indexes:**
+- `idx_pending_inputs_spending_txid` - Find all inputs for a pending transaction
+
+---
+
+#### Table: `automation_state`
+
+**Purpose:** Persists the automation mode (proposer/receiver) and related state across restarts.
+
+**Schema:**
+```sql
+CREATE TABLE automation_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    mode TEXT NOT NULL DEFAULT 'proposer',
+    last_coinjoin_height INTEGER NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL
+);
+```
+
+**Columns:**
+- `id` - Always 1 (singleton table)
+- `mode` - Current automation mode: "proposer" or "receiver"
+- `last_coinjoin_height` - Block height of last successful coinjoin
+- `updated_at` - Unix timestamp of last state change
+
+**Note:** The `CHECK (id = 1)` constraint ensures only one row exists (singleton pattern).
+
+---
+
 #### Table: `transaction_history`
 
-**Purpose:** Records all confirmed transactions affecting the wallet balance, providing a complete audit log for user accounting.
+**Purpose:** Records all confirmed transactions affecting the wallet balance.
+
+This is for auditing/tracking by users; it's not required for wallet functionality.
 
 **Schema:**
 ```sql
@@ -362,7 +450,7 @@ CREATE INDEX idx_partial_utxo_tx_type ON partial_utxo_set(transaction_type);
 
 **Usage:**
 - Automatically populated during blockchain scanning
-- Filters: P2TR outputs ≥ 5000 sats
+- Filters: P2TR outputs ≥ 3000 sats (MIN_UTXO_SIZE)
 - Tracks spent status in real-time
 - Used for SNICKER candidate discovery (on-demand queries)
 - Provides trustless validation of proposer UTXOs
@@ -489,29 +577,14 @@ cp /backup/*.enc ~/.local/share/ambient/mainnet/mywallet/
 ### Password Strength
 
 - **Minimum:** 12+ characters recommended
-- **Lost password = lost wallet** - no recovery mechanism
-- Argon2id intentionally slow (~2 seconds) to resist brute force
+- **Lost password = lost wallet** - no recovery mechanism yet (see SNICKER_RECOVERY.md).
 
 ### Database Encryption
 
 - **All sensitive data encrypted at rest**
 - Plaintext only exists in RAM
-- Memory not zeroed on drop (TODO: use zeroize crate)
-
-### SNICKER-Specific Risks
-
-1. **`snicker_utxos` table contains spending keys**
-   - Database encryption is critical
-   - Losing `snicker.sqlite.enc` = losing access to SNICKER UTXOs
-   - Mnemonic alone cannot recover SNICKER UTXOs
-
-2. **Proposal replay protection**
-   - `tag` field ensures unique proposals
-   - Prevents double-spending via same proposal
-
-3. **Automation safety**
-   - `automation_log` provides audit trail
-   - Review logs for unexpected automated actions
+- Bitcoin private keys use `zeroize` crate for secure memory zeroing; but see #1 for more on this
+- Password-derived encryption keys not yet zeroized (TODO)
 
 ## Testing
 
@@ -522,22 +595,3 @@ Test databases use unencrypted file-based SQLite:
 let conn = Connection::open(&temp_db_path)?;
 Snicker::init_snicker_db(&mut conn)?;
 ```
-
-Production always uses encrypted in-memory databases.
-
-## Future Enhancements (v2)
-
-- [ ] Password change functionality (re-encrypt all three files)
-- [ ] Database migration system for schema upgrades
-- [ ] Per-spending-event decryption (decrypt only needed SNICKER UTXO keys)
-- [ ] Secure memory zeroing with `zeroize` crate
-- [ ] Database integrity checks on load
-- [ ] Optional cloud backup with client-side encryption
-- [ ] Multi-signature support for SNICKER proposals
-
-## References
-
-- **BDK:** https://bitcoindevkit.org/
-- **SNICKER Protocol:** See `docs/PROTOCOL.md`
-- **Encryption Implementation:** See `src/encryption.rs`
-- **Database Initialization:** See `src/snicker/mod.rs` (lines 824-931)

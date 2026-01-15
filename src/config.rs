@@ -13,7 +13,7 @@ use std::fs;
 /// 1. Minimum change output size - change below this is dropped and added to miner fee
 /// 2. Minimum tracked UTXO size - partial_utxo_set only stores UTXOs >= this amount
 ///
-/// At 3000 sats, outputs are economically spendable even in moderate fee environments.
+/// At 3000 sats, outputs are economically spendable even in higher fee environments.
 /// NOT user-configurable to prevent inconsistency between change creation and UTXO tracking.
 pub const MIN_UTXO_SIZE: u64 = 3000;
 
@@ -95,6 +95,7 @@ pub enum AutomationMode {
     /// Disabled - no automation
     Disabled,
     /// Basic mode - automatically accept receiver proposals only
+    /// This is currently unused.
     Basic,
     /// Advanced mode - accept receiver proposals AND create proposer proposals
     Advanced,
@@ -269,13 +270,13 @@ pub struct SnickerAutomation {
     pub snicker_pattern_only: bool,
 
     /// Number of outstanding proposals to maintain in Proposer mode
-    /// Default: 5 (aggressive for bootstrapping new ecosystem)
+    /// Default: 15
     #[serde(default = "default_outstanding_proposals")]
     pub outstanding_proposals: u32,
 
     /// Timeout window in blocks before reroll in Receiver mode
     /// If no coinjoin occurs within this many blocks, flip coin again
-    /// Default: 144 blocks (~1 day)
+    /// Default: 25 blocks (~4 hours)
     #[serde(default = "default_receiver_timeout_blocks")]
     pub receiver_timeout_blocks: u32,
 }
@@ -539,14 +540,16 @@ fn default_snicker_pattern_only() -> bool {
     false
 }
 
-/// Get the default number of outstanding proposals to maintain (5)
+/// Get the default number of outstanding proposals to maintain
+/// Note: Aggressive (15) for signet testing; consider 5 for mainnet
 fn default_outstanding_proposals() -> u32 {
-    5
+    15
 }
 
-/// Get the default receiver timeout in blocks (144 = ~1 day)
+/// Get the default receiver timeout in blocks
+/// Note: Aggressive (25 = ~4h) for signet testing; consider 144 (~1 day) for mainnet
 fn default_receiver_timeout_blocks() -> u32 {
-    144
+    25
 }
 
 /// Get the default Nostr relays
