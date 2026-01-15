@@ -191,7 +191,7 @@ impl WalletNode {
     }
 
     /// Send funds with automatic fee estimation (6-block target)
-    ///
+    /// See comment in calling function re: why this is not used in normal workflow.
     /// Estimates optimal fee rate from mempool.space (or static defaults for regtest).
     /// Returns error if estimation fails - user must specify manual fee rate.
     pub async fn send_to_address_auto(&self, address_str: &str, amount_sats: u64) -> Result<Txid> {
@@ -216,8 +216,13 @@ impl WalletNode {
         amount_sats: u64,
         fee_rate_sat_vb: f32,
     ) -> Result<Txid> {
-        // Enforce minimum fee rate to ensure transaction is accepted
-        let fee_rate_sat_vb = fee_rate_sat_vb.max(crate::MIN_FEE_RATE_SAT_VB);
+        // Reject fee rates below minimum - caller should validate and inform user
+        if fee_rate_sat_vb < crate::MIN_FEE_RATE_SAT_VB {
+            return Err(anyhow::anyhow!(
+                "Fee rate {:.1} sat/vB is below minimum {:.1} sat/vB",
+                fee_rate_sat_vb, crate::MIN_FEE_RATE_SAT_VB
+            ));
+        }
 
         // Use hybrid approach: SNICKER UTXOs first, then regular UTXOs as needed
         info!("💰 Using hybrid UTXO selection (SNICKER + regular as needed)");

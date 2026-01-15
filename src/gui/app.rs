@@ -1344,7 +1344,17 @@ impl AmbientApp {
                                 });
                                 return Task::none();
                             }
-                            rate.max(crate::MIN_FEE_RATE_SAT_VB)
+                            if rate < crate::MIN_FEE_RATE_SAT_VB {
+                                self.active_modal = Some(Modal::Error {
+                                    title: "Fee Rate Too Low".to_string(),
+                                    message: format!(
+                                        "Fee rate {:.1} sat/vB is below minimum {:.1} sat/vB",
+                                        rate, crate::MIN_FEE_RATE_SAT_VB
+                                    ),
+                                });
+                                return Task::none();
+                            }
+                            rate
                         }
                         Err(_) => {
                             self.active_modal = Some(Modal::Error {

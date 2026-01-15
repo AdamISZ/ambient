@@ -897,6 +897,7 @@ impl WalletNode {
                     }
 
                     // Record any new confirmed wallet transactions to transaction history
+                    // NOTE: Transactions with SNICKER inputs are handled in step 7c with correct balance
                     {
                         use bdk_wallet::bitcoin::consensus::encode::serialize_hex;
                         let snicker_conn_guard = snicker_conn.lock().unwrap();
@@ -909,6 +910,24 @@ impl WalletNode {
 
                                 // Skip if already recorded
                                 if crate::snicker::db::is_transaction_recorded(&snicker_conn_guard, &txid_str) {
+                                    continue;
+                                }
+
+                                // Skip if transaction has SNICKER inputs - will be handled in step 7c
+                                // with correct balance calculation (BDK can't see SNICKER input amounts)
+                                let has_snicker_inputs = canonical_tx.tx_node.tx.input.iter().any(|input| {
+                                    let outpoint = input.previous_output;
+                                    crate::snicker::db::is_snicker_utxo(
+                                        &snicker_conn_guard,
+                                        &outpoint.txid.to_string(),
+                                        outpoint.vout,
+                                    )
+                                });
+                                if has_snicker_inputs {
+                                    tracing::debug!(
+                                        "Skipping BDK recording for {} - has SNICKER inputs, will handle in block scan",
+                                        txid_str
+                                    );
                                     continue;
                                 }
 
@@ -1102,44 +1121,124 @@ impl WalletNode {
 
                                 // Check if any inputs in this block spend our SNICKER UTXOs
                                 // Do this BEFORE updating partial UTXO set for efficiency
+                                // Also record transactions with SNICKER involvement using correct balance
                                 for tx in &indexed_block.block.txdata {
+                                    use bdk_wallet::bitcoin::consensus::encode::serialize_hex;
                                     let spending_txid = tx.compute_txid();
+                                    let spending_txid_str = spending_txid.to_string();
+
+                                    // Collect all SNICKER inputs for this transaction
+                                    let mut snicker_input_total: u64 = 0;
+                                    let mut has_snicker_inputs = false;
 
                                     for input in &tx.input {
                                         let outpoint = input.previous_output;
+                                        let outpoint_txid_str = outpoint.txid.to_string();
 
-                                        // Check if this input spends a SNICKER UTXO
-                                        let is_snicker_spend: bool = {
+                                        // Check if this input spends a SNICKER UTXO and get amount
+                                        let snicker_amount: Option<u64> = {
                                             let conn = snicker_conn.lock().unwrap();
                                             conn.query_row(
-                                                "SELECT 1 FROM snicker_utxos WHERE txid = ?1 AND vout = ?2 AND status IN ('unspent', 'pending')",
-                                                (&outpoint.txid.to_string(), outpoint.vout),
-                                                |_| Ok(true),
-                                            ).is_ok()
+                                                "SELECT amount FROM snicker_utxos WHERE txid = ?1 AND vout = ?2 AND status IN ('unspent', 'pending')",
+                                                (&outpoint_txid_str, outpoint.vout),
+                                                |row| row.get(0),
+                                            ).ok()
                                         };
 
-                                        if is_snicker_spend {
-                                            tracing::info!("🔍 SNICKER UTXO {}:{} spent in {} at height {}",
-                                                outpoint.txid, outpoint.vout, spending_txid, scan_height);
+                                        if let Some(amount) = snicker_amount {
+                                            has_snicker_inputs = true;
+                                            snicker_input_total += amount;
+
+                                            tracing::info!("🔍 SNICKER UTXO {}:{} ({} sats) spent in {} at height {}",
+                                                outpoint.txid, outpoint.vout, amount, spending_txid, scan_height);
 
                                             // Mark as spent in SNICKER database
                                             {
                                                 let conn = snicker_conn.lock().unwrap();
                                                 if let Err(e) = conn.execute(
                                                     "UPDATE snicker_utxos SET status = 'spent', spent_in_txid = ? WHERE txid = ? AND vout = ?",
-                                                    (spending_txid.to_string(), outpoint.txid.to_string(), outpoint.vout),
+                                                    (&spending_txid_str, &outpoint_txid_str, outpoint.vout),
                                                 ) {
                                                     tracing::error!("Failed to mark SNICKER UTXO as spent: {}", e);
                                                 } else {
                                                     tracing::info!("✅ Marked SNICKER UTXO {}:{} as SPENT in {}",
                                                         outpoint.txid, outpoint.vout, spending_txid);
-
-                                                    // Flush to encrypted file after UTXO status change
-                                                    if let Err(e) = snicker_db.flush(&*conn) {
-                                                        tracing::error!("Failed to flush SNICKER database: {}", e);
-                                                    }
                                                 }
                                             }
+                                        }
+                                    }
+
+                                    // If this transaction has SNICKER inputs, record it with correct balance
+                                    if has_snicker_inputs {
+                                        // Check if this is a coinjoin (already handled by coinjoin detection)
+                                        let is_coinjoin = {
+                                            let conn = snicker_conn.lock().unwrap();
+                                            crate::snicker::db::get_coinjoin_role(&conn, &spending_txid_str)
+                                                .ok()
+                                                .flatten()
+                                                .is_some()
+                                        };
+
+                                        if !is_coinjoin {
+                                            // Get BDK's view of sent/received (may miss SNICKER components)
+                                            let wallet_guard = wallet.lock().await;
+                                            let (bdk_sent, bdk_received) = wallet_guard.sent_and_received(tx);
+                                            drop(wallet_guard);
+
+                                            // Get SNICKER outputs in this transaction (outputs we'll receive)
+                                            let snicker_output_total = {
+                                                let conn = snicker_conn.lock().unwrap();
+                                                crate::snicker::db::get_snicker_outputs_amount(&conn, &spending_txid_str)
+                                            };
+
+                                            // Calculate true balance change:
+                                            // (what we received) - (what we spent)
+                                            let total_received = bdk_received.to_sat() + snicker_output_total;
+                                            let total_sent = bdk_sent.to_sat() + snicker_input_total;
+                                            let balance_change = total_received as i64 - total_sent as i64;
+
+                                            let tx_type = if balance_change >= 0 { "receive" } else { "send" };
+
+                                            tracing::info!(
+                                                "📝 Recording SNICKER-involved tx {}: BDK sent={}, BDK recv={}, SNICKER in={}, SNICKER out={}, balance={}",
+                                                &spending_txid_str[..8], bdk_sent.to_sat(), bdk_received.to_sat(),
+                                                snicker_input_total, snicker_output_total, balance_change
+                                            );
+
+                                            // Record or update the transaction
+                                            let conn = snicker_conn.lock().unwrap();
+                                            let tx_hex = serialize_hex(tx);
+                                            let timestamp = std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .map(|d| d.as_secs())
+                                                .unwrap_or(0);
+
+                                            // Try to update existing record first (BDK may have recorded it wrong)
+                                            let updated = crate::snicker::db::update_transaction_balance(
+                                                &conn, &spending_txid_str, balance_change, tx_type
+                                            ).unwrap_or(false);
+
+                                            if !updated {
+                                                // No existing record, insert new one
+                                                if let Err(e) = crate::snicker::db::record_transaction(
+                                                    &conn,
+                                                    &spending_txid_str,
+                                                    &tx_hex,
+                                                    balance_change,
+                                                    tx_type,
+                                                    scan_height,
+                                                    timestamp,
+                                                ) {
+                                                    tracing::error!("Failed to record SNICKER tx {}: {}", spending_txid_str, e);
+                                                }
+                                            }
+                                            drop(conn);
+                                        }
+
+                                        // Flush after processing SNICKER spends
+                                        let conn = snicker_conn.lock().unwrap();
+                                        if let Err(e) = snicker_db.flush(&*conn) {
+                                            tracing::error!("Failed to flush SNICKER database: {}", e);
                                         }
                                     }
                                 }

@@ -989,6 +989,56 @@ pub fn update_transaction_type(conn: &Connection, txid: &str, tx_type: &str) -> 
     Ok(())
 }
 
+/// Update balance and type for an existing transaction record
+/// Used when SNICKER spend detection provides more accurate balance than BDK's view
+pub fn update_transaction_balance(
+    conn: &Connection,
+    txid: &str,
+    balance_change_sats: i64,
+    tx_type: &str,
+) -> Result<bool> {
+    let rows_updated = conn.execute(
+        "UPDATE transaction_history SET balance_change_sats = ?, tx_type = ? WHERE txid = ?",
+        (balance_change_sats, tx_type, txid),
+    )?;
+    if rows_updated > 0 {
+        tracing::debug!(
+            "Updated transaction {} balance to {} sats, type={}",
+            txid, balance_change_sats, tx_type
+        );
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+/// Check if a transaction input is a SNICKER UTXO
+pub fn is_snicker_utxo(conn: &Connection, txid: &str, vout: u32) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM snicker_utxos WHERE txid = ? AND vout = ?",
+        (txid, vout),
+        |_| Ok(true),
+    ).unwrap_or(false)
+}
+
+/// Get the amount of a SNICKER UTXO
+pub fn get_snicker_utxo_amount(conn: &Connection, txid: &str, vout: u32) -> Option<u64> {
+    conn.query_row(
+        "SELECT amount FROM snicker_utxos WHERE txid = ? AND vout = ?",
+        (txid, vout),
+        |row| row.get(0),
+    ).ok()
+}
+
+/// Get total SNICKER output amount for a transaction (outputs we received)
+pub fn get_snicker_outputs_amount(conn: &Connection, spending_txid: &str) -> u64 {
+    conn.query_row(
+        "SELECT COALESCE(SUM(amount), 0) FROM snicker_utxos WHERE txid = ?",
+        [spending_txid],
+        |row| row.get::<_, i64>(0),
+    ).unwrap_or(0) as u64
+}
+
 /// Get all transaction history entries
 pub fn get_transaction_history(conn: &Connection) -> Result<Vec<TransactionHistoryEntry>> {
     let mut stmt = conn.prepare(

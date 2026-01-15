@@ -177,8 +177,9 @@ impl Manager {
     }
 
     /// Send to address with automatic fee estimation (6-block target)
-    ///
     /// Returns error if fee estimation fails - user must specify manual fee rate.
+    /// This is not used in normal workflow; user must specify fee rate since
+    /// this can have poor privacy.
     pub async fn send_to_address_auto(
         &self,
         address_str: &str,
