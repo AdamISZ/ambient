@@ -87,32 +87,8 @@ impl AmbientApp {
             iced::Subscription::none()
         };
 
-        // Status bar subscription - polls the tracing status channel
-        let status_sub = iced::Subscription::run_with_id(
-            "status_updates",
-            iced::futures::stream::unfold(
-                crate::gui::take_status_receiver(),
-                |receiver_opt| async move {
-                    let receiver = receiver_opt?;
-
-                    // Poll at 100ms intervals
-                    async_std::task::sleep(Duration::from_millis(100)).await;
-
-                    // Try to get the latest message (drain older ones)
-                    let mut latest_msg = None;
-                    while let Ok(msg) = receiver.try_recv() {
-                        latest_msg = Some(msg);
-                    }
-
-                    match latest_msg {
-                        Some(msg) => Some((Message::StatusUpdate(msg), Some(receiver))),
-                        None => Some((Message::Placeholder, Some(receiver))),
-                    }
-                }
-            )
-        );
-
         // Only subscribe to events when wallet is loaded
+        // Note: Status bar updates come via WalletUpdate.status_message, not tracing
         match &self.state {
             AppState::WalletLoaded { manager, wallet_data, .. } => {
                 // Event-driven blockchain update subscription
@@ -173,9 +149,9 @@ impl AmbientApp {
                 };
 
                 // Combine subscriptions
-                iced::Subscription::batch([balance_sub, automation_sub, keyboard_sub, status_sub])
+                iced::Subscription::batch([balance_sub, automation_sub, keyboard_sub])
             }
-            _ => iced::Subscription::batch([keyboard_sub, status_sub])
+            _ => keyboard_sub
         }
     }
 
@@ -1316,11 +1292,17 @@ impl AmbientApp {
 
                     // Basic validation
                     if address.is_empty() {
-                        eprintln!("❌ Address cannot be empty");
+                        self.active_modal = Some(Modal::Error {
+                            title: "Invalid Address".to_string(),
+                            message: "Address cannot be empty".to_string(),
+                        });
                         return Task::none();
                     }
                     if amount_str.is_empty() {
-                        eprintln!("❌ Amount cannot be empty");
+                        self.active_modal = Some(Modal::Error {
+                            title: "Invalid Amount".to_string(),
+                            message: "Amount cannot be empty".to_string(),
+                        });
                         return Task::none();
                     }
 
@@ -1328,13 +1310,26 @@ impl AmbientApp {
                     let amount_sats = match amount_str.parse::<f64>() {
                         Ok(btc) => {
                             if btc <= 0.0 {
-                                eprintln!("❌ Amount must be positive");
+                                self.active_modal = Some(Modal::Error {
+                                    title: "Invalid Amount".to_string(),
+                                    message: "Amount must be positive".to_string(),
+                                });
+                                return Task::none();
+                            }
+                            if btc > 21_000_000.0 {
+                                self.active_modal = Some(Modal::Error {
+                                    title: "Invalid Amount".to_string(),
+                                    message: "Amount too large - did you enter sats instead of BTC?".to_string(),
+                                });
                                 return Task::none();
                             }
                             (btc * 100_000_000.0) as u64
                         }
                         Err(_) => {
-                            eprintln!("❌ Invalid amount: {}", amount_str);
+                            self.active_modal = Some(Modal::Error {
+                                title: "Invalid Amount".to_string(),
+                                message: format!("Could not parse '{}' as a BTC amount", amount_str),
+                            });
                             return Task::none();
                         }
                     };
@@ -1343,13 +1338,19 @@ impl AmbientApp {
                     let fee_rate = match fee_rate_str.parse::<f32>() {
                         Ok(rate) => {
                             if rate <= 0.0 {
-                                eprintln!("❌ Fee rate must be positive");
+                                self.active_modal = Some(Modal::Error {
+                                    title: "Invalid Fee Rate".to_string(),
+                                    message: "Fee rate must be positive".to_string(),
+                                });
                                 return Task::none();
                             }
                             rate.max(crate::MIN_FEE_RATE_SAT_VB)
                         }
                         Err(_) => {
-                            eprintln!("❌ Invalid fee rate: {}", fee_rate_str);
+                            self.active_modal = Some(Modal::Error {
+                                title: "Invalid Fee Rate".to_string(),
+                                message: format!("Could not parse '{}' as a fee rate", fee_rate_str),
+                            });
                             return Task::none();
                         }
                     };
@@ -1393,7 +1394,10 @@ impl AmbientApp {
                         Task::done(Message::SyncRequested)
                     }
                     Err(e) => {
-                        eprintln!("❌ Failed to send transaction: {}", e);
+                        self.active_modal = Some(Modal::Error {
+                            title: "Transaction Failed".to_string(),
+                            message: e,
+                        });
                         Task::none()
                     }
                 }
@@ -1884,7 +1888,8 @@ impl AmbientApp {
             }
 
             Message::StatusUpdate(msg) => {
-                // Update status bar with latest tracing message
+                // Explicit status bar update (for user-facing messages)
+                // Note: Primary status comes from WalletUpdate.status_message
                 if let AppState::WalletLoaded { wallet_data, .. } = &mut self.state {
                     wallet_data.status_message = Some(msg);
                 }

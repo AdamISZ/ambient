@@ -36,6 +36,12 @@ pub enum Modal {
         receiver_output_value: u64,
         delta: i64,
     },
+
+    /// Error dialog
+    Error {
+        title: String,
+        message: String,
+    },
 }
 
 /// Steps in the wallet generation wizard
@@ -132,6 +138,9 @@ impl Modal {
                     *receiver_output_value,
                     *delta,
                 )
+            }
+            Modal::Error { title, message } => {
+                crate::gui::views::modals::error_dialog::view(title, message)
             }
         }
     }

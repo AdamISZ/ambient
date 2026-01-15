@@ -2762,17 +2762,12 @@ impl WalletNode {
                     tweaked_seckey = tweaked_seckey.negate();
                 }
 
-                // Debug: compare derived pubkey with UTXO's script_pubkey
+                // Sanity check: verify derived pubkey matches UTXO's script_pubkey
                 let final_pubkey = tweaked_seckey.public_key(&secp);
                 let final_xonly = XOnlyPublicKey::from(final_pubkey);
                 let script_xonly = &local_utxo.txout.script_pubkey.as_bytes()[2..]; // Skip OP_1 PUSH32
-                tracing::debug!("derive_utxo_privkey COMPARISON:");
-                tracing::debug!("  Derived pubkey xonly:    {}", hex::encode(final_xonly.serialize()));
-                tracing::debug!("  Script pubkey xonly:     {}", hex::encode(script_xonly));
                 if final_xonly.serialize() != script_xonly[..32] {
                     tracing::error!("❌ PUBKEY MISMATCH: derived key doesn't match UTXO script_pubkey!");
-                } else {
-                    tracing::debug!("✅ PUBKEY MATCH: derived key matches UTXO script_pubkey");
                 }
 
                 Ok(tweaked_seckey)

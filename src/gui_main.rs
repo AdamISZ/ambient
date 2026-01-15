@@ -40,11 +40,9 @@ async fn main() -> iced::Result {
         .open(&log_path)
         .expect("Failed to open log file");
 
-    // Initialize the status layer for GUI status bar updates
-    let status_layer = gui::init_status_layer();
-
-    // Initialize tracing with file output and status layer
+    // Initialize tracing with file output
     // Respects RUST_LOG environment variable, defaults to INFO level
+    // Note: Status bar updates come via WalletUpdate events, not tracing
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info"))
         .add_directive("bdk_kyoto=warn".parse().unwrap())
@@ -56,7 +54,6 @@ async fn main() -> iced::Result {
         .with(tracing_subscriber::fmt::layer()
             .with_writer(log_file)
             .with_ansi(false))
-        .with(status_layer)
         .with(filter)
         .init();
 

@@ -4,3 +4,4 @@ pub mod generate_wallet_wizard;
 pub mod settings_dialog;
 pub mod open_wallet_dialog;
 pub mod accept_proposal_dialog;
+pub mod error_dialog;

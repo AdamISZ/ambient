@@ -6,13 +6,11 @@ pub mod app;
 pub mod message;
 pub mod modal;
 pub mod state;
-pub mod status_layer;
 pub mod theme;
 pub mod views;
 pub mod widgets;
 
 pub use app::AmbientApp;
-pub use status_layer::{init_status_layer, take_status_receiver};
 
 /// Load the application icon from embedded PNG
 fn load_icon() -> Option<iced::window::Icon> {

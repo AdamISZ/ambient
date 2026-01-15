@@ -155,7 +155,7 @@ pub enum Message {
     AutomationIntervalChanged(String),
     AutomationStatusUpdate,
 
-    // Status bar updates (from tracing INFO messages)
+    // Explicit status bar updates (for user-facing messages only)
     StatusUpdate(String),
 
     // Placeholder for unimplemented actions
